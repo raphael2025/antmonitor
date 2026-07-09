@@ -35,13 +35,25 @@
 
   <div id="segModal" class="modal hidden">
     <div class="modal-box">
-      <div class="modal-head"><span>⚙ 设置（网段 / 扫描）</span><button id="segClose">×</button></div>
+      <div class="modal-head"><span>⚙ 设置（网段 / 扫描 / 云端上报）</span><button id="segClose">×</button></div>
       <div id="segBody">
         <div class="muted">每行一个网段（如 <code>172.16.119</code> 或 <code>172.16.119.x</code>）。</div>
         <textarea id="segText" rows="8" placeholder="172.16.101&#10;172.16.102&#10;..."></textarea>
         <div class="seg-host">主机号 <input id="segHs" type="number" min="1" max="254"> – <input id="segHe" type="number" min="1" max="254"></div>
         <div class="seg-host">全网扫描间隔(秒) <input id="setInterval" type="number" min="30"></div>
         <div class="seg-host">ARP限速 max_pps <input id="setPps" type="number" min="0"> <span class="muted">(三层CoPP限制下，建议≤500的一半)</span></div>
+        <hr class="seg-divider">
+        <div class="muted">☁ 云端上报（多场地总览）。保存即时生效，无需重启。本场地ID：<code id="cloudSiteId">-</code></div>
+        <div class="seg-host"><label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input id="cloudEnabled" type="checkbox"> 启用上报</label>
+          <span class="muted">场地在NAT后也不需要端口映射，本地每分钟主动推</span></div>
+        <div class="seg-host">场地名 <input id="cloudName" type="text" placeholder="云端显示名，如 内蒙一场">
+          类型 <select id="cloudType">
+            <option value="air">❄ 风冷</option>
+            <option value="hydro">💧 水冷</option>
+            <option value="mixed">🌀 混合</option>
+          </select></div>
+        <div class="seg-host">云端地址 <input id="cloudUrl" type="text" placeholder="https://overview.example.com"></div>
+        <div class="seg-host">上报token <input id="cloudToken" type="text" placeholder="云端 ingest.token 或本场地专属钥匙"></div>
       </div>
       <div class="modal-foot">
         <button id="segCancel">取消</button>

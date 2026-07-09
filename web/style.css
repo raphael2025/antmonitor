@@ -119,8 +119,13 @@ body.viewer #btnFull, body.viewer #btnQuick { display: none !important; }
 /* 网段设置 */
 #segBody textarea { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #e6e6e6;
   border-radius: 6px; padding: 8px 10px; font-family: monospace; font-size: 13px; margin: 8px 0; resize: vertical; }
-.seg-host { display: flex; align-items: center; gap: 8px; color: #adbac7; font-size: 13px; }
+.seg-host { display: flex; align-items: center; gap: 8px; color: #adbac7; font-size: 13px; margin: 6px 0; }
 .seg-host input { width: 70px; background: #0d1117; border: 1px solid #30363d; color: #e6e6e6; padding: 6px 8px; border-radius: 5px; }
+.seg-host input[type=text] { width: 260px; }
+.seg-host input[type=checkbox] { width: auto; }
+.seg-host select { background: #0d1117; border: 1px solid #30363d; color: #e6e6e6; padding: 6px 8px; border-radius: 5px; }
+.seg-divider { border: 0; border-top: 1px solid #30363d; margin: 12px 0; }
+#cloudSiteId { color: #58a6ff; }
 
 /* 视图切换 + 货架视图 */
 .viewtabs { float: right; }

@@ -699,16 +699,38 @@ def api_segments(_: dict = Depends(require_viewer)):
 
 
 @app.get("/api/settings")
-def api_settings_get(_: dict = Depends(require_viewer)):
-    return {"scan_interval": CFG["schedule"].get("scan_interval", 300),
-            "max_pps": CFG["scan"].get("max_pps", 100),
-            "container_interval": CFG["schedule"].get("container_interval", 10),
-            "discovery_workers": CFG["scan"].get("discovery_workers", 300)}
+def api_settings_get(sess: dict = Depends(require_viewer)):
+    out = {"scan_interval": CFG["schedule"].get("scan_interval", 300),
+           "max_pps": CFG["scan"].get("max_pps", 100),
+           "container_interval": CFG["schedule"].get("container_interval", 10),
+           "discovery_workers": CFG["scan"].get("discovery_workers", 300)}
+    if auth.has_role(sess, "admin"):   # 云端上报配置含 token，只给 admin
+        import cloud_report
+        c = CFG.get("cloud") or {}
+        out["cloud"] = {"enabled": bool(c.get("enabled")), "url": c.get("url") or "",
+                        "token": c.get("token") or "", "site_name": c.get("site_name") or "",
+                        "site_type": c.get("site_type") or "air"}
+        out["site_id"] = cloud_report.site_id(CFG)
+    return out
 
 
 @app.post("/api/settings")
 def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     s = {}
+    if isinstance(body.get("cloud"), dict):   # 云端上报(网页配置, 存 settings.json, 即时生效)
+        c = body["cloud"]
+        cl = {"enabled": bool(c.get("enabled")),
+              "url": str(c.get("url") or "").strip().rstrip("/"),
+              "token": str(c.get("token") or "").strip(),
+              "site_name": str(c.get("site_name") or "").strip()[:64],
+              "site_type": c.get("site_type") if c.get("site_type") in ("air", "hydro", "mixed") else "air"}
+        if cl["enabled"] and not (cl["url"] and cl["token"] and cl["site_name"]):
+            return JSONResponse({"ok": False, "error": "启用上报需填写 云端地址/上报token/场地名"},
+                                status_code=400)
+        if cl["url"] and not cl["url"].startswith(("http://", "https://")):
+            return JSONResponse({"ok": False, "error": "云端地址须以 http:// 或 https:// 开头"},
+                                status_code=400)
+        s["cloud"] = cl
     try:   # 非数字字段返回 400 而非 500
         if "scan_interval" in body:
             s["scan_interval"] = max(30, min(86400, int(body["scan_interval"])))
@@ -721,7 +743,15 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     service_mod.save_settings({**service_mod.load_settings(), **s})
     service_mod.apply_settings(CFG, s)   # 即时生效，无需重启
     SVC.wake()                           # 唤醒调度循环立即按新间隔重排(否则要等当前 sleep 走完)
-    return {"ok": True, **s}
+    out = {"ok": True, **s}
+    if "cloud" in s:                     # 上报线程热重启(旧线程自动失效)
+        import cloud_report
+        cloud_report.start(CFG, _build_public_summary,
+                           lambda hours: db.customer_report(SVC.conn, hours))
+        out["site_id"] = cloud_report.site_id(CFG)
+        print(f"[cloud] 网页更新上报配置: enabled={s['cloud']['enabled']}"
+              f" → {s['cloud'].get('url') or '(未填)'} (场地: {s['cloud'].get('site_name') or '-'})")
+    return out
 
 
 @app.post("/api/segments")
@@ -877,6 +907,16 @@ def api_machine_state(body: dict = Body(...), sess: dict = Depends(require_ops))
 @app.get("/")
 def index():
     return FileResponse(os.path.join(WEB_DIR, "index.html"))
+
+
+@app.middleware("http")
+async def _no_cache_static(request: Request, call_next):
+    """前端文件禁强缓存(每次向服务器复核, 未变返回304)——否则 git 更新版本后
+    浏览器拿旧 JS 渲染新接口, 要手动 Ctrl+F5 才恢复。文件只有几十KB, 代价可忽略。"""
+    resp = await call_next(request)
+    if request.url.path.startswith("/web/") or request.url.path == "/":
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
 
 
 if os.path.isdir(WEB_DIR):

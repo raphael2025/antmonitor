@@ -60,13 +60,20 @@ def enabled(cfg):
     return bool(c.get("enabled") and c.get("url") and c.get("token") and c.get("site_name"))
 
 
+_GEN = 0   # 代数：每次 start() 递增使旧线程下一轮自行退出——支持网页改配置后热重启
+
+
 def start(cfg, get_summary, get_customers):
-    """get_summary: () -> /api/public/summary 同构 dict
+    """启动/热重启上报线程(旧线程自动失效)。未启用时仅停掉旧线程。
+    get_summary: () -> /api/public/summary 同构 dict
     get_customers: (hours:int) -> customers 列表(worker/machines/uptime_pct/delivered_th_h/power_kwh)"""
+    global _GEN
+    _GEN += 1
     if not enabled(cfg):
         return None
-    sid = site_id(cfg)
-    t = threading.Thread(target=_loop, args=(cfg.get("cloud"), sid, get_summary, get_customers),
+    t = threading.Thread(target=_loop,
+                         args=(_GEN, dict(cfg.get("cloud") or {}), site_id(cfg),
+                               get_summary, get_customers),
                          daemon=True, name="cloud-report")
     t.start()
     return t
@@ -79,13 +86,13 @@ def _post(c, path, payload):
     r.raise_for_status()
 
 
-def _loop(c, sid, get_summary, get_customers):
+def _loop(gen, c, sid, get_summary, get_customers):
     interval = max(10, int(c.get("interval", 60)))
     cust_iv = max(60, int(c.get("customer_interval", 600)))
     cust_hours = int(c.get("customer_hours", 24))
     last_cust = 0.0
     fails = 0
-    while True:
+    while gen == _GEN:   # 配置被网页改过(代数变了)就退出，由新线程接管
         t0 = time.time()
         pushed = False
         try:
