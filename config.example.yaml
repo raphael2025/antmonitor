@@ -1,0 +1,103 @@
+# 配置模板：复制为 config.yaml 后按场地实际情况填写(config.yaml 不入 git)
+﻿# 矿机监控配置
+scan:
+  # 网段：优先用 segments.json(网页可编辑)；为空则回退到下面的 base + lo-hi
+  segments: []          # 如 ["172.16.119","172.16.120"]，网页「网段设置」里增删
+  host_start: 1         # 每段主机号起
+  host_end: 254         # 每段主机号止
+  base: "172.16"        # 回退用：IP 前两段
+  lo: 100               # 回退用：第三段起始
+  hi: 160               # 回退用：第三段结束
+  online_timeout: 0.5   # 在线判定超时(秒)
+  data_timeout: 2.0     # 取算力超时(秒)
+  workers: 300          # 快巡检并发(已知在线机,可高)
+  discovery_workers: 300 # 全网发现并发
+  liveness_gate: true   # 发现时先快速 TCP 连 80 判活(三类设备都开80)，死IP不再白跑3个探测
+  gate_timeout: 0.4     # 判活连接超时(秒)
+  max_pps: 100          # 每秒新建连接上限(≈死IP的ARP速率)，保护三层500pps CoPP(5倍余量)；0=不限
+  # 二次确认：上次在线、本次掉线/零算力的机器，用更宽松超时重探，去掉抖动/慢响应误判
+  reconfirm_enabled: true
+  reconfirm_online_timeout: 2.0  # 二次确认的连接超时(秒)
+  reconfirm_data_timeout: 5.0    # 二次确认的取数超时(秒)
+  reconfirm_passes: 2            # 重探轮数(任一轮恢复即判在线)
+  fetch_worker: true    # 在线机额外取矿工名(cgminer 4028 pools, 明文跨固件)
+  container_offline_kick_sec: 86400  # 集装箱离线超过此秒数(默认24h)从记忆中踢除
+  roster_retention_days: 7   # 机器名册保留天数(限电下线的机器在此期内每5分钟仍会被探测以抓恢复)
+  passwords:            # 原厂 digest 依次尝试的密码
+    - ["root", "root"]
+
+schedule:
+  scan_interval: 300    # 全网扫描间隔(秒)，默认5分钟扫一次全部网段(新机/掉线/限电全覆盖)
+  enabled: true         # 是否开启后台定时扫描
+  watchdog_minutes: 0   # 看门狗：超过N分钟无成功扫描则告警；0=自动取 scan_interval×3
+  container_interval: 10 # 集装箱(冷却)高频刷新间隔(秒)，独立于矿机扫描；带宽可忽略
+
+alerts:
+  enabled: true
+  cooldown: 1800              # 同机同类告警冷却(秒)，防刷屏
+  zero_grace_sec: 600        # 零算力机器运行时长<此值(秒)暂不报(刚开机/限电恢复升频中)；0=立即报
+  reject_pct: 5.0            # 拒绝率 ≥ 此值(%) → 矿池健康告警；0 关闭
+  segment_down_ratio: 0.6    # 某网段原在线机掉线比例 ≥ 此值 → 合并为网段事件
+  segment_down_min: 5        # 且掉线数 ≥ 此值才触发网段去重
+  # 集装箱：以下故障位不报警(仍在卡片显示)
+  # supply_liquid_flow_low=供液流量低 liquid_level_high=液位高 supply_liquid_pressure_high=供液压力高 leakage_fault=漏液
+  container_faults_ignore: ["supply_liquid_flow_low", "liquid_level_high", "supply_liquid_pressure_high", "leakage_fault"]
+  container_supply_pressure_min: 0.2   # 供液压 < 此值(MPa) → 告警；0=关
+  container_return_pressure_min: 0.05  # 回液压 < 此值(MPa) → 告警；0=关
+
+telegram:
+  enabled: false        # 填好 token/chat_id 并改 true 才推送
+  bot_token: ""
+  chat_id: ""
+
+cloud:                  # 云端总览上报(E:\main 部署到云服务器后启用)：本地每分钟主动推，NAT后无需端口映射
+  enabled: false
+  url: ""               # 云端总览地址，如 https://overview.example.com
+  token: ""             # 云端 config.yaml > ingest.token(或分配给本场地的专属token)
+  site_name: ""         # 本场地在云端显示的名字(可改，云端按 site_id 识别不会串数据)
+  site_type: air        # air=风冷 | hydro=水冷
+  site_id: ""           # 场地唯一ID。留空=自动生成并存 cloud_site_id.txt(一次生成永不变)。
+                        # ⚠ 整目录克隆到新场地时删掉 cloud_site_id.txt 让它重新生成，否则两场地同ID互相覆盖
+  interval: 60          # 摘要上报间隔(秒)
+  customer_interval: 600 # 客户报表上报间隔(秒)
+  customer_hours: 24    # 客户报表统计周期(小时)
+  timeout: 10           # 上报请求超时(秒)
+
+control:
+  enabled: true         # 远程命令总开关（重启/定位灯/换矿池）。关闭则一律拒绝写操作
+  uniplus_password: ""  # 第三方 UniPlusOS 解锁密码（重启/换矿池需要；定位灯免密）
+  timeout: 8            # 单条命令超时(秒)
+  max_batch: 1000       # 单次批量命令最多目标台数(防一次性误重启全场)
+  # 重启浪涌保护：同变压器(常为连号IP)的机器同时上电涌流叠加会跳闸，故打乱+分批+延迟。
+  # 参数按 2500kVA/带380台/单机~5.9kW(满载~90%)/启动6分钟升频 估算：30台/批最坏全压在一台变压器上
+  # 涌流也只占容量很小一截；8秒间隔远够涌流回落。500台约17批×8s≈2.3分钟跑完。
+  reboot_concurrency: 30   # 每批同时重启多少台(首次跑稳了、没掉压没跳闸，可再上调到50加快)
+  reboot_delay_sec: 8      # 每批之间间隔秒数(让涌流回落、电压稳定)
+  reboot_shuffle: true     # 打乱重启顺序(把同变压器的连号机器分散到不同批次/时间，最关键)
+  # 原厂密码复用 scan.passwords
+
+auth:
+  enabled: true         # 关闭=匿名只读(viewer)：可看不可控；远程命令/扫描/改设置等写操作需开启 auth 并以 ops/admin 登录。生产建议开启
+  secure_cookie: false  # 走 HTTPS 时设 true(令牌只在加密连接传输)；纯内网 HTTP 必须 false 否则登录失效
+  # 密码已用 pbkdf2 哈希(不再明文)。改密码: 运行 `python auth.py 新密码` 把输出整串替换下面的 password。
+  # ⚠️ 当前哈希对应的仍是默认弱口令(admin888/ops888/viewer888)，生产务必改成强口令！
+  users:                # 角色：admin(全部) / ops(监控+命令+扫描) / viewer(只读)
+    - {username: admin,  password: "pbkdf2$200000$8f3f3ca74b10da69d665dc6a5694dcdc$f2c872c5f248eb4bcadcb8da4bcda8842e68614c41f01384c43548a10fa01101",  role: admin}
+    - {username: ops,    password: "pbkdf2$200000$2af185caf576bd47ca9a1c57e5b73241$cc4ce8c448ccddbf56c53c37d59dd2136cf79316b27e040725aa0c921b62260c",    role: ops}
+    - {username: viewer, password: "pbkdf2$200000$0b7fcbad4ac213bd997821f057b7a6ae$be42a14bbede1b4493a4849e3c271a8665ec45c0fafb33cb7d9f0f3f7568784a", role: viewer}
+
+update:                 # git 更新器(git clone 部署时可用): 网页API/命令行检测新版本并更新
+  auto: false           # true=检测到新版本自动拉取+重启(需 NSSM/run.bat 守护进程接管重启)
+  branch: ""            # 跟踪分支; 留空=当前分支。生产建议专用 release 分支
+  check_interval: 3600  # 自动检测间隔(秒)
+
+db:
+  path: "miner_monitor.db"
+  retention_days: 3     # 快照保留天数，超过自动清理
+
+server:
+  host: "0.0.0.0"
+  port: 8800
+
+public_api:
+  token: ""   # 留空=关闭Agent取数API; 生成: python -c "import secrets;print(secrets.token_hex(32))"

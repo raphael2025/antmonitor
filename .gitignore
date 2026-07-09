@@ -1,0 +1,54 @@
+# 数据库与 WAL（生产数据，勿入库；用 backup_db.py 单独备份）
+*.db
+*.db-wal
+*.db-shm
+miner_monitor.db*
+
+# 备份
+backups/
+
+# 运行时生成的配置（网页可改的覆盖项）
+*.settings.json
+settings.json
+
+# 日志
+*.log
+server.log
+
+# 敏感/本机文件：git 更新流程(updater.py)要求这些永不入库——更新永远不碰配置和数据
+config.yaml
+segments.json
+cloud_site_id.txt
+
+# 扫描/运维过程数据
+allmac.txt
+cur19.txt
+expect_19.txt
+live_full.txt
+scan_now.txt
+sn_*.txt
+apply_list.txt
+apply_result.txt
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 扫描导出
+miners_*.csv
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Claude Code 会话/工作流数据(非项目源码)
+.claude/
+
+# 本机 Claude/MCP 配置(机器相关)
+.mcp.json

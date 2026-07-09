@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>矿机监控面板</title>
+  <link rel="stylesheet" href="/web/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+  <div id="staleBanner" class="stale-banner hidden"></div>
+  <div id="loginOverlay" class="login-overlay hidden">
+    <div class="login-box">
+      <h2>⛏ 矿机监控 · 登录</h2>
+      <input id="loginUser" placeholder="用户名" autocomplete="username">
+      <input id="loginPass" type="password" placeholder="密码" autocomplete="current-password">
+      <div id="loginErr" class="login-err"></div>
+      <button id="loginBtn" class="primary">登录</button>
+    </div>
+  </div>
+
+  <header>
+    <h1>⛏ 矿机监控面板</h1>
+    <div class="actions">
+      <span id="lastScan" class="muted">尚未扫描</span>
+      <span id="userBadge" class="badge" title="当前角色"></span>
+      <button id="btnLogout" title="退出登录">退出</button>
+      <button id="btnVoice" title="掉线/告警语音播报">🔇 语音告警: 关</button>
+      <button id="btnTestVoice" title="测试语音播报">🔉 测试</button>
+      <button id="btnSeg" title="网段设置">⚙ 网段</button>
+      <button id="btnQuick">快巡检</button>
+      <button id="btnFull" class="primary">全网扫描</button>
+    </div>
+  </header>
+
+  <div id="segModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head"><span>⚙ 设置（网段 / 扫描）</span><button id="segClose">×</button></div>
+      <div id="segBody">
+        <div class="muted">每行一个网段（如 <code>172.16.119</code> 或 <code>172.16.119.x</code>）。</div>
+        <textarea id="segText" rows="8" placeholder="172.16.101&#10;172.16.102&#10;..."></textarea>
+        <div class="seg-host">主机号 <input id="segHs" type="number" min="1" max="254"> – <input id="segHe" type="number" min="1" max="254"></div>
+        <div class="seg-host">全网扫描间隔(秒) <input id="setInterval" type="number" min="30"></div>
+        <div class="seg-host">ARP限速 max_pps <input id="setPps" type="number" min="0"> <span class="muted">(三层CoPP限制下，建议≤500的一半)</span></div>
+      </div>
+      <div class="modal-foot">
+        <button id="segCancel">取消</button>
+        <button id="segSave">保存</button>
+        <button id="segSaveScan" class="primary">保存并全网扫描</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="progressBar" class="progress hidden">
+    <div class="bar"><div id="progFill" class="fill"></div></div>
+    <span id="progText"></span>
+  </div>
+
+  <section class="cards">
+    <div class="card"><div class="num" id="cOnline">–</div><div class="lbl">在线 / 总数</div></div>
+    <div class="card"><div class="num" id="cTotalHr">–</div><div class="lbl">总算力</div></div>
+    <div class="card"><div class="num" id="cAvgHr">–</div><div class="lbl">平均算力/台</div></div>
+    <div class="card"><div class="num" id="cOffline">–</div><div class="lbl">离线</div></div>
+    <div class="card alert"><div class="num" id="cAlerts">–</div><div class="lbl">活跃告警</div></div>
+    <div class="card"><div class="num" id="cFw">–</div><div class="lbl">原厂 / 第三方</div></div>
+    <div class="card"><div class="num" id="cPower">–</div><div class="lbl">总功耗 (kW)</div></div>
+    <div class="card"><div class="num" id="cEff">–</div><div class="lbl">平均能效 (J/TH)</div></div>
+    <div class="card alert"><div class="num" id="cContainers">–</div><div class="lbl">集装箱(故障)</div></div>
+  </section>
+
+  <section class="grid2">
+    <div class="panel">
+      <h2 id="trendTitle">总算力趋势</h2>
+      <canvas id="trendChart" height="90"></canvas>
+    </div>
+    <div class="panel">
+      <h2>活跃告警 <span id="alertCount" class="badge">0</span></h2>
+      <div id="alertList" class="alertlist"><div class="muted">无</div></div>
+    </div>
+  </section>
+
+  <section class="panel" id="containerPanel" style="display:none">
+    <h2>🧊 集装箱 (AntBox) <span id="containerCount" class="badge">0</span>
+      <button id="btnScanContainers" class="mini-btn" style="float:right">🔄 立即刷新</button>
+    </h2>
+    <div id="containerList" class="clist"></div>
+  </section>
+
+  <section class="panel">
+    <h2>全部矿机 <span id="minerCount" class="badge">0</span>
+      <span class="viewtabs">
+        <button id="tabList" class="tab active">列表</button>
+        <button id="tabRack" class="tab">货架</button>
+        <button id="tabWorker" class="tab">矿工名</button>
+      </span>
+    </h2>
+    <div id="workerView" class="hidden">
+      <div class="wbar">周期
+        <select id="workerPeriod">
+          <option value="0">当前快照</option>
+          <option value="24">近 24 小时</option>
+          <option value="72">近 3 天</option>
+          <option value="168">近 7 天</option>
+        </select>
+        <button id="btnExportCsv" class="hidden">⬇ 导出CSV</button>
+        <span class="muted">报表含可用率 / 交付算力 / 耗电</span>
+      </div>
+      <div id="workerList"></div>
+    </div>
+    <div id="rackView" class="hidden">
+      <div class="legend">
+        <span><i class="dot ok"></i>正常</span>
+        <span><i class="dot zero"></i>零算力</span>
+        <span><i class="dot offline"></i>离线/空位</span>
+      </div>
+      <div id="rackList"></div>
+    </div>
+    <div id="listView">
+    <div class="filters">
+      <input id="search" placeholder="搜索 IP / SN / 矿工名">
+      <select id="fSeg"><option value="">全部网段</option></select>
+      <select id="fStatus">
+        <option value="">全部状态</option>
+        <option value="online">在线</option>
+        <option value="offline">离线</option>
+        <option value="repair">维修中</option>
+      </select>
+      <select id="fFw">
+        <option value="">全部固件</option>
+        <option value="stock">原厂</option>
+        <option value="uniplus">第三方</option>
+      </select>
+      <span id="segStat" class="muted"></span>
+    </div>
+    <div class="cmdbar">
+      <span id="selCount" class="muted">已选 0 台</span>
+      <button data-cmd="selall" class="mini-btn">选中当前筛选</button>
+      <button data-cmd="clear" class="mini-btn">清空</button>
+      <span class="sep"></span>
+      <button data-cmd="locate-on" class="mini-btn">💡 定位灯开</button>
+      <button data-cmd="locate-off" class="mini-btn">定位灯关</button>
+      <button data-cmd="reboot" class="mini-btn danger">⟳ 重启</button>
+      <button data-cmd="set-pools" class="mini-btn danger">⚙ 换矿池</button>
+      <span class="sep"></span>
+      <button data-cmd="repair" class="mini-btn">🔧 维修中</button>
+      <button data-cmd="unrepair" class="mini-btn">取消维修</button>
+      <button data-cmd="remove" class="mini-btn danger">🗑 下架移除</button>
+    </div>
+    <div class="tablewrap">
+      <table id="minerTable">
+        <thead><tr>
+          <th class="cbcol"><input type="checkbox" id="cbAll" title="全选本页"></th>
+          <th data-k="ip">IP</th><th data-k="status">状态</th><th data-k="firmware">固件</th>
+          <th data-k="model">机型</th><th data-k="hr_rt">实时算力</th><th data-k="hr_avg">平均算力</th>
+          <th data-k="power">功耗</th><th data-k="eff">能效</th><th>拒绝率</th><th data-k="temp">芯片温</th>
+          <th data-k="uptime">运行时长</th><th data-k="worker">矿工名</th><th data-k="sn">SN</th><th>备注</th>
+        </tr></thead>
+        <tbody id="minerBody"></tbody>
+      </table>
+    </div>
+    </div>
+  </section>
+
+  <div id="cmdModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head"><span id="cmdTitle"></span><button id="cmdClose">×</button></div>
+      <div id="cmdBody"></div>
+      <div class="modal-foot">
+        <button id="cmdCancel">取消</button>
+        <button id="cmdConfirm" class="primary">确认执行</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="modal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head"><span id="mTitle"></span><button id="mClose">×</button></div>
+      <canvas id="mChart" height="120"></canvas>
+      <div id="mInfo"></div>
+    </div>
+  </div>
+
+  <footer class="muted">自动刷新每 10 秒 · 数据来自最近一次扫描</footer>
+  <script src="/web/app.js"></script>
+</body>
+</html>

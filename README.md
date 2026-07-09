@@ -1,0 +1,214 @@
+# 矿机监控系统 (Miner Monitor)
+
+扫描局域网矿机、自动识别固件、读取算力，提供 **Web 面板 + 定时巡检 + 主动告警**。
+已提供 **Agent 公共 API**（`/api/public/*`，Token 鉴权、只读）供 hermes 等 AI agent 取数。
+
+> 📚 **文档**：[开发文档](docs/DEVELOPMENT.md) ｜ [内部API-矿机接口](docs/INTERNAL_API.md) ｜
+> [外部API-Agent取数接口](docs/EXTERNAL_API.md)（详细）
+
+> 算力按**千进制**显示：1000 TH = 1 PH，1000 PH = 1 EH（总算力/客户/趋势自动选单位；
+> 单机一般仍为 TH）。CSV/接口内部仍存原始 TH 数值。
+
+## 支持的设备 / 接口
+
+| 设备 | 探测 | 数据来源 | 认证 |
+|---|---|---|---|
+| 原厂 Bitmain 矿机 | `GET http://IP:6060/get_sn`（明文 SN，快） | `GET /cgi-bin/stats.cgi` | Digest（默认 root/root，可配多组） |
+| 第三方 UniPlusOS 矿机 | `GET http://IP/api/v1/summary` | 同左 | 免认证 |
+| **AntBox 水冷集装箱** | `GET http://IP/cooler?operation=coolerState` | 同左 + `minerInfo` | 免认证 |
+
+> 扫描时按 矿机→AntBox 顺序探测，与矿机**同网段自动发现**集装箱（控制器响应慢，给更宽超时）。
+> 集装箱**记忆持久化**（`containers` 表）+ **独立高频刷新**：全量扫描(每天)发现新箱；已知箱由专门的
+> 循环每 `schedule.container_interval`(默认10s)只打 `/cooler` 刷新（50箱@10s≈123kbps，带宽可忽略，
+> 与矿机5min巡检解耦）；离线超 `scan.container_offline_kick_sec`(默认24h) 自动踢除。
+
+## 集装箱 (AntBox) 监控
+
+读取每个水冷集装箱控制器：**进/出水温、ΔT、供回液压力、流量、箱内温湿度、冷却塔进水温、
+设定温度、总功耗(两路配电之和，卡片头部 ⚡ 显示 kW/MW)、泵/风扇状态、箱内矿机数/芯片温**。面板「🧊 集装箱」面板按箱卡片展示，
+点击看进/出水/箱内温历史曲线。**冷却故障告警**（漏液/泵故障/断流/水温过高/液位/冻结/断相…，
+共 20+ 故障位）→ 告警 + 语音 + 推送；箱体控制器离线 → `cooler_offline`。矿机↔箱体：
+箱体 `minerInfo` 汇报其箱内矿机数/成员（populated 时关联）。集装箱随快巡检高频更新。
+
+**在线规则**：任一探测在 `online_timeout`（默认 0.5s）内有响应即在线；
+6060 连得上但读不到 SN（返回 error/空）也算在线，SN 记为 `N/A`。
+
+## 项目结构
+
+```
+miner_core.py     扫描核心（探测/并发/排名/基线），无副作用，纯数据
+db.py             SQLite：扫描快照 + 告警 + 命令审计 command_log
+alerts.py         告警规则评估 + Telegram 推送
+control.py        远程命令层（重启/定位灯/换矿池，原厂+第三方双路）
+auth.py           登录 + 角色权限（admin/ops/viewer）
+service.py        扫描编排 + 后台定时巡检线程
+server.py         FastAPI：JSON API + 托管前端 + 鉴权
+web/              前端面板（index.html / style.css / app.js，Chart.js 趋势图）
+scan_miners.py    命令行扫描器（薄封装，复用 miner_core）
+config.yaml       配置
+```
+
+## 登录与权限（RBAC）
+
+`config.yaml` 的 `auth` 段配置用户与角色（`enabled:false` 则免登录）：
+- **viewer**：只读监控（隐藏所有写操作入口）
+- **ops**：监控 + 远程命令 + 触发扫描
+- **admin**：全部（含命令审计日志）
+
+会话基于 Cookie 令牌（内存存储，重启需重新登录）。
+
+## 远程命令与批量操作
+
+表格勾选矿机（或「选中当前筛选」），用命令栏批量执行：
+
+| 命令 | 原厂 Bitmain | 第三方 UniPlusOS | 破坏性 |
+|---|---|---|---|
+| 💡 定位灯 | `blink.cgi` | `find-miner`（免解锁） | 否 |
+| ⟳ 重启 | `reboot.cgi` | `system/reboot`（需解锁） | 是·二次确认 |
+| ⚙ 换矿池 | `set_miner_conf.cgi` | `settings`（需解锁） | 是·二次确认 |
+
+破坏性命令弹窗强制二次确认；所有命令写入 `command_log` 审计表（admin 可查 `/api/commands`）。
+第三方解锁密码配 `control.uniplus_password`，原厂密码复用 `scan.passwords`。
+
+## 矿工名分组（吸收自旧 antbox）
+
+扫描时对在线机额外查 **cgminer 4028 端口的 `pools` 命令**取矿工名（矿池 User，明文、
+跨固件通用——第三方 HTTP 接口会把 User 打码成 `*****`，4028 不会）。面板「矿工名」标签页
+按矿工名/客户聚合：总台数、总算力、机型分布。可在 `scan.fetch_worker` 关闭。
+
+## 实时推送（WebSocket）
+
+面板通过 `/ws` 长连接接收推送：每次扫描完成/告警触发，后台线程即时推送，前端秒级刷新
+（轮询降级为 30s 兜底）。WS 同样校验登录 Cookie。
+
+## 货架/机位视图
+
+按 /24 网段自动聚合成「货架」，最后一段为机位号，无需手工映射。
+每个机位按状态着色（正常/低算力/过温/无算力/离线·空位），异常一眼可见，
+点击机位直达单机详情。面板「全部矿机」右上「列表 / 货架」切换。
+
+## 快速开始
+
+```bash
+pip install -r requirements.txt
+python server.py            # 启动面板 + 后台定时巡检
+# 浏览器打开 http://<本机IP>:8800
+```
+
+启动后按 `config.yaml` 节奏运行：
+- **全网扫描** `schedule.scan_interval`（默认 300s=5分钟）：每 5 分钟扫一遍全部网段，
+  新机/掉线/限电上下线全在 5 分钟内捕捉。并发受 `scan.max_pps`(默认100) 限速保护三层 CoPP。
+- **集装箱刷新** `schedule.container_interval`（默认 10s）：独立高频刷新冷却数据。
+
+> 60 段(~1.5万IP)实测：每次全扫 ~150s，ARP≈100/s（你的 500 CoPP 有 5 倍余量），带宽峰值 ~26 Mbps(数据平面，不占CoPP)。
+
+## 命令行（不依赖服务）
+
+```bash
+python scan_miners.py --lo 100 --hi 160        # 扫描出排名 + CSV
+python scan_miners.py --report miners_xxx.csv  # 只从 CSV 出报告
+```
+
+## Web API（前端用，也是未来 MCP/HTTP 取数的基础）
+
+| 接口 | 说明 |
+|---|---|
+| `GET /api/summary` | 总览：在线/总/平均算力、固件分布、基线、Top/Bottom、总功耗、平均能效、告警数 |
+| `GET /api/miners?status=&fw=&q=&sort=&order=` | 矿机列表（含功耗/能效/温度/运行时长，可筛选/搜索/排序） |
+| `GET /api/miner/{ip}` | 单机当前状态 + 历史曲线 |
+| `GET /api/racks` | 货架视图数据（按 /24 聚合，机位状态着色） |
+| `GET /api/workers` | 矿工名分组（总台数/总算力/机型分布） |
+| `GET /api/containers` · `/api/container/{ip}` | 集装箱列表 / 单箱详情+水温历史 |
+| `WS /ws` | 实时推送（扫描完成/告警），需登录 Cookie |
+| `GET /api/alerts?active=true` | 告警列表 |
+| `GET /api/trend?points=288` | 总算力历史趋势 |
+| `GET /api/segments` · `POST /api/segments` | 读取 / 保存扫描网段（保存需 admin） |
+| `POST /api/scan?kind=full\|quick` | 手动触发扫描（需 ops+） |
+| `POST /api/command` | 远程命令 `{ips,action,params}`（需 ops+） |
+| `GET /api/commands` | 命令审计日志（需 admin） |
+| `POST /api/login` · `/api/logout` · `GET /api/me` | 登录 / 登出 / 当前用户 |
+| `GET /api/progress` | 当前扫描进度 |
+
+> 读接口需 viewer+，写接口需 ops+，审计需 admin。未登录返回 401，权限不足返回 403。
+
+## 网段设置 / 按网段看算力
+
+- 网页右上「⚙ 网段」（仅 admin）：每行一个网段，设主机号范围，存 `segments.json`，可「保存并全网扫描」。
+- 「全部矿机」筛选栏有 **网段下拉**：选某网段即在右侧看该段 **在线数 / 算力 / 功耗**；货架视图每段也直接显示算力。
+
+## 机器生命周期（限电 / 维修 / 下架）
+
+- 限电拉闸下线、来电恢复上线，靠每 5 分钟的全网扫描自动捕捉（与上次对比出上/下线）。
+- **维修中**：选中机器→「🔧维修中」。不再报离线告警、列表显示"维修中"标签，修好重新上线**自动恢复正常**。
+- **下架移除**：选中→「🗑下架移除」从名册删除（不再告警）；若重装上线，下次全网扫描当新机重新纳入。
+
+## 扫描性能与负载控制（针对三层 500pps CoPP）
+
+- **快速判活闸门**（`scan.liveness_gate`）：先 1 次 TCP 连 80 判活（原厂/第三方/AntBox 三类都开80），
+  死 IP ~0.4s 直接判离线，不再白跑 3 个探测。（6060 只对原厂有效，故用 80 通用判活。）
+- **ARP 限速**（`scan.max_pps`，默认 100）：令牌桶限制每秒新建连接(≈死IP的 ARP 速率)，
+  护住三层的 ARP/控制平面(CoPP)限制。`discovery_workers` 是并发上限，实际由 max_pps 节流。
+- 数据流量（读矿机/箱子）是硬件转发的数据平面，**不占 CoPP**，无需限制。
+
+## 告警确认与防误判
+
+- **二次确认**：某机「上次在线、本次掉线/零算力」时，立刻用更宽松超时（连接2s/数据5s、关判活闸门）
+  单独重探一遍，仍失败才报警——避免网络抖动/响应慢造成的误判（只重探掉下来的真机，成本极低）。
+- **告警时间戳**：每条告警显示首次出现时间 + 相对时间（如「28分钟前」），老的没处理一眼可见。
+- **确认按钮**：矿机告警可点「确认」标记处理中（显示"✓ 用户 已确认"、行变灰），多人值班不重复跑；
+  集装箱告警不提供确认（修好自动消失）。告警在条件恢复时仍自动消除。
+- **语音只报台数**：出现新告警时播报「掉线 N 台，零算力 N 台，集装箱故障 N 处」，不念 IP。
+
+## 告警规则
+
+- **掉线** offline：上次在线、本次超时 → crit
+- **零算力** zero：在线但实时算力为 0（含读不到）→ warn
+- **拒绝率** reject：拒绝率 ≥ `alerts.reject_pct`(默认5%) → warn（矿池健康，4028 取 accepted/rejected/stale）
+- **网段事件** segment_down：某段「原在线」机掉线比例 ≥ `segment_down_ratio`(0.6) 且数量 ≥ `segment_down_min`(5)
+  → **合并成一条事件**（疑似交换机/断电），并抑制该段的单条掉线，防刷屏
+- **监控停滞** stalled（看门狗）：超过 `schedule.watchdog_minutes`(0=scan_interval×3) 无成功扫描 → crit，
+  防止扫描进程悄悄死掉。建议进程再交 systemd/NSSM 守护。
+
+> 同机同类告警恢复后自动 resolve；货架配色：正常(绿)/零算力(红)/离线·空位(灰)。
+
+## 客户报表（内部对账）
+
+「矿工名」标签页选周期（当前/24h/3天/7天）：当前=机型分布；周期=按客户出
+**可用率% / 交付算力 TH·h / 耗电 kWh**（停机正确归属到该机已知矿工名）。用于托管对账。
+
+## 告警通道
+
+- **浏览器语音告警**：面板右上「🔇 语音告警」按钮开启（点击即解锁音频）。出现新告警时：
+  掉线→蜂鸣 + 中文语音播报 IP（"警告，N 台矿机掉线，172 点 16 点…"）+ 桌面通知；
+  过温/严重→蜂鸣 + 播报；恢复→提示音。标题栏显示活跃告警数 `(N)`。偏好存 localStorage。
+- **Telegram 推送**：在 `config.yaml` 填 `telegram.bot_token` 与 `chat_id`，`enabled: true` 即开启。
+
+## 云端总览上报（多场地汇聚）
+
+配好 `config.yaml > cloud` 段后，本地每分钟向云端总览（E:\main 项目，部署在云服务器）
+**主动推送**场地摘要（在线/算力/功耗/告警/集装箱，几KB/次）+ 每10分钟推客户报表。
+方向是本地→云端，**场地在 NAT 后面不需要任何端口映射**；第一次上报云端自动注册本场地。
+断网自动中断（云端显示"未收到上报"），恢复自动续传；上报线程独立，不影响扫描/告警。
+
+**场地身份 = 唯一 site_id**：首次启动自动生成存 `cloud_site_id.txt`（启动日志会打印），
+云端按它识别本场地——`site_name` 随时可改不丢数据。
+⚠ 整目录克隆部署到新场地时必须删掉 `cloud_site_id.txt`（自动重新生成），否则两场地同ID互相覆盖。
+
+```yaml
+cloud:
+  enabled: true
+  url: "https://overview.example.com"   # 云端总览地址
+  token: "<云端 config.yaml > ingest.token>"
+  site_name: "内蒙一场"                  # 云端显示名(全网唯一)
+  site_type: air                         # air=风冷 | hydro=水冷
+```
+
+## 后续规划（功能定稿后再做）
+
+1. **MCP server**：把 summary/top/bottom/miner/alerts 暴露成 tool，供 hermes/openclaw 调用。
+2. **访问控制**：API token + Telegram chat_id 白名单（算力/SN/拓扑属敏感数据）。
+3. 机型/网段分组统计、历史趋势对比、导出报表。
+
+## 依赖
+
+Python 3.8+：`requests fastapi uvicorn PyYAML`（见 requirements.txt）
