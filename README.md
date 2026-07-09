@@ -203,6 +203,16 @@ cloud:
   site_type: air                         # air=风冷 | hydro=水冷
 ```
 
+## 版本更新（git 更新器）
+
+以 git clone 方式部署后，可检测远端新版本并更新（配置/数据被 .gitignore 保护，更新永不触碰）：
+
+- 自动：`config.yaml > update.auto: true`，每小时自查，有新版本自动拉取+编译自检+重启
+  （需 NSSM 守护或用 `run.bat` 启动——退出后 3 秒自动重新拉起）
+- 手动：机器上跑 `python updater.py check / apply`（apply 后重启服务），
+  或 API `GET /api/update/check`、`POST /api/update/apply`（admin，apply 自动重启）
+- 语法错误的坏版本会被编译自检拦下并**自动回滚**；发布流程见 E:\main [docs/DEPLOY.md §6](../main/docs/DEPLOY.md)
+
 ## 后续规划（功能定稿后再做）
 
 1. **MCP server**：把 summary/top/bottom/miner/alerts 暴露成 tool，供 hermes/openclaw 调用。
