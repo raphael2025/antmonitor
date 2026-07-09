@@ -703,13 +703,21 @@ function toast(text, kind) {
   setTimeout(() => t.remove(), 6000);
 }
 
-/* ---------------- 网段设置 ---------------- */
+/* ---------------- 设置(网段/扫描/云端上报) ---------------- */
 async function openSeg() {
   const d = await jget("/api/segments");
   $("segText").value = (d.segments || []).join("\n");
   $("segHs").value = d.host_start; $("segHe").value = d.host_end;
   const s = await jget("/api/settings");
   $("setInterval").value = s.scan_interval; $("setPps").value = s.max_pps;
+  if (s.cloud) {   // 云端上报配置(仅 admin 下发)
+    $("cloudEnabled").checked = !!s.cloud.enabled;
+    $("cloudName").value = s.cloud.site_name || "";
+    $("cloudType").value = s.cloud.site_type || "air";
+    $("cloudUrl").value = s.cloud.url || "";
+    $("cloudToken").value = s.cloud.token || "";
+    $("cloudSiteId").textContent = s.site_id || "-";
+  }
   $("segModal").classList.remove("hidden");
 }
 async function saveSeg(scan) {
@@ -718,12 +726,24 @@ async function saveSeg(scan) {
   const r = await fetch("/api/segments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   const d = await r.json();
   if (!d.ok) { toast("保存失败：" + (d.error || r.status)); return; }
-  await fetch("/api/settings", {
+  const r2 = await fetch("/api/settings", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ scan_interval: parseInt($("setInterval").value) || 300, max_pps: parseInt($("setPps").value) || 0 }),
+    body: JSON.stringify({
+      scan_interval: parseInt($("setInterval").value) || 300,
+      max_pps: parseInt($("setPps").value) || 0,
+      cloud: {
+        enabled: $("cloudEnabled").checked,
+        site_name: $("cloudName").value.trim(),
+        site_type: $("cloudType").value,
+        url: $("cloudUrl").value.trim(),
+        token: $("cloudToken").value.trim(),
+      },
+    }),
   });
+  const d2 = await r2.json();
+  if (!d2.ok) { toast("保存失败：" + (d2.error || r2.status)); return; }
   $("segModal").classList.add("hidden");
-  toast(`已保存 ${d.count} 个网段 + 扫描参数`, "ok");
+  toast(`已保存 网段/扫描/云端上报设置` + ($("cloudEnabled").checked ? "（上报已启用，即时生效）" : ""), "ok");
   if (scan) { await fetch("/api/scan?kind=full", { method: "POST" }); toast("已触发全网扫描", "ok"); setTimeout(pollProgress, 500); }
 }
 $("btnSeg").onclick = openSeg;

@@ -85,6 +85,8 @@ def apply_settings(cfg, s):
         cfg["scan"]["max_pps"] = int(s["max_pps"])
     if "discovery_workers" in s:
         cfg["scan"]["discovery_workers"] = int(s["discovery_workers"])
+    if isinstance(s.get("cloud"), dict):   # 云端上报(网页可配)，覆盖进 yaml 的 cloud 段
+        cfg.setdefault("cloud", {}).update(s["cloud"])
 
 
 def save_settings(s):
