@@ -55,7 +55,7 @@ cloud:                  # 云端总览上报(E:\main 部署到云服务器后启
   url: ""               # 云端总览地址，如 https://overview.example.com
   token: ""             # 云端 config.yaml > ingest.token(或分配给本场地的专属token)
   site_name: ""         # 本场地在云端显示的名字(可改，云端按 site_id 识别不会串数据)
-  site_type: air        # air=风冷 | hydro=水冷
+  site_type: air        # air=风冷 | hydro=水冷 | mixed=混合(风冷+水冷集装箱都有)。只影响云端分组显示
   site_id: ""           # 场地唯一ID。留空=自动生成并存 cloud_site_id.txt(一次生成永不变)。
                         # ⚠ 整目录克隆到新场地时删掉 cloud_site_id.txt 让它重新生成，否则两场地同ID互相覆盖
   interval: 60          # 摘要上报间隔(秒)

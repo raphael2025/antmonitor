@@ -17,7 +17,7 @@ cloud:
   url: "https://overview.example.com"   # 云端总览地址
   token: "云端 config.yaml > ingest.token(或分配给本场地的专属token)"
   site_name: "XX一场"                    # 云端显示名(可改，改名不影响数据归属)
-  site_type: air                         # air=风冷 | hydro=水冷
+  site_type: air                         # air=风冷 | hydro=水冷 | mixed=混合(只影响云端分组显示)
   site_id: ""                            # 一般留空自动生成；迁移机器时填旧ID
   interval: 60
   customer_interval: 600
