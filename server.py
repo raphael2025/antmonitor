@@ -24,6 +24,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 
 import appconfig
 import auth
+import cloud_alert_summary
 import cloud_report
 import control
 import db
@@ -45,6 +46,12 @@ WS_MAX_CLIENTS = 500   # 并发 WS 上限：无界集合会被脚本用海量连
 MAIN_LOOP = None
 
 
+def _start_cloud_report():
+    """(重新)启动云端上报线程，供启动、设置热更新、看门狗自愈共用同一套参数。"""
+    return cloud_report.start(CFG, _build_cloud_summary,
+                              lambda hours: db.customer_report(SVC.conn, hours))
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app_):
     global MAIN_LOOP
@@ -52,8 +59,7 @@ async def lifespan(app_):
     SVC.notify = _broadcast_threadsafe   # 扫描线程→WS 推送
     SVC.start_scheduler()
     guardian = MAIN_LOOP.create_task(_guardian_loop())   # 不依赖 daemon 线程的最终兜底
-    if cloud_report.start(CFG, _build_public_summary,
-                          lambda hours: db.customer_report(SVC.conn, hours)):
+    if _start_cloud_report():
         log.info("云端上报已启动 → %s (场地: %s, ID: %s)", CFG["cloud"]["url"],
                  CFG["cloud"]["site_name"], cloud_report.site_id(CFG))
     updater.start_auto(CFG.get("update") or {})
@@ -88,12 +94,20 @@ def _startup_selfcheck():
         log.warning("auth.enabled=false：任何人可匿名只读访问面板")
 
 
+def _ensure_cloud_report():
+    """云端上报线程存活检查+自愈：这条线程不归 MonitorService 管，单独在这补一份看门狗覆盖。"""
+    if cloud_report.enabled(CFG) and not cloud_report.is_alive():
+        log.warning("云端上报线程已意外退出，尝试重新拉起")
+        _start_cloud_report()
+
+
 async def _guardian_loop():
     """主事件循环守护：daemon 扫描/看门狗全死时仍能拉起（Web 活着就有人盯）。"""
     while True:
         try:
             await asyncio.sleep(60)
             await asyncio.get_running_loop().run_in_executor(None, SVC.health_tick)
+            await asyncio.get_running_loop().run_in_executor(None, _ensure_cloud_report)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -292,6 +306,14 @@ def api_summary(_: dict = Depends(require_viewer)):
     return {"scanned": True, **_summary_stats(ls, recs), "progress": SVC.progress}
 
 
+def _container_faulty(c, ignore):
+    """该集装箱是否有"未被忽略"的真实故障——口径必须与 alerts.evaluate_containers 一致，
+    否则用户明明已经把某个故障位加进忽略列表(不报警)，总览/列表的"故障"计数却还在算它。"""
+    if not c.get("online"):
+        return False
+    return any(f["flag"] not in ignore for f in (c.get("faults") or []))
+
+
 def _summary_stats(ls, recs):
     """/api/summary 与 /api/public/summary 共用的统计口径，保证两边永远一致。"""
     with_hr, no_hr, _offline = miner_core.rank(recs)
@@ -308,6 +330,7 @@ def _summary_stats(ls, recs):
     effs = [r["eff"] for r in with_hr if r.get("eff")]
     cs = db.get_containers(SVC.conn)
     total = len(recs)
+    ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
     return {
         "scan_id": ls.get("scan_id"), "scan_ts": ls.get("ts"), "scan_kind": ls.get("kind"),
         "total": total, "online": online, "offline": total - online,
@@ -319,7 +342,7 @@ def _summary_stats(ls, recs):
         "by_firmware": by_fw,
         "active_alerts": db.count_active(SVC.conn),
         "containers": len(cs),
-        "containers_faulty": sum(1 for c in cs if c.get("online") and c.get("faults")),
+        "containers_faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
         "containers_offline": sum(1 for c in cs if not c.get("online")),
     }
 
@@ -400,6 +423,18 @@ def _build_public_summary():
     except Exception as e:  # noqa: BLE001
         log.exception("build_public_summary error")
         return {"ok": False, "ts": int(time.time()), "error": str(e)}
+
+
+def _build_cloud_summary():
+    """云端上报专用：在本地摘要基础上加一份"活跃告警摘要"(按类型+客户聚合，不含单机IP)。
+    只喂给 cloud_report 上报线程，不影响 /api/public/summary、/api/summary 等本地接口。"""
+    s = _build_public_summary()
+    try:
+        s["alert_summary"] = cloud_alert_summary.build(SVC.conn)
+    except Exception as e:  # noqa: BLE001  聚合失败不能拖累上报本体(在线/算力/功耗)
+        log.warning("告警摘要聚合失败(不影响上报本体): %s", e)
+        s["alert_summary"] = []
+    return s
 
 
 def _public_miner_row(r):
@@ -525,8 +560,9 @@ def api_public_containers(request: Request):
 
     def build():
         cs = db.get_containers(SVC.conn)
+        ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
         return {"ok": True, "ts": int(time.time()), "count": len(cs),
-                "faulty": sum(1 for c in cs if c.get("online") and c.get("faults")),
+                "faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
                 "offline": sum(1 for c in cs if not c.get("online")),
                 "containers": cs}
     return _cached(("containers",), 8, build)
@@ -637,8 +673,9 @@ def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(re
 def api_containers(_: dict = Depends(require_viewer)):
     cs = db.get_containers(SVC.conn)
     acfg = CFG.get("alerts", {})
+    ignore = set(acfg.get("container_faults_ignore", []))
     return {"count": len(cs),
-            "faulty": sum(1 for c in cs if c.get("online") and c.get("faults")),
+            "faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
             "offline": sum(1 for c in cs if not c.get("online")),
             "containers": cs,
             "faults_ignore": acfg.get("container_faults_ignore", []),
@@ -670,10 +707,14 @@ def api_racks(_: dict = Depends(require_viewer)):
     def state(r):
         if r is None:
             return "empty"
+        if r["status"] == "unknown":   # 本轮扫描超时没来得及探测，既非在线也非离线
+            return "unknown"
         if r["status"] == "offline":
             return "offline"
         hr = r.get("hr_rt")
-        return "zero" if (hr is None or hr == 0) else "ok"
+        # 只有明确读到 0 才算零算力；hr_rt=None(接口抖动没读到)不能当零算力画黄，
+        # 否则一次接口超时就把正常在线机误显示成"零算力"故障
+        return "zero" if hr == 0 else "ok"
 
     by_seg = {}   # seg -> {host: record}
     for r in recs:
@@ -702,7 +743,8 @@ def api_racks(_: dict = Depends(require_viewer)):
         out.append({"name": seg, "slots": slots,
                     "online": cnt.get("ok", 0) + cnt.get("zero", 0),
                     "abnormal": cnt.get("zero", 0), "offline": cnt.get("offline", 0),
-                    "empty": cnt.get("empty", 0), "hashrate": round(hr_sum, 2)})
+                    "empty": cnt.get("empty", 0), "unknown": cnt.get("unknown", 0),
+                    "hashrate": round(hr_sum, 2)})
     return {"racks": out}
 
 
@@ -814,8 +856,7 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     SVC.wake()                         # 唤醒调度循环立即按新间隔重排
     out = {"ok": True, **s}
     if "cloud" in s:                   # 上报线程热重启(旧线程自动失效)
-        cloud_report.start(CFG, _build_public_summary,
-                           lambda hours: db.customer_report(SVC.conn, hours))
+        _start_cloud_report()
         out["site_id"] = cloud_report.site_id(CFG)
         log.info("网页更新上报配置: enabled=%s → %s (场地: %s)", s["cloud"]["enabled"],
                  s["cloud"].get("url") or "(未填)", s["cloud"].get("site_name") or "-")

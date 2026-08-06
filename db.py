@@ -252,12 +252,15 @@ def save_scan(conn, kind, records, keep_ips=None):
     else:
         kept_src = list(records)
     online = sum(1 for r in kept_src if r["status"] == "online")
+    # status="unknown"(本轮扫描超时没来得及探测的机器)不计入 total/online/offline——
+    # 它既不是确认在线也不是确认离线，算进 offline 会在总览上凭空多出一堆假离线。
+    offline = sum(1 for r in kept_src if r["status"] == "offline")
     total_hr = round(sum(r.get("hr_rt") or 0 for r in kept_src), 2)
     ts = int(time.time())
     with _wlock, conn:
         cur = conn.execute(
             "INSERT INTO scans(ts,kind,total,online,offline,total_hr) VALUES(?,?,?,?,?,?)",
-            (ts, kind, len(kept_src), online, len(kept_src) - online, total_hr),
+            (ts, kind, online + offline, online, offline, total_hr),
         )
         sid = cur.lastrowid
         kept = [{"scan_id": sid, "ip": r["ip"], "status": r["status"],
