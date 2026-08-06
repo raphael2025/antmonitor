@@ -555,6 +555,16 @@ def scan(ips, cfg, progress_cb=None, workers=None):
         for f, ip in futs.items():
             if ip in seen:
                 continue
+            if f.done():
+                # as_completed 的超时检查发生在"取下一个已完成结果"之前：有极小概率
+                # 恰好卡在"结果已经算出来、但还没被 as_completed 取走"这个窗口触发
+                # TimeoutError，这种 future 其实是真探测完了，绝不能当unknown丢掉。
+                try:
+                    results.append(f.result())
+                except Exception:
+                    results.append(_blank(ip, "offline"))
+                done += 1
+                continue
             if f.cancel():
                 never_started += 1
             else:

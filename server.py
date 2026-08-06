@@ -319,6 +319,7 @@ def _summary_stats(ls, recs):
     with_hr, no_hr, _offline = miner_core.rank(recs)
     by_fw = {}
     online = 0
+    offline = 0
     total_power = 0
     for r in recs:
         if r["status"] == "online":
@@ -326,14 +327,18 @@ def _summary_stats(ls, recs):
             by_fw[r["firmware"]] = by_fw.get(r["firmware"], 0) + 1
             if r.get("power"):
                 total_power += r["power"]
+        elif r["status"] == "offline":
+            offline += 1
+        # status="unknown"(本轮扫描超时没来得及探测)不计入 total/online/offline——
+        # 口径须跟 db.save_scan 一致，否则总览/云端上报的"总数"、"离线数"会被虚高
     total_hr = round(sum(r["hr_rt"] for r in with_hr), 2) if with_hr else 0.0
     effs = [r["eff"] for r in with_hr if r.get("eff")]
     cs = db.get_containers(SVC.conn)
-    total = len(recs)
+    total = online + offline
     ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
     return {
         "scan_id": ls.get("scan_id"), "scan_ts": ls.get("ts"), "scan_kind": ls.get("kind"),
-        "total": total, "online": online, "offline": total - online,
+        "total": total, "online": online, "offline": offline,
         "with_hashrate": len(with_hr), "no_hashrate": len(no_hr),
         "total_hashrate_th": total_hr,
         "avg_hashrate_th": round(total_hr / len(with_hr), 2) if with_hr else 0,
