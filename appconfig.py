@@ -133,9 +133,11 @@ def _validate(cfg):
     clamp("schedule", "scan_interval", 30, 86400, int)
     clamp("schedule", "full_interval", 60, 604800, int)
     clamp("schedule", "container_interval", 5, 3600, int)
-    clamp("scan", "max_pps", 0, 5000, int)
-    clamp("scan", "workers", 1, 2000, int)
-    clamp("scan", "discovery_workers", 1, 2000, int)
+    # 三层交换机 CoPP 硬限制约 500pps，这里是代码层面的最后一道保险——
+    # 不管 config.yaml 还是网页设置怎么填，并发/连接速率永远不允许超过 500。
+    clamp("scan", "max_pps", 1, 500, int)
+    clamp("scan", "workers", 1, 500, int)
+    clamp("scan", "discovery_workers", 1, 500, int)
     clamp("scan", "host_start", 1, 254, int)
     clamp("scan", "host_end", 1, 254, int)
     clamp("db", "retention_days", 1, 3650, int)

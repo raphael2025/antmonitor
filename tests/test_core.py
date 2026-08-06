@@ -136,7 +136,7 @@ def test_config_validation_clamps_and_orders_intervals():
     assert cfg["schedule"]["scan_interval"] == 30            # 收敛到下限
     assert cfg["schedule"]["full_interval"] >= cfg["schedule"]["scan_interval"]
     assert cfg["scan"]["host_start"] < cfg["scan"]["host_end"]   # 起止被对调
-    assert cfg["scan"]["max_pps"] == 5000
+    assert cfg["scan"]["max_pps"] == 500   # 三层CoPP硬上限，代码层面不可配更高
 
 
 def test_apply_settings_only_touches_known_keys(cfg):
