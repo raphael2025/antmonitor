@@ -22,15 +22,41 @@ import time
 import yaml
 
 
+DEFAULT_DB = "miner_monitor.db"
+
+
 def _db_path():
+    """与 db.py / server.py 一致：配置文件路径由 MINER_CONFIG 环境变量决定。
+
+    以前这里硬编码 "config.yaml" 且吞掉所有异常，部署环境用 MINER_CONFIG 指向
+    别处时会静默备份错误/过期的库文件——出问题时完全无感知。"""
+    cfg_path = os.environ.get("MINER_CONFIG", "config.yaml")
     try:
-        with open("config.yaml", encoding="utf-8") as f:
-            return yaml.safe_load(f).get("db", {}).get("path", "miner_monitor.db")
-    except Exception:
-        return "miner_monitor.db"
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        return (cfg.get("db") or {}).get("path", DEFAULT_DB)
+    except (OSError, yaml.YAMLError, AttributeError) as e:
+        print(f"[WARN] 读取配置失败 {cfg_path}: {e}")
+        print(f"[WARN] 回退到默认数据库路径 {DEFAULT_DB}；"
+              f"若实际库不在此处请用 --src 指定或检查 MINER_CONFIG")
+        return DEFAULT_DB
+
+
+def _rm_partial(path):
+    """删除失败留下的半成品备份(含 WAL/SHM 残留)，不让它冒充一份有效备份。"""
+    for p in (path, path + "-wal", path + "-shm"):
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                print(f"[..] 已清理半成品备份 {p}")
+            except OSError as e:
+                print(f"[WARN] 清理半成品备份失败 {p}: {e}")
 
 
 def backup(src, out_dir, keep, stamp):
+    if keep < 1:
+        print("[ERR] --keep 必须至少为 1；拒绝创建后立即删除全部备份")
+        return 2
     if not os.path.exists(src):
         print(f"[ERR] 源库不存在: {src}")
         return 2
@@ -38,14 +64,28 @@ def backup(src, out_dir, keep, stamp):
     dst = os.path.join(out_dir, f"miner_monitor_{stamp}.db")
 
     # 1) 在线备份（一致快照，不阻塞写）
-    src_conn = sqlite3.connect(src)
-    dst_conn = sqlite3.connect(dst)
+    # 任何一步失败都必须删掉半成品文件：否则它会被下面的滚动保留逻辑当成一份
+    # "合法备份"占位，把真正可用的旧备份挤出保留窗口。
+    err = None
+    src_conn = dst_conn = None
     try:
+        src_conn = sqlite3.connect(src)
+        dst_conn = sqlite3.connect(dst)
         with dst_conn:
             src_conn.backup(dst_conn)   # SQLite Online Backup API
+    except (sqlite3.Error, OSError) as e:
+        err = e
     finally:
-        src_conn.close()
-        dst_conn.close()
+        for c in (src_conn, dst_conn):
+            if c is not None:
+                try:
+                    c.close()
+                except sqlite3.Error:
+                    pass
+    if err is not None:
+        print(f"[ERR] 在线备份失败 {src} -> {dst}: {err}")
+        _rm_partial(dst)
+        return 3
 
     # 2) 完整性校验
     chk = sqlite3.connect(dst)

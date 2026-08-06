@@ -1,5 +1,6 @@
 # 配置模板：复制为 config.yaml 后按场地实际情况填写(config.yaml 不入 git)
-﻿# 矿机监控配置
+# 所有项都有内置默认值(见 appconfig.py 的 DEFAULTS)，这里只写你要改的即可；
+# 少写一整段也不会崩，启动时会自动补默认并把不合法的值收敛到安全范围。
 scan:
   # 网段：优先用 segments.json(网页可编辑)；为空则回退到下面的 base + lo-hi
   segments: []          # 如 ["172.16.119","172.16.120"]，网页「网段设置」里增删
@@ -8,54 +9,70 @@ scan:
   base: "172.16"        # 回退用：IP 前两段
   lo: 100               # 回退用：第三段起始
   hi: 160               # 回退用：第三段结束
-  online_timeout: 0.5   # 在线判定超时(秒)
-  data_timeout: 2.0     # 取算力超时(秒)
-  workers: 300          # 快巡检并发(已知在线机,可高)
+  online_timeout: 2.5   # 在线判定超时(秒)；远程/跨网访问 RTT≈0.5s 时，0.5s 会误杀几乎全部矿机
+  data_timeout: 5.0     # 取算力超时(秒)
+  workers: 300          # 名册巡检并发(已知真机,可高)
   discovery_workers: 300 # 全网发现并发
   liveness_gate: true   # 发现时先快速 TCP 连 80 判活(三类设备都开80)，死IP不再白跑3个探测
-  gate_timeout: 0.4     # 判活连接超时(秒)
+  gate_timeout: 2.0     # 判活连接超时(秒)；须明显大于到矿机的 RTT，否则整网假离线
   max_pps: 100          # 每秒新建连接上限(≈死IP的ARP速率)，保护三层500pps CoPP(5倍余量)；0=不限
   # 二次确认：上次在线、本次掉线/零算力的机器，用更宽松超时重探，去掉抖动/慢响应误判
   reconfirm_enabled: true
-  reconfirm_online_timeout: 2.0  # 二次确认的连接超时(秒)
-  reconfirm_data_timeout: 5.0    # 二次确认的取数超时(秒)
+  reconfirm_online_timeout: 3.0  # 二次确认的连接超时(秒)
+  reconfirm_data_timeout: 6.0    # 二次确认的取数超时(秒)
   reconfirm_passes: 2            # 重探轮数(任一轮恢复即判在线)
+  reconfirm_max: 800             # 疑似掉线超过此数=真实大面积事件，不重探(别在网络最脆弱时加压)
   fetch_worker: true    # 在线机额外取矿工名(cgminer 4028 pools, 明文跨固件)
   container_offline_kick_sec: 86400  # 集装箱离线超过此秒数(默认24h)从记忆中踢除
-  roster_retention_days: 7   # 机器名册保留天数(限电下线的机器在此期内每5分钟仍会被探测以抓恢复)
+  roster_retention_days: 7   # 机器名册保留天数(限电下线的机器在此期内仍会被巡检以抓恢复)
+  migrate_max: 200      # 一轮最多自动下架多少个"同SN已在新IP上线"的旧IP残影，超过则交人工
   passwords:            # 原厂 digest 依次尝试的密码
     - ["root", "root"]
 
 schedule:
-  scan_interval: 300    # 全网扫描间隔(秒)，默认5分钟扫一次全部网段(新机/掉线/限电全覆盖)
   enabled: true         # 是否开启后台定时扫描
-  watchdog_minutes: 0   # 看门狗：超过N分钟无成功扫描则告警；0=自动取 scan_interval×3
+  # 两档扫描（不要合成一档！）：
+  #   巡检 scan_interval —— 只探名册内的已知真机(约5千台)，抓上线/掉线/掉算力，日常主力
+  #   发现 full_interval —— 展开全部网段(约1.5万地址)找新装机，死IP判活超时是主要耗时来源
+  # 合成"每5分钟全扫一次"会让扫描耗时逼近间隔本身，系统长期处于"永远在扫"，
+  # 既压三层网络，也让 SQLite 的 WAL checkpoint 永远追不上。
+  scan_interval: 300    # 名册巡检间隔(秒)
+  full_interval: 3600   # 全网发现间隔(秒)
+  watchdog_minutes: 0   # 看门狗：超过N分钟无成功扫描则告警+自愈；0=自动按上面两个间隔推算
   container_interval: 10 # 集装箱(冷却)高频刷新间隔(秒)，独立于矿机扫描；带宽可忽略
 
 alerts:
   enabled: true
-  cooldown: 1800              # 同机同类告警冷却(秒)，防刷屏
-  zero_grace_sec: 600        # 零算力机器运行时长<此值(秒)暂不报(刚开机/限电恢复升频中)；0=立即报
-  reject_pct: 5.0            # 拒绝率 ≥ 此值(%) → 矿池健康告警；0 关闭
-  segment_down_ratio: 0.6    # 某网段原在线机掉线比例 ≥ 此值 → 合并为网段事件
-  segment_down_min: 5        # 且掉线数 ≥ 此值才触发网段去重
+  cooldown: 1800              # 同机同类告警冷却(秒)，防抖动刷屏
+  zero_grace_sec: 600         # 零算力机器运行时长<此值(秒)暂不报(刚开机/限电恢复升频中)；0=立即报
+  reject_pct: 5.0             # 拒绝率 ≥ 此值(%) → 矿池健康告警；0 关闭
+  segment_down_ratio: 0.6     # 某网段已知真机掉线比例 ≥ 此值 → 合并为网段事件
+  segment_down_min: 5         # 且掉线数 ≥ 此值才触发网段合并
+  # 掉算力：矿场最常见的故障形态(算力板/风扇坏一块)，机器"在线且有算力"但只剩一半，
+  # 光靠零算力告警是完全静默的。基线取同机型在线机的实时算力中位数。
+  low_hashrate_ratio: 0.7     # 低于同机型中位数的此比例 → 告警；0=关
+  low_hashrate_rounds: 2      # 连续 N 轮成立才报(防单轮读数抖动)
+  low_hashrate_min_peers: 5   # 同机型在线机少于此数不做基线(样本太少不可信)
+  overheat_c: 95              # 芯片温 ≥ 此值(℃) → 高温告警；0=关
+  overheat_clear_c: 90        # 回落到此值以下才消警(滞回，防临界抖动刷屏)
   # 集装箱：以下故障位不报警(仍在卡片显示)
-  # supply_liquid_flow_low=供液流量低 liquid_level_high=液位高 supply_liquid_pressure_high=供液压力高 leakage_fault=漏液
-  container_faults_ignore: ["supply_liquid_flow_low", "liquid_level_high", "supply_liquid_pressure_high", "leakage_fault"]
+  # supply_liquid_flow_low=供液流量低 liquid_level_high=液位高 supply_liquid_pressure_high=供液压力高
+  # ⚠ 注意 leakage_fault(漏液) 属于 crit 级安全故障，除非确认是误报，否则不建议加进忽略列表
+  container_faults_ignore: ["supply_liquid_flow_low", "liquid_level_high", "supply_liquid_pressure_high"]
   container_supply_pressure_min: 0.2   # 供液压 < 此值(MPa) → 告警；0=关
   container_return_pressure_min: 0.05  # 回液压 < 此值(MPa) → 告警；0=关
 
 telegram:
-  enabled: false        # 填好 token/chat_id 并改 true 才推送
+  enabled: false        # 填好 token/chat_id 并改 true 才推送(推送走独立线程，不阻塞扫描)
   bot_token: ""
   chat_id: ""
 
-cloud:                  # 云端总览上报(E:\main 部署到云服务器后启用)：本地每分钟主动推，NAT后无需端口映射
+cloud:                  # 云端总览上报：本地每分钟主动推，场地在 NAT 后无需端口映射
   enabled: false
   url: ""               # 云端总览地址，如 https://overview.example.com
   token: ""             # 云端 config.yaml > ingest.token(或分配给本场地的专属token)
   site_name: ""         # 本场地在云端显示的名字(可改，云端按 site_id 识别不会串数据)
-  site_type: air        # air=风冷 | hydro=水冷 | mixed=混合(风冷+水冷集装箱都有)。只影响云端分组显示
+  site_type: air        # air=风冷 | hydro=水冷 | mixed=混合。只影响云端分组显示
   site_id: ""           # 场地唯一ID。留空=自动生成并存 cloud_site_id.txt(一次生成永不变)。
                         # ⚠ 整目录克隆到新场地时删掉 cloud_site_id.txt 让它重新生成，否则两场地同ID互相覆盖
   interval: 60          # 摘要上报间隔(秒)
@@ -69,35 +86,54 @@ control:
   timeout: 8            # 单条命令超时(秒)
   max_batch: 1000       # 单次批量命令最多目标台数(防一次性误重启全场)
   # 重启浪涌保护：同变压器(常为连号IP)的机器同时上电涌流叠加会跳闸，故打乱+分批+延迟。
-  # 参数按 2500kVA/带380台/单机~5.9kW(满载~90%)/启动6分钟升频 估算：30台/批最坏全压在一台变压器上
+  # 参数按 2500kVA/带380台/单机~5.9kW/启动6分钟升频 估算：30台/批最坏全压在一台变压器上
   # 涌流也只占容量很小一截；8秒间隔远够涌流回落。500台约17批×8s≈2.3分钟跑完。
-  reboot_concurrency: 30   # 每批同时重启多少台(首次跑稳了、没掉压没跳闸，可再上调到50加快)
+  reboot_concurrency: 30   # 每批同时重启多少台
   reboot_delay_sec: 8      # 每批之间间隔秒数(让涌流回落、电压稳定)
-  reboot_shuffle: true     # 打乱重启顺序(把同变压器的连号机器分散到不同批次/时间，最关键)
+  reboot_shuffle: true     # 打乱重启顺序(把同变压器的连号机器分散到不同批次，最关键)
   # 原厂密码复用 scan.passwords
 
 auth:
-  enabled: true         # 关闭=匿名只读(viewer)：可看不可控；远程命令/扫描/改设置等写操作需开启 auth 并以 ops/admin 登录。生产建议开启
-  secure_cookie: false  # 走 HTTPS 时设 true(令牌只在加密连接传输)；纯内网 HTTP 必须 false 否则登录失效
-  # 密码已用 pbkdf2 哈希(不再明文)。改密码: 运行 `python auth.py 新密码` 把输出整串替换下面的 password。
-  # ⚠️ 当前哈希对应的仍是默认弱口令(admin888/ops888/viewer888)，生产务必改成强口令！
+  enabled: true         # 关闭=匿名只读(viewer)：可看不可控。生产建议开启
+  secure_cookie: false  # 走 HTTPS 时设 true；纯内网 HTTP 必须 false 否则登录失效
+  # 改密码: 运行 `python auth.py 新密码` 把输出整串替换下面的 password
   users:                # 角色：admin(全部) / ops(监控+命令+扫描) / viewer(只读)
-    - {username: admin,  password: "pbkdf2$200000$8f3f3ca74b10da69d665dc6a5694dcdc$f2c872c5f248eb4bcadcb8da4bcda8842e68614c41f01384c43548a10fa01101",  role: admin}
-    - {username: ops,    password: "pbkdf2$200000$2af185caf576bd47ca9a1c57e5b73241$cc4ce8c448ccddbf56c53c37d59dd2136cf79316b27e040725aa0c921b62260c",    role: ops}
-    - {username: viewer, password: "pbkdf2$200000$0b7fcbad4ac213bd997821f057b7a6ae$be42a14bbede1b4493a4849e3c271a8665ec45c0fafb33cb7d9f0f3f7568784a", role: viewer}
+    - {username: admin,  password: "改成 python auth.py 生成的哈希", role: admin}
+    - {username: ops,    password: "改成 python auth.py 生成的哈希", role: ops}
+    - {username: viewer, password: "改成 python auth.py 生成的哈希", role: viewer}
 
-update:                 # git 更新器(git clone 部署时可用): 网页API/命令行检测新版本并更新
+update:                 # git 更新器(git clone 部署时可用)
   auto: false           # true=检测到新版本自动拉取+重启(需 NSSM/run.bat 守护进程接管重启)
   branch: ""            # 跟踪分支; 留空=当前分支。生产建议专用 release 分支
   check_interval: 3600  # 自动检测间隔(秒)
 
 db:
   path: "miner_monitor.db"
-  retention_days: 3     # 快照保留天数，超过自动清理
+  retention_days: 3          # 明细快照保留天数(每轮5千行，占空间的大头)
+  # 计费聚合：每小时把每个客户的交付算力/耗电/可用率归档进 worker_hourly 表。
+  # 明细删了它还在，所以"近30天/90天客户报表"才能算得出来(月度对账的依据)。
+  # 一天只增几百行，留一年也才十几万行。
+  rollup_retention_days: 400
+  checkpoint_minutes: 10     # 每 N 分钟做一次 WAL checkpoint(TRUNCATE)
+                             # ⚠ 不做这件事 WAL 会长到几百MB，读越来越慢、崩溃恢复越来越久
+  vacuum_hour: 4             # 每天几点 VACUUM 回收删除留下的空页；-1=关闭
+                             # (SQLite 删行不缩文件；VACUUM 期间独占数据库，故放低峰期)
 
 server:
   host: "0.0.0.0"
   port: 8800
+  # 前置 nginx/frp 时填代理的 IP 或 CIDR，才会信任 X-Forwarded-For 取真实客户端IP。
+  # 留空=不信任任何代理(直连部署的正确选择)。不填而前面有代理 → 登录限流会按代理IP
+  # 算成一个人，一人爆破锁死所有人；乱填 → 任何人加个伪造头就能绕过限流。
+  trusted_proxies: []        # 如 ["10.0.0.5", "192.168.1.0/24"]
 
 public_api:
-  token: ""   # 留空=关闭Agent取数API; 生成: python -c "import secrets;print(secrets.token_hex(32))"
+  # 外部 Agent 取数用的共享 Token。留空 = 整组 /api/public/* 返回 404(fail-closed)
+  # 生成: python -c "import secrets;print(secrets.token_hex(32))"
+  token: ""
+
+logging:
+  level: INFO           # DEBUG | INFO | WARNING | ERROR
+  file: ""              # 留空=写 logs/miner.log
+  max_mb: 20            # 单个日志文件上限，超过自动轮转
+  backups: 5            # 保留几个历史文件

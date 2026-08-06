@@ -1,0 +1,18 @@
+schedule:
+  enabled: false
+db:
+  path: ":memory:"
+auth:
+  enabled: true
+  users:
+    - username: admin
+      password: test-admin-password
+      role: admin
+    - username: viewer
+      password: test-viewer-password
+      role: viewer
+control:
+  enabled: true
+  max_batch: 2
+public_api:
+  token: test-public-token

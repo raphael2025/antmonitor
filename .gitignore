@@ -11,9 +11,13 @@ backups/
 *.settings.json
 settings.json
 
-# 日志
+# 日志(logs.py 轮转输出到 logs/)
 *.log
 server.log
+logs/
+
+# 测试缓存
+.pytest_cache/
 
 # 敏感/本机文件：git 更新流程(updater.py)要求这些永不入库——更新永远不碰配置和数据
 config.yaml
