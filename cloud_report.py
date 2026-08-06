@@ -71,16 +71,24 @@ def enabled(cfg):
 
 
 _GEN = 0   # 代数：每次 start() 递增使旧线程下一轮自行退出——支持网页改配置后热重启
+_thread = None   # 当前上报线程引用，供 is_alive() 给看门狗做存活检查
+
+
+def is_alive():
+    """上报线程是否还活着，供外部(server.py 的 guardian 循环)做存活检查+自愈。
+    未启用云端上报时线程本就不存在，调用方应先用 enabled(cfg) 判断。"""
+    return bool(_thread and _thread.is_alive())
 
 
 def start(cfg, get_summary, get_customers):
     """启动/热重启上报线程(旧线程自动失效)。未启用时仅停掉旧线程。
     get_summary: () -> /api/public/summary 同构 dict
     get_customers: (hours:int) -> customers 列表(worker/machines/uptime_pct/delivered_th_h/power_kwh)"""
-    global _GEN
+    global _GEN, _thread
     _GEN += 1        # 先递增：即使下面初始化失败，旧线程也必须停掉
     try:
         if not enabled(cfg):
+            _thread = None
             return None
         c = dict(cfg.get("cloud") or {})
         sid = site_id(cfg)
@@ -89,9 +97,11 @@ def start(cfg, get_summary, get_customers):
         t = threading.Thread(target=_loop, args=(_GEN, c, sid, get_summary, get_customers),
                              daemon=True, name="cloud-report")
         t.start()
+        _thread = t
         return t
     except Exception as e:  # noqa: BLE001  上报是附加功能，绝不能拖垮主服务启动
         log.error("云端上报初始化失败，本功能已禁用，原因：%s", e, exc_info=True)
+        _thread = None
         return None
 
 
@@ -139,6 +149,7 @@ def _loop(gen, c, sid, get_summary, get_customers):
                     "containers_faulty": s.get("containers_faulty") or 0,
                     "containers_offline": s.get("containers_offline") or 0,
                     "scan_age_s": (now - scan_ts) if scan_ts else None,
+                    "alert_summary": s.get("alert_summary") or [],
                 })
                 pushed = True
                 if fails:

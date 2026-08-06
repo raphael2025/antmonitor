@@ -547,12 +547,25 @@ def scan(ips, cfg, progress_cb=None, workers=None):
     except TimeoutError:
         log.warning("scan: 整体超时 %ds，已完成 %d/%d", int(overall_to), len(seen), total)
     finally:
+        # 整轮扫描拥堵/超时时，"排不上号、压根没问过"的机器绝不能当成"问了确认离线"——
+        # 否则链路一抖动就能把成百上千台在线机批量误报离线。用 f.cancel() 的返回值
+        # 区分：线程池里还没排到(never_started) vs. 已经在跑但卡住没回来(started_stuck)，
+        # 两者都标记 unknown，交给上层(alerts.evaluate)原样跳过、保留上一轮状态。
+        never_started = started_stuck = 0
         for f, ip in futs.items():
             if ip in seen:
                 continue
-            f.cancel()
-            results.append(_blank(ip, "offline"))
+            if f.cancel():
+                never_started += 1
+            else:
+                started_stuck += 1
+            rec = _blank(ip, "unknown")
+            rec["note"] = "本轮未探测(扫描超时)"
+            results.append(rec)
             done += 1
+        if never_started or started_stuck:
+            log.warning("scan: %d 台本轮未探测，保留原状态不判离线(排队未启动 %d / 已启动但卡住 %d)",
+                        never_started + started_stuck, never_started, started_stuck)
         try:
             ex.shutdown(wait=False, cancel_futures=True)
         except TypeError:  # Python < 3.9

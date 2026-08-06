@@ -58,6 +58,7 @@
 | `miner_core.py` | 探测核心（**纯数据，无副作用**） | `probe` `scan` `probe_stock/uniplus/antbox` `fetch_pool` `gen_ips_seg` `rank` `RateLimiter` `tcp_open` |
 | `db.py` | SQLite 存储层（共享连接 + `RLock`） | `init_db` `save_scan` `roster_ips` `upsert_known_miners` `raise/resolve_alert` `active_alerts_by_type` `customer_report` `prune` |
 | `alerts.py` | 告警规则评估 + 恢复 + Telegram | `evaluate` `evaluate_containers` `_push_batch` |
+| `cloud_alert_summary.py` | 活跃告警按类型+客户聚合（只读，只给云端上报用，不含单机IP） | `build` |
 | `control.py` | 远程命令（写设备，双固件） | `run_batch` `run_one` `_stock` `_uniplus` |
 | `auth.py` | 登录 + RBAC + pbkdf2 + 失败限流 | `login` `current` `has_role` `hash_password` `locked` |
 | `service.py` | 扫描编排 + 后台调度线程 | `MonitorService` `_do_scan` `_loop` `_container_loop` `_watchdog_loop` `_reconfirm` `scan_full` |

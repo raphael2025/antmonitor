@@ -361,7 +361,7 @@ async function refreshMiners() {
     return `<tr class="${rowClass(r)} ${selected.has(r.ip) ? "sel" : ""}">`
       + `<td class="cbcol"><input type="checkbox" data-ip="${esc(r.ip)}" ${ck}></td>`
       + `<td class="ip-link" onclick="openMiner('${esc(r.ip)}')">${esc(r.ip)}</td>`
-      + `<td>${r.mstate === "repair" ? '<span class="pill repair">维修中</span>' : `<span class="pill ${esc(r.status)}">${r.status === "online" ? "在线" : "离线"}</span>`}</td>`
+      + `<td>${r.mstate === "repair" ? '<span class="pill repair">维修中</span>' : `<span class="pill ${esc(r.status)}" title="${r.status === "unknown" ? "本轮扫描超时没来得及探测，非确认离线" : ""}">${r.status === "online" ? "在线" : r.status === "unknown" ? "未探测" : "离线"}</span>`}</td>`
       + `<td>${r.firmware ? `<span class="pill ${esc(r.firmware)}">${esc(r.firmware)}</span>` : "-"}</td>`
       + `<td>${esc(r.model) || "-"}</td>`
       + hrCell(r) + `<td>${r.hr_avg != null ? fmtHash(r.hr_avg) : "-"}</td>`
@@ -404,11 +404,14 @@ async function refreshRacks() {
   const legend = `<div class="legend" style="margin-bottom:12px">`
     + `<span><i class="dot slot ok"></i>在线</span><span><i class="dot slot zero"></i>零算力</span>`
     + `<span><i class="dot slot offline"></i>离线</span><span><i class="dot slot empty"></i>空机位</span>`
+    + `<span><i class="dot slot unknown"></i>未探测(本轮扫描超时)</span>`
     + `<span class="muted">（格子里是机位号，空号一眼可见）</span></div>`;
   $("rackList").innerHTML = legend + (d.racks || []).map(rk => {
     const slots = rk.slots.map(s => {
       if (s.st === "empty")   // 空机位：灰、不可点
         return `<div class="slot empty" title="${esc(s.ip)} · 空机位">${s.h}</div>`;
+      if (s.st === "unknown")   // 本轮未探测：不是离线，别吓人
+        return `<div class="slot unknown" title="${esc(s.ip)} · 本轮扫描超时没来得及探测" onclick="openMiner('${esc(s.ip)}')">${s.h}</div>`;
       const tip = `${s.ip}${s.hr != null ? " · " + fmtHash(s.hr) : ""}${s.temp != null ? " · " + s.temp + "℃" : ""}`;
       return `<div class="slot ${s.st}" title="${esc(tip)}" onclick="openMiner('${esc(s.ip)}')">${s.h}</div>`;
     }).join("");

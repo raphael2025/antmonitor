@@ -78,6 +78,7 @@ td.low { color: #f0883e; font-weight: 600; }
 .pill.repair { background: #2d2410; color: #e3b341; }
 .pill.stock { background: #2a2230; color: #d2a8ff; }
 .pill.uniplus { background: #1c2a33; color: #56d4dd; }
+.pill.unknown { background: #12233d; color: #58a6ff; }
 
 .filters { display: flex; gap: 10px; margin-bottom: 12px; }
 .filters input, .filters select {
@@ -145,6 +146,7 @@ body.viewer #btnFull, body.viewer #btnQuick { display: none !important; }
 .slot.offline { background: #da3633; }              /* 货架 离线 红 */
 .slot.empty { background: #242931; color: rgba(255,255,255,.18); cursor: default; }  /* 货架 空机位 灰 */
 .slot.empty:hover { outline: none; }
+.slot.unknown { background: #1f6feb; }              /* 货架 本轮未探测(非离线) 蓝 */
 .rack { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
 .rack-head { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 13px; }
 .rack-head .name { font-weight: 600; color: #c9d1d9; }

@@ -137,6 +137,8 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     # —— 网段级故障(基于当前绝对离线率)：交换机持续挂着会一直维持事件 ——
     seg_total, seg_off = {}, {}
     for ip, r in cur.items():
+        if r["status"] == "unknown":   # 本轮未探测：不确定死活，不计入网段分母/分子
+            continue
         if ip in roster:
             seg = ".".join(ip.split(".")[:3])
             seg_total[seg] = seg_total.get(seg, 0) + 1
@@ -164,6 +166,11 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             peers[r.get("model") or "?"] = peers.get(r.get("model") or "?", 0) + 1
 
     for ip, r in cur.items():
+        if r["status"] == "unknown":
+            # 本轮扫描超时没来得及探测(miner_core.scan 的 overall_to 兜底)：
+            # 既不是确认在线也不是确认离线，原样跳过——保留上一轮的告警状态不动，
+            # 既不新报也不误清，等下一轮真正探测到再判断。
+            continue
         seg = ".".join(ip.split(".")[:3])
         if r["status"] == "offline":
             for t in ("zero", "reject", "low_hashrate", "overheat"):
