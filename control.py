@@ -7,17 +7,121 @@
 - 重启/换矿池为破坏性操作，前端强制二次确认；本层只负责执行。
 - 所有命令写入 command_log 审计表。
 """
+import ipaddress
 import random
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.auth import HTTPDigestAuth
 
+import appconfig
 import miner_core
 
 ACTIONS = {"reboot", "locate", "set_pools"}
+
+
+def _seg_prefix(seg):
+    """把一条网段配置(如 "172.16.5" / "172.16.5.x")归一成 "172.16.5"；非法返回 None。
+
+    解析规则与 miner_core.gen_ips_seg() 保持一致(取前三段)，只额外做数值归一，
+    保证"扫描时会生成的 IP"与"命令校验放行的 IP"是同一个集合。
+    """
+    parts = str(seg).strip().split(".")
+    if len(parts) < 3:
+        return None
+    try:
+        octets = [int(p) for p in parts[:3]]
+    except (TypeError, ValueError):
+        return None
+    if any(o < 0 or o > 255 for o in octets):
+        return None
+    return ".".join(str(o) for o in octets)
+
+
+def known_ip_scope(cfg):
+    """返回 (网段前缀集合, host_start, host_end)——即本矿场"允许被下发命令"的地址范围。
+
+    直接复用 appconfig.load_segments(cfg)，与扫描线程用的是同一份网段配置。
+    """
+    segs, hs, he = appconfig.load_segments(cfg)
+    prefixes = set()
+    for s in segs or []:
+        p = _seg_prefix(s)
+        if p:
+            prefixes.add(p)
+    try:
+        hs, he = int(hs), int(he)
+    except (TypeError, ValueError):
+        hs, he = 1, 254
+    if he < hs:
+        hs, he = he, hs
+    return prefixes, hs, he
+
+
+def is_known_ip(ip, scope):
+    """ip 是否落在 scope(known_ip_scope() 的返回值)描述的网段范围内。"""
+    prefixes, hs, he = scope
+    parts = str(ip).split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        host = int(parts[3])
+    except (TypeError, ValueError):
+        return False
+    return ".".join(parts[:3]) in prefixes and hs <= host <= he
+
+
+def filter_known_ips(ips, cfg):
+    """按矿场配置网段过滤命令目标，返回 (allowed, rejected) 两个 IP 字符串列表。
+
+    allowed  = 落在任意一个配置网段(前缀 + host_start~host_end)内的 IP，保持入参顺序；
+    rejected = 其余 IP(如 127.0.0.1、公网地址、内网其它业务系统)，调用方应拒绝执行
+               并把这些 IP 回显给用户，切勿静默丢弃。
+
+    这是防 SSRF/凭证外泄的关键一层：本模块会对目标发起带 Digest 认证的 HTTP 请求，
+    目标一旦超出矿场网段，监控服务器就成了内网扫描跳板，矿机管理密码也会被送到
+    攻击者可控的服务上。网段配置为空时一律判为 rejected(失败关闭，不放行)。
+    """
+    scope = known_ip_scope(cfg)
+    allowed, rejected = [], []
+    for ip in ips or []:
+        (allowed if is_known_ip(ip, scope) else rejected).append(ip)
+    return allowed, rejected
+
+
+def normalize_ips(ips, max_batch, cfg=None):
+    """校验 IPv4 目标并按原顺序去重，防止同一台机器被重复执行命令。
+
+    返回 (ip_list, error_msg)；error_msg 非空时 ip_list 为 None。
+
+    传入 cfg 时(推荐，所有对外接口都应传)会额外做网段校验：只要有任何一个目标
+    不在配置网段内，整个请求被拒绝(fail closed)，错误信息里列出越界的 IP。
+    需要"部分放行"的调用方请改用 filter_known_ips()。
+    cfg 省略时行为与旧版完全一致(仅格式校验)，保持向后兼容。
+    """
+    if not isinstance(ips, list) or not ips:
+        return None, "未指定目标矿机"
+    out = []
+    seen = set()
+    for raw in ips:
+        if not isinstance(raw, str):
+            return None, "目标 IP 必须是字符串"
+        try:
+            ip = str(ipaddress.IPv4Address(raw.strip()))
+        except ipaddress.AddressValueError:
+            return None, f"非法 IPv4 地址: {str(raw)[:64]}"
+        if ip not in seen:
+            seen.add(ip)
+            out.append(ip)
+    if len(out) > int(max_batch):
+        return None, f"单次目标超过上限 {max_batch} 台，请分批"
+    if cfg is not None:
+        out, rejected = filter_known_ips(out, cfg)
+        if rejected:
+            shown = "、".join(rejected[:5]) + ("…" if len(rejected) > 5 else "")
+            return None, f"以下 {len(rejected)} 个 IP 不在矿场配置网段内，已拒绝: {shown}"
+    return out, ""
 
 
 def _stock(ip, action, params, passwords, timeout):

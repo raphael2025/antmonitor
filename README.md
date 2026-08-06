@@ -37,16 +37,31 @@
 
 ```
 miner_core.py     扫描核心（探测/并发/排名/基线），无副作用，纯数据
-db.py             SQLite：扫描快照 + 告警 + 命令审计 command_log
-alerts.py         告警规则评估 + Telegram 推送
+db.py             SQLite：扫描快照 + 告警 + 计费聚合 + 命令审计；也是运维CLI(见下)
+alerts.py         告警规则评估 + 推送（批量写库，一轮评估只 2 读 2 写）
 control.py        远程命令层（重启/定位灯/换矿池，原厂+第三方双路）
 auth.py           登录 + 角色权限（admin/ops/viewer）
-service.py        扫描编排 + 后台定时巡检线程
+appconfig.py      配置装载/默认值/校验 + settings.json、segments.json 读写
+logs.py           统一日志（控制台 + 轮转文件）
+service.py        扫描编排 + 定时巡检/看门狗/数据库维护线程
 server.py         FastAPI：JSON API + 托管前端 + 鉴权
 web/              前端面板（index.html / style.css / app.js，Chart.js 趋势图）
 scan_miners.py    命令行扫描器（薄封装，复用 miner_core）
-config.yaml       配置
+backup_db.py      SQLite 在线热备份 + 完整性校验 + 滚动保留
+tests/            pytest：告警状态机 / 计费 / 扫描编排（`python -m pytest tests/ -q`）
+config.yaml       配置（不入 git，模板见 config.example.yaml）
 ```
+
+### 数据库运维 CLI
+
+```bash
+python db.py stats        # 主库/WAL 大小、报表可覆盖小时数
+python db.py checkpoint   # 立即把 WAL 合并回主库并截断
+python db.py rollup       # 立即补跑计费小时聚合
+python db.py vacuum       # 回收删除留下的空页（独占数据库，放低峰期）
+```
+> 服务运行时这三件事由后台维护线程按 `db.checkpoint_minutes` / `db.vacuum_hour` 自动做，
+> CLI 只是需要手动介入时用。
 
 ## 登录与权限（RBAC）
 
@@ -144,8 +159,21 @@ python scan_miners.py --report miners_xxx.csv  # 只从 CSV 出报告
 
 ## 扫描性能与负载控制（针对三层 500pps CoPP）
 
+**两档扫描（这是容量设计的核心，别再合成一档）：**
+
+| | 巡检 quick | 全网发现 full |
+|---|---|---|
+| 目标 | 名册内已知真机（约5千台） | 展开全部网段（约1.5万地址） |
+| 间隔 | `schedule.scan_interval`（默认300s） | `schedule.full_interval`（默认3600s） |
+| 抓什么 | 上线/掉线/掉算力/高温，日常主力 | 新装机/新网段 |
+
+死 IP 的判活超时是全扫耗时的主要来源。若把两档合成「每5分钟全扫一次」，扫描耗时会
+逼近间隔本身，系统长期处于「永远在扫」状态：既压三层网络，也让 SQLite 的 WAL
+checkpoint 永远追不上（本项目曾因此把 WAL 涨到 800MB）。单轮耗时超过巡检间隔时日志会告警。
+
 - **快速判活闸门**（`scan.liveness_gate`）：先 1 次 TCP 连 80 判活（原厂/第三方/AntBox 三类都开80），
-  死 IP ~0.4s 直接判离线，不再白跑 3 个探测。（6060 只对原厂有效，故用 80 通用判活。）
+  死 IP 直接判离线，不再白跑 3 个探测。（6060 只对原厂有效，故用 80 通用判活。）
+  `gate_timeout` 必须明显大于到矿机的 RTT，否则整网假离线。
 - **ARP 限速**（`scan.max_pps`，默认 100）：令牌桶限制每秒新建连接(≈死IP的 ARP 速率)，
   护住三层的 ARP/控制平面(CoPP)限制。`discovery_workers` 是并发上限，实际由 max_pps 节流。
 - 数据流量（读矿机/箱子）是硬件转发的数据平面，**不占 CoPP**，无需限制。
@@ -162,19 +190,34 @@ python scan_miners.py --report miners_xxx.csv  # 只从 CSV 出报告
 ## 告警规则
 
 - **掉线** offline：上次在线、本次超时 → crit
-- **零算力** zero：在线但实时算力为 0（含读不到）→ warn
+- **零算力** zero：在线但实时算力**明确为 0** → warn。
+  注意：算力读不到(null，接口超时/密码错)**不算**零算力，既不报也不清——
+  否则一次接口抖动就误报一片。面板对应显示「无数据」而不是红色的 0。
+- **掉算力** low_hashrate：算力低于**同机型在线机中位数**的 `low_hashrate_ratio`(默认70%)，
+  且连续 `low_hashrate_rounds`(默认2) 轮成立 → warn。矿场最常见的故障形态
+  （算力板/风扇坏一块，机器还"在线且有算力"），只看零算力是完全静默的。
+- **高温** overheat：芯片温 ≥ `overheat_c`(默认95℃) → crit，回落到 `overheat_clear_c`(90℃)
+  以下才消警（滞回，防临界值反复刷屏）
 - **拒绝率** reject：拒绝率 ≥ `alerts.reject_pct`(默认5%) → warn（矿池健康，4028 取 accepted/rejected/stale）
-- **网段事件** segment_down：某段「原在线」机掉线比例 ≥ `segment_down_ratio`(0.6) 且数量 ≥ `segment_down_min`(5)
-  → **合并成一条事件**（疑似交换机/断电），并抑制该段的单条掉线，防刷屏
-- **监控停滞** stalled（看门狗）：超过 `schedule.watchdog_minutes`(0=scan_interval×3) 无成功扫描 → crit，
-  防止扫描进程悄悄死掉。建议进程再交 systemd/NSSM 守护。
+- **网段事件** segment_down：某段「已知真机」掉线比例 ≥ `segment_down_ratio`(0.6) 且数量 ≥ `segment_down_min`(5)
+  → **合并成一条事件**（疑似交换机/断电），并抑制该段的单条掉线/零算力，防刷屏
+- **监控停滞** stalled（看门狗）：超过 `schedule.watchdog_minutes`(0=按扫描间隔自动推算) 无成功扫描
+  → crit，防止扫描进程悄悄死掉。建议进程再交 systemd/NSSM 守护。
 
-> 同机同类告警恢复后自动 resolve；货架配色：正常(绿)/零算力(红)/离线·空位(灰)。
+> 同机同类告警恢复后自动 resolve；标记「维修中」的机器完全静音；货架配色：正常(绿)/零算力(黄)/离线(红)/空位(灰)。
 
 ## 客户报表（内部对账）
 
-「矿工名」标签页选周期（当前/24h/3天/7天）：当前=机型分布；周期=按客户出
+「矿工名」标签页选周期（当前/24h/3天/7天/30天/90天）：当前=机型分布；周期=按客户出
 **可用率% / 交付算力 TH·h / 耗电 kWh**（停机正确归属到该机已知矿工名）。用于托管对账。
+
+**长周期怎么做到的**：明细快照按 `db.retention_days`(默认3天)清理，但每小时会把
+「每客户的交付算力/耗电/在线样本」归档进 `worker_hourly` 表，保留 `db.rollup_retention_days`
+(默认400天)。报表 = 已归档小时 + 当前未归档小时拼接，所以明细删了月度对账照样算得出。
+一天只增几百行。清理逻辑有硬保证：**删除线永远不越过归档进度**，没归档的明细一条都不删。
+
+> 计量口径：单次扫描代表「到下一次扫描」的时长，且单次最多计 15 分钟——
+> 监控自己停摆时不会把停机时间按最后一次读数算成交付算力。
 
 ## 告警通道
 

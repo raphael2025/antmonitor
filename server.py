@@ -1,27 +1,143 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Web 服务：JSON API + 前端面板。"""
-import os
-import asyncio
-import threading
+"""Web 服务：JSON API + 前端面板。
 
-from fastapi import FastAPI, Query, Body, Request, Response, Depends, HTTPException, WebSocket
+数据路径约定：面板/Agent 读的"当前状态"一律来自 MonitorService 的**内存快照**
+(SVC.latest())，不再每个请求回查 SQLite。一个浏览器每 30 秒刷新会打 3~4 个接口，
+每个都拉 5000 行是纯粹的浪费，而且会和扫描落库抢数据库。历史/报表类查询才走 DB。
+"""
+import asyncio
+import contextlib
+import hmac as _hmac
+import ipaddress
+import os
+import threading
+import time
+
+from fastapi import (Body, Depends, FastAPI, HTTPException, Query, Request,
+                     Response, WebSocket)
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.gzip import GZipMiddleware
 
-import db
-import miner_core
-import control
+import appconfig
 import auth
-import service as service_mod
-from service import MonitorService, load_config
+import cloud_report
+import control
+import db
+import logs
+import miner_core
+import updater
+from service import MonitorService
 
-CFG = load_config(os.environ.get("MINER_CONFIG", "config.yaml"))
-service_mod.apply_settings(CFG, service_mod.load_settings())  # 网页保存的参数覆盖
+CFG = appconfig.load_config(os.environ.get("MINER_CONFIG", "config.yaml"))
+logs.setup(CFG)
+log = logs.get(__name__)
+
+appconfig.apply_settings(CFG, appconfig.load_settings())   # 网页保存的参数覆盖
 SVC = MonitorService(CFG)
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
-app = FastAPI(title="矿机监控")
+WS_CLIENTS = set()
+WS_MAX_CLIENTS = 500   # 并发 WS 上限：无界集合会被脚本用海量连接耗尽内存/文件句柄
+MAIN_LOOP = None
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app_):
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
+    SVC.notify = _broadcast_threadsafe   # 扫描线程→WS 推送
+    SVC.start_scheduler()
+    guardian = MAIN_LOOP.create_task(_guardian_loop())   # 不依赖 daemon 线程的最终兜底
+    if cloud_report.start(CFG, _build_public_summary,
+                          lambda hours: db.customer_report(SVC.conn, hours)):
+        log.info("云端上报已启动 → %s (场地: %s, ID: %s)", CFG["cloud"]["url"],
+                 CFG["cloud"]["site_name"], cloud_report.site_id(CFG))
+    updater.start_auto(CFG.get("update") or {})
+    _startup_selfcheck()
+    try:
+        yield
+    finally:
+        guardian.cancel()
+        SVC.stop()
+        db.close_readers()
+
+
+app = FastAPI(title="矿机监控", lifespan=lifespan)
+# 矿机列表全量可达 1~2MB JSON，内网千兆也值得压(通常压到 1/10)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+
+def _startup_selfcheck():
+    main_sz, wal_sz = db.db_size(SVC.conn)
+    log.info("数据库 %.0f MB (WAL %.0f MB)，报表可覆盖约 %d 小时",
+             main_sz / 1e6, wal_sz / 1e6, db.coverage_hours(SVC.conn))
+    if wal_sz > 256 * 1024 * 1024:
+        log.warning("WAL 文件偏大(%.0f MB)，启动后首次 checkpoint 可能耗时较久", wal_sz / 1e6)
+    if auth.enabled(CFG):   # 安全自检：仍用默认弱口令则醒目告警
+        weak = auth.weak_default_users(CFG)
+        if weak:
+            log.error("=" * 64)
+            log.error("安全警告: 用户 %s 仍在使用默认弱口令(admin888 等)", weak)
+            log.error("该系统可远程重启/换矿池全场，请立即用 `python auth.py 新强口令` 改掉")
+            log.error("=" * 64)
+    else:
+        log.warning("auth.enabled=false：任何人可匿名只读访问面板")
+
+
+async def _guardian_loop():
+    """主事件循环守护：daemon 扫描/看门狗全死时仍能拉起（Web 活着就有人盯）。"""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await asyncio.get_running_loop().run_in_executor(None, SVC.health_tick)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("guardian loop error: %s", e)
+
+
+# ---- 客户端 IP（限流/审计的依据）----
+def _trusted_nets():
+    out = []
+    for s in (CFG.get("server", {}).get("trusted_proxies") or []):
+        try:
+            out.append(ipaddress.ip_network(str(s), strict=False))
+        except ValueError:
+            log.warning("server.trusted_proxies 中的 %r 不是合法 IP/CIDR，已忽略", s)
+    return out
+
+
+_TRUSTED = _trusted_nets()
+
+
+def _client_ip(request: Request):
+    """真实客户端 IP。
+
+    只有当直连对端本身在 server.trusted_proxies 里时才采信 X-Forwarded-For——
+    否则任何人加一个伪造头就能绕过登录失败锁定和公共 API 限流。
+    默认不信任任何代理，直连部署下这是正确且安全的行为。"""
+    peer = request.client.host if request.client else ""
+    if _TRUSTED and peer:
+        try:
+            ip = ipaddress.ip_address(peer)
+        except ValueError:
+            return peer
+        if any(ip in n for n in _TRUSTED):
+            xff = request.headers.get("x-forwarded-for", "")
+            if xff:
+                # 取最右侧一个非可信代理的地址(左侧可被客户端伪造)
+                for part in reversed([p.strip() for p in xff.split(",") if p.strip()]):
+                    try:
+                        cand = ipaddress.ip_address(part)
+                    except ValueError:
+                        continue
+                    if not any(cand in n for n in _TRUSTED):
+                        return part
+    return peer
 
 
 def _sess(request: Request):
@@ -46,16 +162,19 @@ require_admin = require("admin")
 
 @app.post("/api/login")
 def api_login(request: Request, response: Response, body: dict = Body(...)):
-    src = request.client.host if request.client else None
+    src = _client_ip(request)
     if auth.locked(src):
         return JSONResponse({"ok": False, "error": "失败次数过多，请稍后再试"}, status_code=429)
     token = auth.login(CFG, body.get("username", ""), body.get("password", ""), src=src)
     if not token:
+        log.warning("登录失败: user=%r from=%s", str(body.get("username", ""))[:32], src)
         return JSONResponse({"ok": False, "error": "用户名或密码错误"}, status_code=401)
     s = auth.session(token)
-    # secure_cookie: 走 HTTPS 时设为 true(令牌只在加密连接传输)；纯内网 HTTP 保持 false 否则 cookie 不发
+    # secure_cookie: 走 HTTPS 时设为 true；纯内网 HTTP 保持 false 否则 cookie 不发
     response.set_cookie(auth.COOKIE, token, httponly=True, samesite="lax",
-                        secure=bool(CFG.get("auth", {}).get("secure_cookie", False)), max_age=auth.TTL)
+                        secure=bool(CFG.get("auth", {}).get("secure_cookie", False)),
+                        max_age=auth.TTL)
+    log.info("登录成功: %s (%s) from %s", s["user"], s["role"], src)
     return {"ok": True, "user": s["user"], "role": s["role"]}
 
 
@@ -76,36 +195,6 @@ def api_me(request: Request):
             "auth_enabled": auth.enabled(CFG)}
 
 
-WS_CLIENTS = set()
-MAIN_LOOP = None
-_SORT_FIELDS = {"ip", "status", "firmware", "model", "hr_rt", "hr_avg", "power",
-                "eff", "temp", "uptime", "worker", "sn"}
-
-
-@app.on_event("startup")
-def _startup():
-    global MAIN_LOOP
-    MAIN_LOOP = asyncio.get_event_loop()
-    SVC.notify = _broadcast_threadsafe   # 扫描线程→WS 推送
-    SVC.start_scheduler()
-    # 云端总览上报(config.cloud.enabled 才启动)：本地→云端每分钟推摘要，NAT 后无需端口映射
-    import cloud_report
-    if cloud_report.start(CFG, _build_public_summary,
-                          lambda hours: db.customer_report(SVC.conn, hours)):
-        print(f"[cloud] 云端上报已启动 → {CFG['cloud']['url']} "
-              f"(场地: {CFG['cloud']['site_name']}, ID: {cloud_report.site_id(CFG)})")
-    # git 自动更新(config.update.auto 才启用; 需 NSSM/run.bat 守护进程接管重启)
-    import updater
-    updater.start_auto(CFG.get("update") or {})
-    if auth.enabled(CFG):   # 安全自检：仍用默认弱口令则醒目告警(能重启/换池全场，务必改强口令)
-        weak = auth.weak_default_users(CFG)
-        if weak:
-            print("=" * 64)
-            print(f"!!! 安全警告: 用户 {weak} 仍在使用默认弱口令(admin888 等) !!!")
-            print("!!! 该系统可远程重启/换矿池全场，请立即用 `python auth.py 新强口令` 改掉 !!!")
-            print("=" * 64)
-
-
 def _broadcast_threadsafe(payload):
     """从后台扫描线程安全地向所有 WS 客户端推送。"""
     if MAIN_LOOP is None:
@@ -113,8 +202,9 @@ def _broadcast_threadsafe(payload):
     for ws in list(WS_CLIENTS):
         try:
             fut = asyncio.run_coroutine_threadsafe(ws.send_json(payload), MAIN_LOOP)
-            fut.add_done_callback(lambda f, w=ws: WS_CLIENTS.discard(w) if f.exception() else None)
-        except Exception:
+            fut.add_done_callback(
+                lambda f, w=ws: WS_CLIENTS.discard(w) if f.exception() else None)
+        except Exception:  # noqa: BLE001
             WS_CLIENTS.discard(ws)
 
 
@@ -124,30 +214,74 @@ async def ws_endpoint(websocket: WebSocket):
     if not sess:
         await websocket.close(code=1008)
         return
+    if len(WS_CLIENTS) >= WS_MAX_CLIENTS:   # 1013 = try again later
+        log.warning("WS 连接数已达上限 %d，拒绝新连接", WS_MAX_CLIENTS)
+        await websocket.close(code=1013)
+        return
     await websocket.accept()
     WS_CLIENTS.add(websocket)
     try:
         await websocket.send_json({"type": "hello"})
         while True:
             try:
-                await asyncio.wait_for(websocket.receive_text(), timeout=60)   # 仅保活，忽略入站
+                await asyncio.wait_for(websocket.receive_text(), timeout=60)   # 仅保活
             except asyncio.TimeoutError:
                 pass
             # 周期性复检会话：登出/令牌过期后主动断开，避免失效会话仍持续接收推送
             if not auth.current(CFG, websocket.cookies.get(auth.COOKIE, "")):
                 await websocket.close(code=1008)
                 break
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     finally:
         WS_CLIENTS.discard(websocket)
 
 
 def _latest_records():
-    ls = db.latest_scan(SVC.conn)
-    if not ls:
-        return None, []
-    return ls, db.scan_records(SVC.conn, ls["scan_id"])
+    """(scan_meta, records)。records 是共享只读列表——需要改写字段的调用方必须先拷贝。"""
+    return SVC.latest()
+
+
+# ---- 通用短缓存 + 每来源限流 ----
+_cache = {}
+_cache_lock = threading.Lock()
+_rate = {}
+_rate_lock = threading.Lock()
+_RATE_MAX = 120                 # 每分钟每来源请求上限
+_RATE_PER_SEC = _RATE_MAX / 60.0
+
+
+def _cached(key, ttl, builder, want_hit=False):
+    """短TTL缓存：同 key 在 ttl 秒内复用上次结果，避免重查询/重算。
+    want_hit=True 时返回 (data, 是否命中缓存)，供响应里如实标 cached 字段。"""
+    now = time.time()
+    with _cache_lock:
+        ent = _cache.get(key)
+        if ent and (now - ent[0]) < ttl:
+            return (ent[1], True) if want_hit else ent[1]
+    data = builder()
+    with _cache_lock:
+        _cache[key] = (now, data)
+        if len(_cache) > 300:   # 顺手清过期项防无界增长
+            for k in [k for k, v in _cache.items() if now - v[0] > 300]:
+                _cache.pop(k, None)
+    return (data, False) if want_hit else data
+
+
+def _rate_ok(src):
+    """令牌桶限流，每来源 _RATE_MAX/分钟。"""
+    now = time.time()
+    with _rate_lock:
+        toks, last = _rate.get(src, (float(_RATE_MAX), now))
+        toks = min(float(_RATE_MAX), toks + (now - last) * _RATE_PER_SEC)
+        if toks < 1:
+            _rate[src] = [toks, now]
+            return False
+        _rate[src] = [toks - 1, now]
+        if len(_rate) > 1000:   # 清理陈旧来源
+            for k in [k for k, v in list(_rate.items()) if now - v[1] > 300]:
+                _rate.pop(k, None)
+        return True
 
 
 @app.get("/api/summary")
@@ -155,233 +289,144 @@ def api_summary(_: dict = Depends(require_viewer)):
     ls, recs = _latest_records()
     if not ls:
         return {"scanned": False, "progress": SVC.progress}
-    with_hr, no_hr, offline = miner_core.rank(recs)
+    return {"scanned": True, **_summary_stats(ls, recs), "progress": SVC.progress}
+
+
+def _summary_stats(ls, recs):
+    """/api/summary 与 /api/public/summary 共用的统计口径，保证两边永远一致。"""
+    with_hr, no_hr, _offline = miner_core.rank(recs)
     by_fw = {}
+    online = 0
+    total_power = 0
     for r in recs:
         if r["status"] == "online":
+            online += 1
             by_fw[r["firmware"]] = by_fw.get(r["firmware"], 0) + 1
-    total_hr = round(sum(r["hr_rt"] for r in with_hr), 2) if with_hr else 0
-    # 总功耗口径与 /api/miners agg 一致：所有在线机的功耗(不限是否有算力)
-    total_power = sum(r["power"] for r in recs if r["status"] == "online" and r.get("power"))
+            if r.get("power"):
+                total_power += r["power"]
+    total_hr = round(sum(r["hr_rt"] for r in with_hr), 2) if with_hr else 0.0
     effs = [r["eff"] for r in with_hr if r.get("eff")]
-    avg_eff = round(sum(effs) / len(effs), 2) if effs else 0
-    _cs = db.get_containers(SVC.conn)
+    cs = db.get_containers(SVC.conn)
+    total = len(recs)
     return {
-        "scanned": True,
-        "scan_ts": ls["ts"], "scan_kind": ls["kind"],
-        "total": ls["total"], "online": ls["online"], "offline": ls["offline"],
+        "scan_id": ls.get("scan_id"), "scan_ts": ls.get("ts"), "scan_kind": ls.get("kind"),
+        "total": total, "online": online, "offline": total - online,
         "with_hashrate": len(with_hr), "no_hashrate": len(no_hr),
         "total_hashrate_th": total_hr,
         "avg_hashrate_th": round(total_hr / len(with_hr), 2) if with_hr else 0,
         "total_power_kw": round(total_power / 1000, 1),
-        "avg_efficiency": avg_eff,
+        "avg_efficiency": round(sum(effs) / len(effs), 2) if effs else 0,
         "by_firmware": by_fw,
         "active_alerts": db.count_active(SVC.conn),
-        "containers": len(_cs),
-        "containers_faulty": sum(1 for c in _cs if c.get("online") and c.get("faults")),
-        "containers_offline": sum(1 for c in _cs if not c.get("online")),
-        "progress": SVC.progress,
+        "containers": len(cs),
+        "containers_faulty": sum(1 for c in cs if c.get("online") and c.get("faults")),
+        "containers_offline": sum(1 for c in cs if not c.get("online")),
     }
 
 
-# --- Public read-only summary for external agents (Hermes/Cursor) ---
-# Added 2026-06-29 by request. Does NOT require auth, but is gated by a
-# shared bearer token (config: public_api_token). Token is intentionally
-# shared-secret rather than per-user — there are no per-user audit
-# requirements for an external polling agent.
-# Reuses the same data path as /api/summary to guarantee consistency.
-import hmac as _hmac
-import time as _time
-import threading as _threading
-
-_public_cache = {"ts": 0.0, "data": None}
-_public_cache_lock = _threading.Lock()
-_PUBLIC_CACHE_TTL = 10.0  # seconds
-
-# 通用短缓存 + 每来源限流：防外部 Agent 高频轮询通过全局DB锁拖慢扫描落库
-_pub_cache = {}                # key -> (ts, data)
-_pub_cache_lock = _threading.Lock()
-_pub_rate = {}                 # src -> [tokens, last]
-_pub_rate_lock = _threading.Lock()
-_PUB_RATE_MAX = 120            # 每分钟每来源请求上限
-_PUB_RATE_PER_SEC = _PUB_RATE_MAX / 60.0
-
-
-def _cached(key, ttl, builder):
-    """短TTL缓存：同 key 在 ttl 秒内复用上次结果，避免重查询/重算。"""
-    now = _time.time()
-    with _pub_cache_lock:
-        ent = _pub_cache.get(key)
-        if ent and (now - ent[0]) < ttl:
-            return ent[1]
-    data = builder()
-    with _pub_cache_lock:
-        _pub_cache[key] = (now, data)
-        if len(_pub_cache) > 300:   # 顺手清过期项防无界增长
-            for k in [k for k, v in _pub_cache.items() if now - v[0] > 300]:
-                _pub_cache.pop(k, None)
-    return data
-
-
-def _rate_ok(src):
-    """令牌桶限流，每来源 _PUB_RATE_MAX/分钟。"""
-    now = _time.time()
-    with _pub_rate_lock:
-        toks, last = _pub_rate.get(src, (float(_PUB_RATE_MAX), now))
-        toks = min(float(_PUB_RATE_MAX), toks + (now - last) * _PUB_RATE_PER_SEC)
-        if toks < 1:
-            _pub_rate[src] = [toks, now]
-            return False
-        _pub_rate[src] = [toks - 1, now]
-        if len(_pub_rate) > 1000:   # 清理陈旧来源
-            for k in [k for k, v in list(_pub_rate.items()) if now - v[1] > 300]:
-                _pub_rate.pop(k, None)
-        return True
-
-
+# ---- 外部 Agent 只读 API（统一 token 鉴权，稳定 snake_case schema，单位带后缀）----
 def _check_public_token(request: Request):
-    """Verify the shared bearer token. If no token is configured, refuse
-    all requests (fail-closed). If a token is configured, require it via
-    Authorization: Bearer <token> OR ?token=<token> query param."""
+    """校验共享 Bearer Token。未配置 token 时整组端点返回 404（fail-closed，不泄露存在性）。
+
+    限流必须在比对 token **之前**：否则错误 token 直接 401 返回，永远走不到限流，
+    等于给爆破/探测留了一条不限速的通道。正确 token 的调用方限流行为不变(同样每次
+    消耗一个令牌，120 次/分钟)。
+    """
     cfg_token = CFG.get("public_api", {}).get("token", "")
     if not cfg_token:
-        # No token configured → endpoint disabled. Return 404 to hide its
-        # existence rather than 401, so unconfigured installations don't
-        # leak.
         raise HTTPException(status_code=404, detail="not found")
+    if not _rate_ok(_client_ip(request)):   # 防高频轮询打爆 DB 拖慢扫描 / 防 token 爆破
+        raise HTTPException(status_code=429, detail="rate limit", headers={"Retry-After": "5"})
     supplied = ""
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         supplied = auth_header[7:].strip()
     if not supplied:
         supplied = request.query_params.get("token", "")
-    if not supplied or not _hmac.compare_digest(supplied, cfg_token):
+    # compare_digest 对含非 ASCII 的 str 会抛 TypeError(→500)，统一按 UTF-8 字节比较
+    if not supplied or not _hmac.compare_digest(supplied.encode("utf-8", "surrogatepass"),
+                                                str(cfg_token).encode("utf-8", "surrogatepass")):
         raise HTTPException(status_code=401, detail="bad token")
-    src = request.client.host if request.client else "?"   # 限流：防高频轮询打爆DB拖慢扫描
-    if not _rate_ok(src):
-        raise HTTPException(status_code=429, detail="rate limit", headers={"Retry-After": "5"})
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request: Request, exc: RequestValidationError):
+    """参数校验(422)发生在路由函数体之前，早于函数体内的鉴权调用。
+
+    对 /api/public/*，越界/非法参数因此能在完全不提供 token 的情况下换来 422，
+    等于确认了端点存在，击穿"未配置 token 就 404"的 fail-closed 设计。这里让这组
+    路径先过一遍鉴权：未配置 token → 404，token 错 → 401，都通过了才谈参数合法性。
+    """
+    if request.url.path.startswith("/api/public/"):
+        try:
+            _check_public_token(request)
+        except HTTPException as e:
+            return JSONResponse({"detail": e.detail}, status_code=e.status_code,
+                                headers=getattr(e, "headers", None))
+    return JSONResponse({"detail": jsonable_encoder(exc.errors())}, status_code=422)
 
 
 def _build_public_summary():
-    """Reuse the exact same data path as api_summary, plus a compact
-    per-miner list for the agent caller. Wrapped in try/except so the
-    endpoint never returns 500."""
+    """与 api_summary 同一数据路径，另加一份精简全量矿机列表。包异常，绝不返回 500。"""
     try:
         ls, recs = _latest_records()
+        base = {"ok": True, "ts": int(time.time()), "progress": SVC.progress}
         if not ls:
-            return {
-                "ok": True,
-                "ts": int(_time.time()),
-                "scanned": False,
-                "progress": SVC.progress,
-                "online": 0, "offline": 0, "total": 0,
-                "online_count": 0, "offline_count": 0, "total_count": 0,
-                "total_hashrate_ths": 0.0,
-                "active_alerts": 0,
-                "miners": [],
-            }
-        with_hr, no_hr, offline = miner_core.rank(recs)
-        total_hr = round(sum(r["hr_rt"] for r in with_hr), 2) if with_hr else 0.0
-        total_power = sum(
-            r["power"] for r in recs
-            if r["status"] == "online" and r.get("power")
-        )
-        _cs = db.get_containers(SVC.conn)
-        active_alerts_n = db.count_active(SVC.conn)
-
-        # Compact per-miner list. Keep it small (online only by default;
-        # include offline flagged with status) for low-overhead polling.
-        miners = []
-        for r in recs:
-            miners.append({
-                "ip": r["ip"],
-                "model": r.get("model") or "",
-                "firmware": r.get("firmware") or "",
-                "status": r.get("status") or "unknown",
-                "hashrate_ths": round(r.get("hr_rt") or 0.0, 2),
-                "temp_c": r.get("temp") or 0,
-                "power_w": r.get("power") or 0,
-                "worker": r.get("worker") or "",
-            })
+            return {**base, "scanned": False,
+                    "online": 0, "offline": 0, "total": 0,
+                    "online_count": 0, "offline_count": 0, "total_count": 0,
+                    "total_hashrate_ths": 0.0, "active_alerts": 0, "miners": []}
+        s = _summary_stats(ls, recs)
         return {
-            "ok": True,
-            "ts": int(_time.time()),
-            "scanned": True,
-            "scan_id": ls.get("scan_id"),
-            "scan_ts": ls.get("ts"),
-            "scan_kind": ls.get("kind"),
-            "total": ls["total"], "online": ls["online"], "offline": ls["offline"],
-            "online_count": ls["online"], "offline_count": ls["offline"], "total_count": ls["total"],
-            "with_hashrate": len(with_hr), "no_hashrate": len(no_hr),
-            "total_hashrate_ths": total_hr,
-            "avg_hashrate_ths": round(total_hr / len(with_hr), 2) if with_hr else 0.0,
-            "total_power_kw": round(total_power / 1000, 1),
-            "active_alerts": active_alerts_n,
-            "containers": len(_cs),
-            "containers_faulty": sum(1 for c in _cs if c.get("online") and c.get("faults")),
-            "containers_offline": sum(1 for c in _cs if not c.get("online")),
-            "progress": SVC.progress,
-            "miners": miners,
+            **base, "scanned": True,
+            "scan_id": s["scan_id"], "scan_ts": s["scan_ts"], "scan_kind": s["scan_kind"],
+            "total": s["total"], "online": s["online"], "offline": s["offline"],
+            "online_count": s["online"], "offline_count": s["offline"],
+            "total_count": s["total"],
+            "with_hashrate": s["with_hashrate"], "no_hashrate": s["no_hashrate"],
+            "total_hashrate_ths": s["total_hashrate_th"],
+            "avg_hashrate_ths": s["avg_hashrate_th"],
+            "total_power_kw": s["total_power_kw"],
+            "active_alerts": s["active_alerts"],
+            "containers": s["containers"], "containers_faulty": s["containers_faulty"],
+            "containers_offline": s["containers_offline"],
+            "miners": [{"ip": r["ip"], "model": r.get("model") or "",
+                        "firmware": r.get("firmware") or "",
+                        "status": r.get("status") or "unknown",
+                        "hashrate_ths": round(r.get("hr_rt") or 0.0, 2),
+                        "temp_c": r.get("temp") or 0, "power_w": r.get("power") or 0,
+                        "worker": r.get("worker") or ""} for r in recs],
         }
-    except Exception as e:
-        return {"ok": False, "ts": int(_time.time()), "error": str(e)}
+    except Exception as e:  # noqa: BLE001
+        log.exception("build_public_summary error")
+        return {"ok": False, "ts": int(time.time()), "error": str(e)}
+
+
+def _public_miner_row(r):
+    """单台矿机的 Agent 友好视图（稳定字段名 + 显式单位）。"""
+    return {
+        "ip": r["ip"], "status": r.get("status") or "unknown",
+        "firmware": r.get("firmware") or "", "model": r.get("model") or "",
+        "sn": r.get("sn") or "", "mac": r.get("mac") or "",
+        "worker": r.get("worker") or "",
+        "hashrate_ths": round(r.get("hr_rt") or 0.0, 2),
+        "hashrate_avg_ths": round(r.get("hr_avg") or 0.0, 2),
+        "power_w": r.get("power") or 0, "temp_c": r.get("temp") or 0,
+        "efficiency_jth": r.get("eff"), "uptime_s": r.get("uptime"),
+        "accepted": r.get("accepted"), "rejected": r.get("rejected"),
+    }
 
 
 @app.get("/api/public/summary")
 def api_public_summary(request: Request, lite: int = 0):
-    """Public, token-gated, read-only summary for external agents.
-
-    Returns the same data as /api/summary but is callable with a shared
-    bearer token instead of a per-user login session. Cached in-process
-    for 10s to avoid hammering the DB when an agent polls.
-
-    lite=1: 省略 miners[] 全量明细（其余统计字段不变），给云端总览等
-    每分钟轮询的调用方省带宽（全场几千台时 ~750KB → 几KB）。
-    旧版本服务端会忽略该参数（返回全量），调用方向后兼容。
-
-    Auth: configure `public_api.token` in config.yaml. If unset, returns
-    404 (fail-closed). Caller must send either
-        Authorization: Bearer <token>
-    or pass ?token=<token> as a query parameter."""
+    """公共只读总览。lite=1 省略 miners[] 明细（给云端总览等每分钟轮询方省带宽）。"""
     _check_public_token(request)
-    now = _time.time()
-    with _public_cache_lock:
-        if _public_cache["data"] is not None and (now - _public_cache["ts"]) < _PUBLIC_CACHE_TTL:
-            out = dict(_public_cache["data"])  # shallow copy
-            out["cached"] = True
-            if lite:
-                out.pop("miners", None)
-            return out
-    data = _build_public_summary()
-    with _public_cache_lock:
-        _public_cache["ts"] = now
-        _public_cache["data"] = data
+    data, hit = _cached(("public_summary",), 10, _build_public_summary, want_hit=True)
     out = dict(data)
-    out["cached"] = False
+    out["cached"] = hit
     if lite:
         out.pop("miners", None)
     return out
-
-
-# ---- 外部 Agent 只读取数 API（统一 token 鉴权，稳定 snake_case schema，单位带后缀） ----
-def _public_miner_row(r):
-    """单台矿机的 Agent 友好视图（稳定字段名 + 显式单位）。"""
-    return {
-        "ip": r["ip"],
-        "status": r.get("status") or "unknown",
-        "firmware": r.get("firmware") or "",
-        "model": r.get("model") or "",
-        "sn": r.get("sn") or "",
-        "worker": r.get("worker") or "",
-        "hashrate_ths": round(r.get("hr_rt") or 0.0, 2),
-        "hashrate_avg_ths": round(r.get("hr_avg") or 0.0, 2),
-        "power_w": r.get("power") or 0,
-        "temp_c": r.get("temp") or 0,
-        "efficiency_jth": r.get("eff"),
-        "uptime_s": r.get("uptime"),
-        "accepted": r.get("accepted"),
-        "rejected": r.get("rejected"),
-    }
 
 
 @app.get("/api/public/health")
@@ -390,39 +435,51 @@ def api_public_health(request: Request):
     _check_public_token(request)
     p = SVC.progress
     last = p.get("last_finished", 0)
-    now = int(_time.time())
+    now = int(time.time())
     try:
         n_alerts = db.count_active(SVC.conn)
-    except Exception:
+    except Exception:  # noqa: BLE001
         n_alerts = None
     return {"ok": True, "ts": now, "scanning": bool(p.get("running")),
             "last_scan_ts": last or None,
             "last_scan_age_s": (now - last) if last else None,
+            "stalled": SVC.is_stale(now),
             "active_alerts": n_alerts}
+
+
+def _filter_recs(recs, status="", fw="", seg="", q="", repair=None):
+    out = recs
+    if seg:
+        out = [r for r in out if r["ip"].rsplit(".", 1)[0] == seg]
+    if status == "repair":
+        out = [r for r in out if repair and r["ip"] in repair]
+    elif status:
+        out = [r for r in out if r["status"] == status]
+    if fw:
+        out = [r for r in out if r["firmware"] == fw]
+    if q:
+        ql = q.lower()
+        out = [r for r in out if ql in r["ip"].lower() or ql in (r.get("sn") or "").lower()
+               or ql in (r.get("mac") or "").lower()
+               or ql in (r.get("worker") or "").lower()]
+    return out
 
 
 @app.get("/api/public/miners")
 def api_public_miners(request: Request, status: str = "", fw: str = "", seg: str = "",
                       q: str = "", limit: int = 50000):
-    """矿机列表（Agent 友好）。filters: status(online/offline)、fw(stock/uniplus)、seg(如 172.16.119)、q(IP/SN/worker 模糊)。"""
+    """矿机列表（Agent 友好）。filters: status/fw/seg/q。"""
+    # limit 不能用 Query(ge=,le=) 声明：那层校验由 FastAPI 在进入函数体前执行，
+    # 越界值会在鉴权之前就返回 422，等于告诉未鉴权的人"这个端点存在"。
+    # 一律先鉴权，再在函数体里手工收敛范围。
     _check_public_token(request)
+    limit = max(1, min(50000, limit))
 
     def build():
         _, recs = _latest_records()
-        out = recs
-        if seg:
-            out = [r for r in out if r["ip"].rsplit(".", 1)[0] == seg]
-        if status:
-            out = [r for r in out if r["status"] == status]
-        if fw:
-            out = [r for r in out if r["firmware"] == fw]
-        if q:
-            ql = q.lower()
-            out = [r for r in out if ql in r["ip"].lower() or ql in (r.get("sn") or "").lower()
-                   or ql in (r.get("worker") or "").lower()]
+        out = _filter_recs(recs, status, fw, seg, q)
         online = [r for r in out if r["status"] == "online"]
-        return {"ok": True, "ts": int(_time.time()), "count": len(out),
-                "online": len(online),
+        return {"ok": True, "ts": int(time.time()), "count": len(out), "online": len(online),
                 "total_hashrate_ths": round(sum(r["hr_rt"] for r in online if r.get("hr_rt")), 2),
                 "total_power_w": sum(r["power"] for r in online if r.get("power")),
                 "miners": [_public_miner_row(r) for r in out[:max(1, limit)]]}
@@ -436,23 +493,24 @@ def api_public_miner(ip: str, request: Request):
     _, recs = _latest_records()
     cur = next((r for r in recs if r["ip"] == ip), None)
     if not cur:
-        return {"ok": True, "ts": int(_time.time()), "found": False, "ip": ip}
+        return {"ok": True, "ts": int(time.time()), "found": False, "ip": ip}
     hist = [{"ts": h["ts"], "status": h.get("status"),
              "hashrate_ths": round(h.get("hr_rt") or 0.0, 2),
              "temp_c": h.get("temp") or 0, "power_w": h.get("power") or 0}
             for h in db.ip_history(SVC.conn, ip, 200)]
-    return {"ok": True, "ts": int(_time.time()), "found": True,
+    return {"ok": True, "ts": int(time.time()), "found": True,
             "miner": _public_miner_row(cur), "history": hist}
 
 
 @app.get("/api/public/alerts")
 def api_public_alerts(request: Request, active: bool = True):
-    """告警列表（默认仅活跃）。type: offline/zero/reject/segment_down/stalled/cooler:*/cooler_offline。"""
+    """告警列表（默认仅活跃）。"""
     _check_public_token(request)
 
     def build():
-        al = db.list_alerts(SVC.conn, active_only=active)
-        return {"ok": True, "ts": int(_time.time()), "count": len(al),
+        al = db.list_alerts(SVC.conn, active_only=active, limit=2000)
+        return {"ok": True, "ts": int(time.time()), "count": len(al),
+                "counts": db.count_active_by_type(SVC.conn),
                 "alerts": [{"id": a["id"], "ts": a["ts"], "ip": a["ip"], "type": a["type"],
                             "severity": a["severity"], "detail": a["detail"],
                             "resolved": bool(a["resolved"]), "resolved_ts": a.get("resolved_ts"),
@@ -462,59 +520,60 @@ def api_public_alerts(request: Request, active: bool = True):
 
 @app.get("/api/public/containers")
 def api_public_containers(request: Request):
-    """水冷集装箱（AntBox）列表：水温/压力/流量/泵风扇/故障/功耗/箱内矿机数。"""
+    """水冷集装箱（AntBox）列表。"""
     _check_public_token(request)
 
     def build():
         cs = db.get_containers(SVC.conn)
-        return {"ok": True, "ts": int(_time.time()), "count": len(cs),
+        return {"ok": True, "ts": int(time.time()), "count": len(cs),
                 "faulty": sum(1 for c in cs if c.get("online") and c.get("faults")),
                 "offline": sum(1 for c in cs if not c.get("online")),
                 "containers": cs}
     return _cached(("containers",), 8, build)
 
 
+def _report_window(hours):
+    """把请求周期收敛到实际有数据的范围，返回 (生效小时数, 是否被截断)。"""
+    cov = db.coverage_hours(SVC.conn) or 1
+    eff = min(max(1, int(hours)), cov)
+    return eff, eff < hours
+
+
 @app.get("/api/public/customers")
 def api_public_customers(request: Request, hours: int = 24):
-    """按客户(矿工名)报表：机器数 / 可用率% / 交付算力 TH·h / 耗电 kWh。hours 超过保留期自动截断。"""
+    """按客户(矿工名)报表：机器数 / 可用率% / 交付算力 TH·h / 耗电 kWh。"""
     _check_public_token(request)
-    cap = CFG["db"].get("retention_days", 3) * 24
-    eff = min(max(1, hours), cap)
+    hours = max(1, min(8760, hours))   # 顺手封顶，避免任意 hours 撑爆缓存键空间
+    eff, truncated = _report_window(hours)
 
     def build():   # 最重的查询, 缓存 45 秒(报表变化慢)
-        return {"ok": True, "ts": int(_time.time()), "hours": hours,
-                "covered_hours": eff, "truncated": eff < hours,
+        return {"ok": True, "ts": int(time.time()), "hours": hours,
+                "covered_hours": eff, "truncated": truncated,
                 "customers": db.customer_report(SVC.conn, eff)}
-    return _cached(("customers", eff), 45, build)
+    # 缓存槽位必须按**原始入参 hours** 区分：响应里带了 hours/truncated 两个随原始入参
+    # 变化的字段，若按收敛后的 eff 做键，hours=20 与 hours=21(都收敛到 eff=20)会互相
+    # 拿到对方的元数据。另外键名与 /api/reports/customers 的 ("customers", eff) 区分开
+    # ——那边缓存的是裸行列表，同键会让两个端点互相返回对方的数据结构。
+    return _cached(("public_customers", hours), 45, build)
+
+
+# ---- 会话 API ----
+_SORT_FIELDS = {"ip", "status", "firmware", "model", "hr_rt", "hr_avg", "power",
+                "eff", "temp", "uptime", "worker", "sn"}
 
 
 @app.get("/api/miners")
 def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
-               sort: str = "hr_rt", order: str = "desc", limit: int = 50000,
+               sort: str = "hr_rt", order: str = "desc",
+               limit: int = Query(50000, ge=1, le=50000),
                _: dict = Depends(require_viewer)):
-    # 默认上限须 ≥ 全场真机数：H7 后落库≈真机全集(~5千+)，若仍按 5000 截断，
-    # 前端会把第5000名之后(恰是离线/零算力=维修/下架对象)的机器静默移出选择集 → 漏命令
+    # 默认上限须 ≥ 全场真机数，否则前端会把第 N 名之后(恰是离线/零算力=维修/下架对象)
+    # 的机器静默移出选择集 → 漏命令
     _, recs = _latest_records()
     repair = db.repair_ips(SVC.conn)
-    for r in recs:
-        r["mstate"] = "repair" if r["ip"] in repair else "active"
-    out = recs
-    if seg:
-        out = [r for r in out if r["ip"].rsplit(".", 1)[0] == seg]
-    if status == "repair":
-        out = [r for r in out if r["mstate"] == "repair"]
-    elif status:
-        out = [r for r in out if r["status"] == status]
-    if fw:
-        out = [r for r in out if r["firmware"] == fw]
-    if q:
-        ql = q.lower()
-        out = [r for r in out if ql in r["ip"].lower() or ql in (r.get("sn") or "").lower()
-               or ql in (r.get("worker") or "").lower()]
-    # 当前筛选范围的算力汇总（选网段即看该段算力）
+    out = _filter_recs(recs, status, fw, seg, q, repair=repair)
     online = [r for r in out if r["status"] == "online"]
-    agg = {"count": len(out),
-           "online": len(online),
+    agg = {"count": len(out), "online": len(online),
            "offline": sum(1 for r in out if r["status"] == "offline"),
            "total_hr": round(sum(r["hr_rt"] for r in online if r.get("hr_rt")), 2),
            "total_power": sum(r["power"] for r in online if r.get("power"))}
@@ -525,8 +584,11 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
     nn = [r for r in out if r.get(sort) not in (None, "")]
     nul = [r for r in out if r.get(sort) in (None, "")]
     nn.sort(key=lambda r: r.get(sort), reverse=rev)
-    out = nn + nul
-    return {"count": len(out), "agg": agg, "miners": out[:limit]}
+    page = (nn + nul)[:limit]
+    # 拷贝后再挂 mstate：recs 是所有请求共享的内存快照，绝不能原地改
+    return {"count": len(out), "agg": agg,
+            "miners": [dict(r, mstate=("repair" if r["ip"] in repair else "active"))
+                       for r in page]}
 
 
 @app.get("/api/workers")
@@ -550,33 +612,35 @@ def api_workers(_: dict = Depends(require_viewer)):
 
 @app.get("/api/reports/customers")
 def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(require_viewer)):
-    # 报表周期不能超过快照保留期(超出部分已被 prune 物理删除)，否则交付算力/耗电按比例少计且无提示
-    cap = CFG["db"].get("retention_days", 3) * 24
-    eff = min(max(1, hours), cap)
-    rows = db.customer_report(SVC.conn, eff)
-    if format == "csv":   # 对客户出账：导出 UTF-8 BOM 的 CSV(Excel 直接打开不乱码)，含数据覆盖期
-        import io
+    eff, truncated = _report_window(hours)
+    rows = _cached(("customers", eff), 45,
+                   lambda: db.customer_report(SVC.conn, eff))
+    if format == "csv":   # 对客户出账：UTF-8 BOM 的 CSV(Excel 直接打开不乱码)
         import csv as _csv
+        import io
         buf = io.StringIO()
         buf.write("﻿")
         w = _csv.writer(buf)
         days = round(eff / 24, 1)
-        w.writerow([f"客户报表  数据覆盖近 {days} 天" + ("（已按保留期截断）" if eff < hours else "")])
+        w.writerow([f"客户报表  数据覆盖近 {days} 天" + ("（已按可用数据截断）" if truncated else "")])
         w.writerow(["客户(矿工名)", "机器数", "可用率%", "交付算力(TH·h)", "耗电(kWh)"])
         for r in rows:
-            w.writerow([r["worker"], r["machines"], r["uptime_pct"], r["delivered_th_h"], r["power_kwh"]])
+            w.writerow([r["worker"], r["machines"], r["uptime_pct"],
+                        r["delivered_th_h"], r["power_kwh"]])
         return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
-                        headers={"Content-Disposition": f'attachment; filename="customers_{eff}h.csv"'})
-    return {"hours": hours, "covered_hours": eff, "truncated": eff < hours, "customers": rows}
+                        headers={"Content-Disposition":
+                                 f'attachment; filename="customers_{eff}h.csv"'})
+    return {"hours": hours, "covered_hours": eff, "truncated": truncated, "customers": rows}
 
 
 @app.get("/api/containers")
 def api_containers(_: dict = Depends(require_viewer)):
     cs = db.get_containers(SVC.conn)
-    faulty = sum(1 for c in cs if c.get("online") and c.get("faults"))
-    offline = sum(1 for c in cs if not c.get("online"))
     acfg = CFG.get("alerts", {})
-    return {"count": len(cs), "faulty": faulty, "offline": offline, "containers": cs,
+    return {"count": len(cs),
+            "faulty": sum(1 for c in cs if c.get("online") and c.get("faults")),
+            "offline": sum(1 for c in cs if not c.get("online")),
+            "containers": cs,
             "faults_ignore": acfg.get("container_faults_ignore", []),
             "supply_pressure_min": acfg.get("container_supply_pressure_min", 0),
             "return_pressure_min": acfg.get("container_return_pressure_min", 0)}
@@ -584,7 +648,7 @@ def api_containers(_: dict = Depends(require_viewer)):
 
 @app.post("/api/containers/scan")
 def api_containers_scan(_: dict = Depends(require_ops)):
-    """手动立即刷新集装箱（后台执行，秒回）。ops+：会真实发包/抢扫描锁，viewer 不可触发。"""
+    """手动立即刷新集装箱（后台执行，秒回）。"""
     threading.Thread(target=SVC.scan_containers, daemon=True).start()
     return {"ok": True}
 
@@ -597,12 +661,11 @@ def api_container(ip: str, _: dict = Depends(require_viewer)):
 
 @app.get("/api/racks")
 def api_racks(_: dict = Depends(require_viewer)):
-    """按 /24 网段聚合成货架，每段固定显示完整机位(host_start..host_end)，缺位=空机位(灰)，
-    便于一眼看出空位/缺号。着色：在线绿 / 零算力黄 / 离线红 / 空位灰。"""
+    """按 /24 网段聚合成货架，每段固定显示完整机位，缺位=空机位(灰)。"""
     ls, recs = _latest_records()
     if not ls:
         return {"racks": []}
-    _, hs, he = service_mod.load_segments(CFG)   # 机位范围与扫描范围一致
+    _, hs, he = appconfig.load_segments(CFG)   # 机位范围与扫描范围一致
 
     def state(r):
         if r is None:
@@ -638,10 +701,8 @@ def api_racks(_: dict = Depends(require_viewer)):
                           "temp": (r.get("temp") if r else None)})
         out.append({"name": seg, "slots": slots,
                     "online": cnt.get("ok", 0) + cnt.get("zero", 0),
-                    "abnormal": cnt.get("zero", 0),
-                    "offline": cnt.get("offline", 0),
-                    "empty": cnt.get("empty", 0),
-                    "hashrate": round(hr_sum, 2)})
+                    "abnormal": cnt.get("zero", 0), "offline": cnt.get("offline", 0),
+                    "empty": cnt.get("empty", 0), "hashrate": round(hr_sum, 2)})
     return {"racks": out}
 
 
@@ -670,7 +731,8 @@ def api_alert_ack(body: dict = Body(...), sess: dict = Depends(require_ops)):
 
 @app.get("/api/alerts")
 def api_alerts(active: bool = True, limit: int = 500, _: dict = Depends(require_viewer)):
-    # counts/total 走精确计数(不受列表 limit 截断)：大面积事件下台数才不会被卡在 200
+    # counts/total 走精确计数(不受列表 limit 截断)：大面积事件下台数才不会被卡在 limit
+    limit = max(1, min(5000, limit))   # 与 /api/trend、/api/commands 保持同一收敛口径
     counts = db.count_active_by_type(SVC.conn)
     return {"alerts": db.list_alerts(SVC.conn, active_only=active, limit=limit),
             "counts": counts, "total": sum(counts.values())}
@@ -678,12 +740,13 @@ def api_alerts(active: bool = True, limit: int = 500, _: dict = Depends(require_
 
 @app.get("/api/trend")
 def api_trend(points: int = 288, _: dict = Depends(require_viewer)):
-    return {"trend": db.hashrate_trend(SVC.conn, points)}
+    return {"trend": db.hashrate_trend(SVC.conn, max(2, min(2000, points)))}
 
 
 @app.post("/api/scan")
 def api_scan(kind: str = Query("manual"), _: dict = Depends(require_ops)):
-    ok = SVC.scan_now_async("quick" if kind == "quick" else kind)
+    """kind=quick 只巡检名册(快)；full/manual 展开全部网段做发现(慢)。"""
+    ok = SVC.scan_now_async("quick" if kind == "quick" else "manual")
     return JSONResponse({"started": ok, "progress": SVC.progress})
 
 
@@ -694,18 +757,18 @@ def api_progress(_: dict = Depends(require_viewer)):
 
 @app.get("/api/segments")
 def api_segments(_: dict = Depends(require_viewer)):
-    segs, hs, he = service_mod.load_segments(CFG)
+    segs, hs, he = appconfig.load_segments(CFG)
     return {"segments": segs, "host_start": hs, "host_end": he}
 
 
 @app.get("/api/settings")
 def api_settings_get(sess: dict = Depends(require_viewer)):
     out = {"scan_interval": CFG["schedule"].get("scan_interval", 300),
+           "full_interval": CFG["schedule"].get("full_interval", 3600),
            "max_pps": CFG["scan"].get("max_pps", 100),
            "container_interval": CFG["schedule"].get("container_interval", 10),
            "discovery_workers": CFG["scan"].get("discovery_workers", 300)}
     if auth.has_role(sess, "admin"):   # 云端上报配置含 token，只给 admin
-        import cloud_report
         c = CFG.get("cloud") or {}
         out["cloud"] = {"enabled": bool(c.get("enabled")), "url": c.get("url") or "",
                         "token": c.get("token") or "", "site_name": c.get("site_name") or "",
@@ -723,7 +786,8 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
               "url": str(c.get("url") or "").strip().rstrip("/"),
               "token": str(c.get("token") or "").strip(),
               "site_name": str(c.get("site_name") or "").strip()[:64],
-              "site_type": c.get("site_type") if c.get("site_type") in ("air", "hydro", "mixed") else "air"}
+              "site_type": c.get("site_type") if c.get("site_type") in ("air", "hydro", "mixed")
+              else "air"}
         if cl["enabled"] and not (cl["url"] and cl["token"] and cl["site_name"]):
             return JSONResponse({"ok": False, "error": "启用上报需填写 云端地址/上报token/场地名"},
                                 status_code=400)
@@ -731,26 +795,30 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
             return JSONResponse({"ok": False, "error": "云端地址须以 http:// 或 https:// 开头"},
                                 status_code=400)
         s["cloud"] = cl
+    ranges = {"scan_interval": (30, 86400), "full_interval": (60, 604800),
+              "container_interval": (5, 3600), "max_pps": (0, 2000),
+              "discovery_workers": (1, 2000)}
     try:   # 非数字字段返回 400 而非 500
-        if "scan_interval" in body:
-            s["scan_interval"] = max(30, min(86400, int(body["scan_interval"])))
-        if "max_pps" in body:
-            s["max_pps"] = max(0, min(2000, int(body["max_pps"])))
-        if "container_interval" in body:
-            s["container_interval"] = max(5, min(3600, int(body["container_interval"])))
+        for k, (lo, hi) in ranges.items():
+            if k in body:
+                s[k] = max(lo, min(hi, int(body[k])))
     except (TypeError, ValueError):
         return JSONResponse({"ok": False, "error": "参数须为数字"}, status_code=400)
-    service_mod.save_settings({**service_mod.load_settings(), **s})
-    service_mod.apply_settings(CFG, s)   # 即时生效，无需重启
-    SVC.wake()                           # 唤醒调度循环立即按新间隔重排(否则要等当前 sleep 走完)
+    effective_scan = s.get("scan_interval", CFG["schedule"].get("scan_interval", 300))
+    effective_full = s.get("full_interval", CFG["schedule"].get("full_interval", 3600))
+    if effective_full < effective_scan:
+        return JSONResponse({"ok": False, "error": "全网发现间隔不能小于巡检间隔"},
+                            status_code=400)
+    appconfig.save_settings({**appconfig.load_settings(), **s})
+    appconfig.apply_settings(CFG, s)   # 即时生效，无需重启
+    SVC.wake()                         # 唤醒调度循环立即按新间隔重排
     out = {"ok": True, **s}
-    if "cloud" in s:                     # 上报线程热重启(旧线程自动失效)
-        import cloud_report
+    if "cloud" in s:                   # 上报线程热重启(旧线程自动失效)
         cloud_report.start(CFG, _build_public_summary,
                            lambda hours: db.customer_report(SVC.conn, hours))
         out["site_id"] = cloud_report.site_id(CFG)
-        print(f"[cloud] 网页更新上报配置: enabled={s['cloud']['enabled']}"
-              f" → {s['cloud'].get('url') or '(未填)'} (场地: {s['cloud'].get('site_name') or '-'})")
+        log.info("网页更新上报配置: enabled=%s → %s (场地: %s)", s["cloud"]["enabled"],
+                 s["cloud"].get("url") or "(未填)", s["cloud"].get("site_name") or "-")
     return out
 
 
@@ -771,15 +839,65 @@ def api_segments_save(body: dict = Body(...), _: dict = Depends(require_admin)):
         hs = max(1, min(254, int(body.get("host_start", 1))))
         he = max(hs, min(254, int(body.get("host_end", 254))))
     except (TypeError, ValueError):
-        return JSONResponse({"ok": False, "error": "host_start/host_end 须为数字"}, status_code=400)
-    service_mod.save_segments(norm, hs, he)
+        return JSONResponse({"ok": False, "error": "host_start/host_end 须为数字"},
+                            status_code=400)
+    appconfig.save_segments(norm, hs, he)
+    log.info("网段已更新: %d 段, 主机号 %d-%d", len(norm), hs, he)
     return {"ok": True, "segments": norm, "host_start": hs, "host_end": he, "count": len(norm)}
+
+
+# 破坏性动作：后端强制要求请求体显式带 confirm:true。
+# control.py 的注释历来写"前端强制二次确认"，但前端确认只是个弹窗——任何持有 ops 会话
+# 的脚本/curl/被注入的同源 JS 都能直接 POST 触发全场重启或换矿池。确认必须落到后端。
+DESTRUCTIVE_ACTIONS = {"reboot", "set_pools"}
+
+
+def _local_known_ip_filter(ips):
+    """control.py 未提供过滤函数时的等价兜底：按 segments.json/config 的网段+主机号判定。"""
+    segs, hs, he = appconfig.load_segments(CFG)
+    known = {str(s).strip() for s in (segs or []) if str(s).strip()}
+    allowed, rejected = [], []
+    for ip in ips:
+        parts = str(ip).split(".")
+        ok = False
+        if len(parts) == 4 and ".".join(parts[:3]) in known:
+            try:
+                ok = hs <= int(parts[3]) <= he
+            except ValueError:
+                ok = False
+        (allowed if ok else rejected).append(ip)
+    return allowed, rejected
+
+
+def _filter_known_ips(ips):
+    """把不属于本矿场已配置网段的目标剔除，返回 (allowed, rejected)。
+
+    为什么必须有：/api/command 会带着矿机管理口令(HTTP Digest)去连目标地址。只校验
+    IP 格式不校验归属，等于把本服务变成一台内网/公网探测器，还会把口令送到任意地址。
+    优先复用 control.filter_known_ips()(控制层统一口径)，拿不到或形状不符则本地兜底，
+    保证这道校验不会因为依赖没到位而被跳过。
+    """
+    fn = getattr(control, "filter_known_ips", None)
+    if callable(fn):
+        try:
+            res = fn(list(ips), CFG)
+            allowed_raw = res[0] if isinstance(res, tuple) else res
+            if isinstance(allowed_raw, (list, tuple, set)):
+                ok = {str(x) for x in allowed_raw}
+                allowed = [ip for ip in ips if ip in ok]
+                return allowed, [ip for ip in ips if ip not in ok]
+            log.warning("control.filter_known_ips 返回结构不符预期(%r)，回退本地校验",
+                        type(allowed_raw).__name__)
+        except Exception:  # noqa: BLE001
+            log.exception("control.filter_known_ips 调用失败，回退本地网段校验")
+    return _local_known_ip_filter(ips)
 
 
 def _audit_reject(user, action, reason):
     try:
-        db.log_commands(SVC.conn, user, f"reject:{action}", [{"ip": "-", "ok": False, "msg": reason}])
-    except Exception:
+        db.log_commands(SVC.conn, user, f"reject:{action}",
+                        [{"ip": "-", "ok": False, "msg": reason}])
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -800,8 +918,10 @@ def _run_command_bg(targets, action, params, user):
         CMD_PROGRESS["success"] = ok_n
         CMD_PROGRESS["failed"] = len(results) - ok_n
         CMD_PROGRESS["fail_ips"] = [r["ip"] for r in results if not r["ok"]][:100]
+        log.info("批量 %s 完成: 成功 %d / 失败 %d (发起人 %s)",
+                 action, ok_n, len(results) - ok_n, user)
     except Exception as e:  # noqa: BLE001
-        print(f"async command error: {e}")
+        log.exception("async command error: %s", e)
     finally:
         CMD_PROGRESS["running"] = False
         _cmd_lock.release()
@@ -814,23 +934,42 @@ def api_command_progress(_: dict = Depends(require_ops)):
 
 @app.post("/api/command")
 def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
-    """远程命令：{ips:[...], action:"reboot|locate|set_pools", params:{...}}"""
+    """远程命令：{ips:[...], action:"reboot|locate|set_pools", params:{...}, confirm:true}
+
+    reboot/set_pools 属破坏性操作，请求体必须显式带 confirm:true（前端"确认执行"弹窗
+    负责补上），否则 400。locate 等只读/无害动作不需要。
+    """
     user = sess.get("user", "?")
     action = body.get("action")
     if not CFG.get("control", {}).get("enabled", False):
         _audit_reject(user, action, "控制功能未启用")
         return JSONResponse({"ok": False, "error": "控制功能未启用"}, status_code=403)
-    if action not in control.ACTIONS:
-        _audit_reject(user, action, "不支持的命令")
+    # 非字符串 action(list/dict) 直接参与集合成员判断会抛 TypeError → 500
+    if not isinstance(action, str) or action not in control.ACTIONS:
+        _audit_reject(user, str(action)[:64], "不支持的命令")
         return JSONResponse({"ok": False, "error": "不支持的命令"}, status_code=400)
-    ips = body.get("ips") or []
-    if not ips:
-        _audit_reject(user, action, "未指定目标矿机")
-        return JSONResponse({"ok": False, "error": "未指定目标矿机"}, status_code=400)
+    if action in DESTRUCTIVE_ACTIONS and body.get("confirm") is not True:
+        _audit_reject(user, action, "缺少 confirm 二次确认")
+        return JSONResponse({"ok": False, "need_confirm": True,
+                             "error": "该操作具破坏性，请在请求体中显式传入 confirm:true 确认"},
+                            status_code=400)
     max_batch = CFG.get("control", {}).get("max_batch", 1000)
-    if len(ips) > max_batch:
-        _audit_reject(user, action, f"目标 {len(ips)} 台超上限 {max_batch}")
-        return JSONResponse({"ok": False, "error": f"单次目标超上限 {max_batch} 台，请分批"}, status_code=400)
+    ips, ip_error = control.normalize_ips(body.get("ips"), max_batch)
+    if ip_error:
+        _audit_reject(user, action, ip_error)
+        return JSONResponse({"ok": False, "error": ip_error}, status_code=400)
+    # 只允许对本矿场已配置网段内的地址下发（防被当成内网/公网探测器泄露矿机口令）
+    ips, out_of_scope = _filter_known_ips(ips)
+    if out_of_scope:
+        _audit_reject(user, action, f"目标不在已配置网段: {','.join(out_of_scope[:10])}")
+        log.warning("命令 %s 被拒: %d 个目标不在已配置网段 (发起人 %s, 示例 %s)",
+                    action, len(out_of_scope), user, out_of_scope[:5])
+        shown = "、".join(out_of_scope[:5]) + ("…" if len(out_of_scope) > 5 else "")
+        return JSONResponse(
+            {"ok": False,
+             "error": f"以下 {len(out_of_scope)} 个 IP 不在已配置网段内，已拒绝下发: {shown}",
+             "rejected": out_of_scope[:100], "rejected_count": len(out_of_scope)},
+            status_code=400)
     params = body.get("params") or {}
     if action == "set_pools":   # 换矿池: 校验 pools 结构与 URL，避免下发非法/恶意配置
         pools = params.get("pools")
@@ -838,32 +977,40 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
             _audit_reject(user, action, "pools 结构非法")
             return JSONResponse({"ok": False, "error": "pools 需为 1-8 项的列表"}, status_code=400)
         for p in pools:
-            if not isinstance(p, dict) or not str(p.get("url", "")).startswith(("stratum+tcp://", "stratum+ssl://")):
+            if not isinstance(p, dict) or not str(p.get("url", "")).startswith(
+                    ("stratum+tcp://", "stratum+ssl://")):
                 _audit_reject(user, action, "矿池 url 非法")
-                return JSONResponse({"ok": False, "error": "每个矿池需含 stratum+tcp:// 开头的 url"}, status_code=400)
-            if not str(p.get("user", "")).strip():   # 缺矿工名会被原样下发→份额无归属/矿池拒绝
+                return JSONResponse(
+                    {"ok": False, "error": "每个矿池需含 stratum+tcp:// 开头的 url"},
+                    status_code=400)
+            if not str(p.get("user", "")).strip():   # 缺矿工名会被原样下发→份额无归属
                 _audit_reject(user, action, "矿池缺 user")
-                return JSONResponse({"ok": False, "error": "每个矿池需填矿工名(user)"}, status_code=400)
+                return JSONResponse({"ok": False, "error": "每个矿池需填矿工名(user)"},
+                                    status_code=400)
     # 从最近快照取每台固件类型，避免重复探测
     _, recs = _latest_records()
     fw_map = {r["ip"]: r["firmware"] for r in recs}
     targets = [(ip, fw_map.get(ip, "")) for ip in ips]
+    log.info("命令 %s: %d 台, 发起人 %s", action, len(targets), user)
     # 重启且开启分批(打乱+延迟会耗时) → 后台异步执行，前端轮询 /api/command/progress
     ctl = CFG.get("control", {})
     rb = int(ctl.get("reboot_concurrency", 0) or 0)
     if action == "reboot" and rb > 0 and len(targets) > rb:
         if not _cmd_lock.acquire(blocking=False):
             _audit_reject(user, action, "已有批量命令在执行")
-            return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"}, status_code=409)
-        CMD_PROGRESS.update({"running": True, "action": action, "done": 0, "total": len(targets),
-                             "success": 0, "failed": 0, "fail_ips": [], "user": user})
-        threading.Thread(target=_run_command_bg, args=(targets, action, params, user), daemon=True).start()
+            return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
+                                status_code=409)
+        CMD_PROGRESS.update({"running": True, "action": action, "done": 0,
+                             "total": len(targets), "success": 0, "failed": 0,
+                             "fail_ips": [], "user": user})
+        threading.Thread(target=_run_command_bg, args=(targets, action, params, user),
+                         daemon=True).start()
         return {"ok": True, "async": True, "action": action, "count": len(targets),
                 "batch": rb, "delay": ctl.get("reboot_delay_sec", 0)}
     results, err = control.run_batch(targets, action, params, CFG)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
-    db.log_commands(SVC.conn, sess.get("user", "?"), action, results)
+    db.log_commands(SVC.conn, user, action, results)
     ok_n = sum(1 for r in results if r["ok"])
     return {"ok": True, "action": action, "success": ok_n,
             "failed": len(results) - ok_n, "results": results}
@@ -872,35 +1019,38 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
 @app.get("/api/update/check")
 def api_update_check(_: dict = Depends(require_admin)):
     """对比 git 远端有没有新版本(git 部署时可用)。"""
-    import updater
     return updater.check((CFG.get("update") or {}).get("branch") or None)
 
 
 @app.post("/api/update/apply")
 def api_update_apply(_: dict = Depends(require_admin)):
     """拉取新代码(ff-only+编译自检+失败回滚)并重启(需 NSSM/run.bat 守护)。"""
-    import updater
     return updater.apply((CFG.get("update") or {}).get("branch") or None)
 
 
 @app.get("/api/commands")
 def api_commands(limit: int = 100, _: dict = Depends(require_admin)):
-    return {"commands": db.list_commands(SVC.conn, limit)}
+    return {"commands": db.list_commands(SVC.conn, max(1, min(5000, limit)))}
 
 
 @app.post("/api/machine-state")
 def api_machine_state(body: dict = Body(...), sess: dict = Depends(require_ops)):
     """标记维修/取消维修/下架移除：{ips:[...], action:"repair"|"active"|"remove"}"""
-    ips = body.get("ips") or []
     action = body.get("action")
-    if not ips or action not in ("repair", "active", "remove"):
+    if action not in ("repair", "active", "remove"):
         return JSONResponse({"ok": False, "error": "参数错误"}, status_code=400)
+    ips, ip_error = control.normalize_ips(
+        body.get("ips"), CFG.get("control", {}).get("max_batch", 1000))
+    if ip_error:
+        return JSONResponse({"ok": False, "error": ip_error}, status_code=400)
     if action == "remove":
         db.remove_miners(SVC.conn, ips)
+        SVC.drop_from_snapshot(ips)   # 内存快照同步剔除，否则要等下轮扫描才消失
     else:
         db.set_machine_state(SVC.conn, ips, action)
     db.log_commands(SVC.conn, sess.get("user", "?"), "state:" + action,
                     [{"ip": ip, "ok": True, "msg": action} for ip in ips])
+    log.info("机器状态 %s: %d 台, 操作人 %s", action, len(ips), sess.get("user", "?"))
     return {"ok": True, "action": action, "count": len(ips)}
 
 
@@ -911,8 +1061,8 @@ def index():
 
 @app.middleware("http")
 async def _no_cache_static(request: Request, call_next):
-    """前端文件禁强缓存(每次向服务器复核, 未变返回304)——否则 git 更新版本后
-    浏览器拿旧 JS 渲染新接口, 要手动 Ctrl+F5 才恢复。文件只有几十KB, 代价可忽略。"""
+    """前端文件禁强缓存(每次向服务器复核, 未变返回304)——否则更新版本后浏览器
+    拿旧 JS 渲染新接口, 要手动 Ctrl+F5 才恢复。文件只有几十KB, 代价可忽略。"""
     resp = await call_next(request)
     if request.url.path.startswith("/web/") or request.url.path == "/":
         resp.headers["Cache-Control"] = "no-cache"
@@ -925,4 +1075,5 @@ if os.path.isdir(WEB_DIR):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host=CFG["server"]["host"], port=CFG["server"]["port"])
+    uvicorn.run(app, host=CFG["server"]["host"], port=CFG["server"]["port"],
+                log_config=None)   # 日志统一交给 logs.py

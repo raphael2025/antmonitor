@@ -31,7 +31,11 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/public/summary
 
 - 所有响应是 JSON，含 `ok`(bool) 与 `ts`(本次响应的 Unix 秒)。出错时 `summary` 返回 `{ok:false,error}`（不抛 500）。
 - 算力单位 **TH/s**（字段 `*_ths`），功率 **W**（`*_w`），温度 **℃**（`*_c`），时长 **秒**（`*_s`）。
-- `/summary` 有 **10 秒进程内缓存**（`cached:true/false`），高频轮询不击穿 DB；其余端点实时查（WAL 读不阻塞扫描）。
+- **进程内短缓存**，高频轮询不击穿 DB：`/summary` 10 秒（响应带 `cached:true/false`）、
+  `/miners`·`/alerts`·`/containers` 8 秒、`/customers` 45 秒（最重的查询，且报表变化慢）。
+- **每来源限流** 120 次/分钟，超限返回 `429` + `Retry-After`。来源默认按直连 IP 判定；
+  前置反向代理时需在 `server.trusted_proxies` 里登记代理地址，否则所有调用方会被算成同一个来源。
+- "当前状态"类数据直接读扫描线程的内存快照，不回查数据库，因此轮询不会拖慢扫描落库。
 - **能力边界**：公共 API **永远只读**（全是 GET，无任何控制/写操作）。远程重启/换矿池/下架等破坏性动作**不对 Agent 开放**，必须走人工审核的会话 API。
 
 ---
@@ -46,11 +50,13 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/public/summary
   "ok": true, "ts": 1782753412,
   "scanning": false,              // 是否正在扫描
   "last_scan_ts": 1782753100,     // 上次成功完成扫描的时间戳(null=尚未完成首扫)
-  "last_scan_age_s": 312,         // 距上次成功扫描多少秒(用它判断扫描是否停滞)
+  "last_scan_age_s": 312,         // 距上次成功扫描多少秒
+  "stalled": false,               // 服务端自己的停滞判定(已按扫描间隔算好阈值)
   "active_alerts": 7              // 当前活跃告警数
 }
 ```
-> 建议 Agent：`last_scan_age_s` 远超 `scan_interval`(默认300) 即视为监控停滞，需告警人工介入。
+> 建议 Agent：直接看 `stalled` 字段即可，它由服务端按当前配置的巡检/发现间隔推算，
+> 比调用方自己拿 `last_scan_age_s` 和一个猜的阈值比大小更准。
 
 ---
 
@@ -140,7 +146,13 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/public/summary
   }, ... ]
 }
 ```
-**告警类型 `type`**：`offline`(掉线) / `zero`(零算力) / `reject`(拒绝率高) / `segment_down`(整段掉线) / `stalled`(监控停滞) / `cooler:<flag>`(集装箱故障) / `cooler_offline`(箱体离线)。
+响应还含 `counts`：按类型的精确计数（不受列表条数限制，大面积事件下用它报数）。
+
+**告警类型 `type`**：
+`offline`(掉线) / `zero`(零算力，算力明确为0；读不到算力**不算**) /
+`low_hashrate`(掉算力，低于同机型中位数) / `overheat`(芯片高温) /
+`reject`(拒绝率高) / `segment_down`(整段掉线) / `stalled`(监控停滞) /
+`cooler:<flag>`(集装箱故障) / `cooler_offline`(箱体离线)。
 **级别 `severity`**：`crit` / `warn` / `info`。
 
 ---
@@ -181,7 +193,10 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/public/summary
   }, ... ]
 }
 ```
-> ⚠️ `truncated:true` 表示请求周期超过 `db.retention_days`(默认3天)，实际只统计了 `covered_hours`——做月度结算前需调大保留期或接计费聚合表（见路线图）。
+> `truncated:true` 表示请求周期超过了**系统实际投运时长**，实际只统计了 `covered_hours`。
+> 长周期（30/90天）已由小时级计费聚合表 `worker_hourly` 支撑，**不再受 `db.retention_days` 限制**：
+> 明细快照按保留期清理，但每客户每小时的交付算力/耗电/在线样本会长期归档（默认400天），
+> 月度对账可直接查。清理逻辑保证删除线永不越过归档进度。
 
 ---
 
@@ -230,7 +245,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/public/summary
 
 | 接口 | 角色 | 说明 |
 |---|---|---|
-| `POST /api/scan?kind=full\|quick` | ops | 手动触发扫描（已有扫描在跑则返回 `started:false`） |
+| `POST /api/scan?kind=full\|quick` | ops | 手动触发扫描：`quick` 只巡检名册(快)，`full` 展开全部网段做发现(慢)。已有扫描在跑则返回 `started:false` |
 | `POST /api/containers/scan` | ops | 手动刷新集装箱 |
 | `POST /api/command` | ops | 远程命令 `{ips,action:"reboot\|locate\|set_pools",params}`；批量上限 `control.max_batch`(默认1000)；set_pools 校验 url(stratum+tcp/ssl)+user |
 | `POST /api/machine-state` | ops | 维修/取消/下架 `{ips,action:"repair\|active\|remove"}` |
@@ -241,7 +256,7 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/public/summary
 | 接口 | 说明 |
 |---|---|
 | `GET /api/commands?limit=` | 命令审计日志 |
-| `POST /api/settings` | 改 `scan_interval`/`max_pps`/`container_interval`（即时生效，非数字→400） |
+| `POST /api/settings` | 改 `scan_interval`(巡检)/`full_interval`(全网发现)/`max_pps`/`container_interval`/`discovery_workers`（即时生效，非数字→400；full_interval < scan_interval→400） |
 | `POST /api/segments` | 改扫描网段（`{segments,host_start,host_end}`） |
 
 ### 错误码

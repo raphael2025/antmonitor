@@ -2,6 +2,7 @@ const $ = (id) => document.getElementById(id);
 let trendChart, modalChart;
 let sortKey = "hr_rt", sortOrder = "desc";
 const HOT = 90;
+const RENDER_CAP = 800;   // 一次最多渲染多少行：5000 行 innerHTML 重建会让低配运维机明显卡顿
 
 // 转义设备/矿池返回的不可信字符串，防止 innerHTML 注入(XSS)
 function esc(s) {
@@ -9,16 +10,32 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
+const safeVal = (v) => v == null ? "-" : esc(v);
 
 let lastOkMs = Date.now();   // 最近一次成功从服务器拿到数据(失联自检用)
 let lastScanTs = 0;          // 服务器最近一次完成扫描的时间戳
 let _staleOn = false;
 let _staleTimer = null;
+
 async function jget(u) {
   const r = await fetch(u);
   if (r.status === 401) { showLogin(); throw new Error("401"); }
   const j = await r.json();
   lastOkMs = Date.now();     // 拿到数据 → 刷新"最近通信"时间
+  return j;
+}
+
+// 所有写操作统一走这里：会话过期时弹登录框，而不是让用户看到一句 "失败：401" 却不知所措
+async function jpost(u, body) {
+  const r = await fetch(u, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (r.status === 401) { showLogin(); throw new Error("401"); }
+  if (r.status === 403) { toast("权限不足：该操作需要 ops 或 admin 角色"); throw new Error("403"); }
+  let j = {};
+  try { j = await r.json(); } catch (e) { j = { ok: false, error: "HTTP " + r.status }; }
+  lastOkMs = Date.now();
   return j;
 }
 
@@ -63,8 +80,7 @@ function hashUnit(maxTh) {
 
 function fmtTime(ts) {
   if (!ts) return "尚未扫描";
-  const d = new Date(ts * 1000);
-  return d.toLocaleString("zh-CN", { hour12: false });
+  return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
 }
 function ago(ts) {
   if (!ts) return "";
@@ -93,6 +109,7 @@ function fmtUptime(sec) {
   if (h) return `${h}时${m}分`;
   return `${m}分`;
 }
+const KIND_LABEL = { full: "全网发现", quick: "巡检", manual: "手动" };
 
 async function refreshSummary() {
   const s = await jget("/api/summary");
@@ -110,26 +127,21 @@ async function refreshSummary() {
   $("cEff").textContent = s.avg_efficiency || 0;
   $("cContainers").textContent = `${s.containers || 0}`
     + ((s.containers_faulty || s.containers_offline) ? ` (${(s.containers_faulty || 0) + (s.containers_offline || 0)})` : "");
-  $("lastScan").textContent = `上次扫描 ${ago(s.scan_ts)} (${s.scan_kind})`;
+  $("lastScan").textContent = `上次扫描 ${ago(s.scan_ts)} (${KIND_LABEL[s.scan_kind] || s.scan_kind})`;
 }
 
 async function ackAlert(id) {
-  await fetch("/api/alerts/ack", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id }) });
-  refreshAlerts();
+  try { await jpost("/api/alerts/ack", { id }); refreshAlerts(); } catch (e) {}
 }
 // 告警里直接下架坏机器：从名册移除 + 清掉它的告警(不再探测/告警)
 async function removeFromAlert(ip) {
   if (!confirm(`确认下架移除 ${ip}？\n将从名册删除、不再探测/告警。若机器仍通电，下次扫描可能被重新收录。`)) return;
   try {
-    const r = await fetch("/api/machine-state", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ips: [ip], action: "remove" }),
-    });
-    const d = await r.json();
-    if (!d.ok) { toast("下架失败：" + (d.error || r.status)); return; }
+    const d = await jpost("/api/machine-state", { ips: [ip], action: "remove" });
+    if (!d.ok) { toast("下架失败：" + (d.error || "")); return; }
     toast(`已下架 ${ip}`, "ok");
     refreshAlerts(); refreshMiners();
-  } catch (e) { toast("下架出错：" + e); }
+  } catch (e) {}
 }
 function alertClick(x) {
   if (x.type && x.type.startsWith("cooler")) return `openContainer('${x.ip}')`;
@@ -139,19 +151,19 @@ function alertClick(x) {
 async function refreshAlerts() {
   const d = await jget("/api/alerts?active=true");
   const a = d.alerts || [];
-  const total = (d.total != null) ? d.total : a.length;   // 真实总数(不被列表200/500条上限卡住)
+  const total = (d.total != null) ? d.total : a.length;   // 真实总数(不被列表上限卡住)
   $("alertCount").textContent = total;
   $("alertList").innerHTML = (a.length ? a.map(x => {
     const click = alertClick(x);
     const isCooler = x.type && x.type.startsWith("cooler");
-    const isMiner = x.ip && x.ip.split(".").length === 4 && !x.ip.endsWith(".x");  // 单台矿机(非网段/非箱)
+    const isMiner = x.ip && x.ip.split(".").length === 4 && !x.ip.endsWith(".x");  // 单台矿机
     let tail = "";
     if (!isCooler) {   // 集装箱告警不给按钮(修好自动消失)
       tail = x.ack_by ? `<span class="acked">✓ ${esc(x.ack_by)} 已确认</span>`
                       : `<button class="ackbtn" onclick="ackAlert(${x.id})">确认</button>`;
-      if (isMiner) tail += `<button class="rmbtn" onclick="removeFromAlert('${x.ip}')" title="从名册下架移除该机器">下架</button>`;
+      if (isMiner) tail += `<button class="rmbtn" onclick="removeFromAlert('${esc(x.ip)}')" title="从名册下架移除该机器">下架</button>`;
     }
-    return `<div class="a ${x.severity}${x.ack_by ? " is-ack" : ""}"><span class="atime">${fmtDT(x.ts)} · ${ago(x.ts)}</span>`
+    return `<div class="a ${esc(x.severity)}${x.ack_by ? " is-ack" : ""}"><span class="atime">${fmtDT(x.ts)} · ${ago(x.ts)}</span>`
       + `<span class="ip"${click ? ` onclick="${click}"` : ""}>${esc(x.ip)}</span>`
       + `<span class="adetail">${esc(x.detail)}</span>${tail}</div>`;
   }).join("") : '<div class="muted">无</div>')
@@ -162,7 +174,7 @@ async function refreshAlerts() {
 
 /* ---------------- 语音告警 ---------------- */
 let voiceOn = localStorage.getItem("voiceOn") === "1";
-let maxSeenId = 0;             // 已见告警的最大id(自增,永不复用)：O(1)判新，替代无限增长的Set
+let maxSeenId = 0;             // 已见告警的最大id(自增,永不复用)：O(1)判新
 let prevActiveIds = new Set();
 let alertsInit = false;
 let audioCtx;
@@ -170,7 +182,7 @@ let audioCtx;
 function beep(freq = 880, dur = 0.25) {
   try {
     audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === "suspended") audioCtx.resume();   // 浏览器锁声后必须先唤醒，否则没声
+    if (audioCtx.state === "suspended") audioCtx.resume();   // 浏览器锁声后必须先唤醒
     const o = audioCtx.createOscillator(), g = audioCtx.createGain();
     o.connect(g); g.connect(audioCtx.destination);
     o.type = "sine"; o.frequency.value = freq;
@@ -190,8 +202,6 @@ function speak(text) {
   } catch (e) {}
 }
 
-function ipSay(ip) { return ip.replace(/\./g, " 点 "); }
-
 function notify(title, body) {
   try {
     if ("Notification" in window && Notification.permission === "granted")
@@ -202,15 +212,15 @@ function notify(title, body) {
 function announceCounts(counts) {
   // 只报当前各类告警「台数/处数」，不念 IP。counts 是后端精确计数(不被列表上限截断)
   const n = (t) => counts[t] || 0;
-  const offline = n("offline"), zero = n("zero"), reject = n("reject");
-  const seg = n("segment_down"), stalled = n("stalled");
   const cooler = Object.keys(counts).filter(t => t.startsWith("cooler")).reduce((s, t) => s + counts[t], 0);
   const parts = [];
-  if (stalled) parts.push("监控停滞");
-  if (seg) parts.push(`${seg} 个网段掉线`);
-  if (offline) parts.push(`掉线 ${offline} 台`);
-  if (zero) parts.push(`零算力 ${zero} 台`);
-  if (reject) parts.push(`拒绝率偏高 ${reject} 台`);
+  if (n("stalled")) parts.push("监控停滞");
+  if (n("segment_down")) parts.push(`${n("segment_down")} 个网段掉线`);
+  if (n("offline")) parts.push(`掉线 ${n("offline")} 台`);
+  if (n("zero")) parts.push(`零算力 ${n("zero")} 台`);
+  if (n("low_hashrate")) parts.push(`掉算力 ${n("low_hashrate")} 台`);
+  if (n("overheat")) parts.push(`高温 ${n("overheat")} 台`);
+  if (n("reject")) parts.push(`拒绝率偏高 ${n("reject")} 台`);
   if (cooler) parts.push(`集装箱故障 ${cooler} 处`);
   if (!parts.length) return;
   beep(880, 0.3); beep(660, 0.3);
@@ -228,7 +238,7 @@ function handleVoice(alerts, counts, total) {
     const hasNew = alerts.some(x => x.id > maxSeenId);
     if (maxId > maxSeenId) maxSeenId = maxId;
     if (hasNew) announceCounts(counts || {});   // 有新告警 → 播报各类真实总数(不念IP)
-    // 列表被截断(>500)时不做"已恢复"播报：老告警被挤出窗口会被误判成已恢复
+    // 列表被截断时不做"已恢复"播报：老告警被挤出窗口会被误判成已恢复
     if (!(total > alerts.length)) {
       const recovered = [...prevActiveIds].filter(id => !curIds.has(id));
       if (recovered.length) { beep(523, 0.15); speak(`${recovered.length} 项告警已恢复`); }
@@ -250,8 +260,7 @@ function setVoice(on, gesture) {
   }
 }
 
-// 浏览器规则：刷新后声音被锁，必须有用户点击才能出声。这里在首次点击页面任意处时解锁，
-// 省得每次刷新都要专门去点语音按钮(语音开着才解锁)。
+// 浏览器规则：刷新后声音被锁，必须有用户点击才能出声。这里在首次点击页面任意处时解锁。
 let _audioUnlocked = false;
 document.addEventListener("click", () => {
   if (_audioUnlocked || !voiceOn) return;
@@ -262,6 +271,17 @@ document.addEventListener("click", () => {
   } catch (e) {}
 });
 
+function trendYScale(data) {
+  // 小幅正常抖动(约±1%)不拉满图高；真实大跌/大涨仍清晰可见。
+  // 量程至少覆盖均值的 8%，再在数据上下各留一点边。
+  if (!data.length) return {};
+  const lo = Math.min(...data), hi = Math.max(...data);
+  const mid = (lo + hi) / 2 || 1;
+  const span = Math.max(hi - lo, Math.abs(mid) * 0.08);
+  const pad = span * 0.15;
+  return { min: mid - span / 2 - pad, max: mid + span / 2 + pad };
+}
+
 async function refreshTrend() {
   const d = await jget("/api/trend?points=288");
   const t = d.trend || [];
@@ -269,38 +289,45 @@ async function refreshTrend() {
   const raw = t.map(x => x.total_hr);
   const { div, unit } = hashUnit(raw.length ? Math.max(...raw) : 0);
   const data = raw.map(v => v / div);
+  const yScale = trendYScale(data);
   const tt = $("trendTitle"); if (tt) tt.textContent = `总算力趋势 (${unit})`;
+  if (!window.Chart) return;   // 无网/CDN 不可达时图表库缺失，不能让整个面板挂掉
   if (!trendChart) {
     trendChart = new Chart($("trendChart"), {
       type: "line",
       data: { labels, datasets: [{ data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: .3, pointRadius: 0, borderWidth: 2 }] },
       options: {
-        interaction: { mode: "index", intersect: false },   // 鼠标放在图上任意处即显示数值(不必正好压到点)
+        interaction: { mode: "index", intersect: false },   // 鼠标放在图上任意处即显示数值
         plugins: { legend: { display: false }, tooltip: { callbacks: {
           title: (items) => items.length ? items[0].label : "",
           label: (c) => c.parsed.y.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " " + unit } } },
-        scales: { x: { ticks: { color: "#6e7681", maxTicksLimit: 8 } }, y: { ticks: { color: "#6e7681" } } }
+        scales: {
+          x: { ticks: { color: "#6e7681", maxTicksLimit: 8 } },
+          y: { ticks: { color: "#6e7681" }, min: yScale.min, max: yScale.max }
+        }
       }
     });
   } else {
     trendChart.data.labels = labels; trendChart.data.datasets[0].data = data;
     trendChart.options.plugins.tooltip.callbacks.label = (c) => c.parsed.y.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " " + unit;
+    trendChart.options.scales.y.min = yScale.min;
+    trendChart.options.scales.y.max = yScale.max;
     trendChart.update("none");
   }
 }
 
 function rowClass(r) {
-  if (r.status === "offline") return "off";
-  return "";
+  return r.status === "offline" ? "off" : "";
 }
+// 口径必须与后端告警一致：hr_rt===0 才是"零算力"(会告警)；null 是"这次没读到数"(不告警)。
+// 之前前端把 null 也画成红色的 0 TH，运维看到满屏红却一条告警都没有，反过来怀疑监控坏了。
 function hrCell(r) {
-  if (r.hr_rt == null) return `<td class="low">0 TH</td>`;   // 读不到=零算力
-  const zero = r.hr_rt === 0;
-  return `<td class="${zero ? "low" : ""}">${fmtHash(r.hr_rt)}</td>`;
+  if (r.hr_rt == null) return `<td class="muted" title="本次未读到算力(接口超时/密码错)，不计为零算力">无数据</td>`;
+  return `<td class="${r.hr_rt === 0 ? "low" : ""}">${fmtHash(r.hr_rt)}</td>`;
 }
 function tempCell(r) {
   if (r.temp == null) return `<td>-</td>`;
-  return `<td class="${r.temp >= HOT ? "hot" : ""}">${r.temp}℃</td>`;
+  return `<td class="${r.temp >= HOT ? "hot" : ""}">${safeVal(r.temp)}℃</td>`;
 }
 const REJECT_HI = 5;
 function rejCell(r) {
@@ -311,44 +338,61 @@ function rejCell(r) {
   return `<td class="${p >= REJECT_HI ? "hot" : ""}">${p}%</td>`;
 }
 
-let lastMiners = [];           // 当前筛选结果（用于全选）
+let lastMiners = [];            // 当前筛选结果全集（选择/命令都基于它，不受渲染上限影响）
 const selected = new Set();     // 选中的 IP
+let showAllRows = false;
 
 async function refreshMiners() {
   const q = $("search").value.trim();
   const st = $("fStatus").value, fw = $("fFw").value, seg = $("fSeg").value;
   const u = `/api/miners?sort=${sortKey}&order=${sortOrder}&status=${st}&fw=${fw}&seg=${seg}&q=${encodeURIComponent(q)}`;
   const d = await jget(u);
-  lastMiners = d.miners || [];   // 后端异常响应(无miners字段)时兜底为空，别让整个矿机视图崩掉
+  lastMiners = d.miners || [];   // 后端异常响应(无miners字段)时兜底为空
   // 防误操作：把选择集收敛为当前结果集内的IP，避免切网段/筛选后残留的不可见机器被命令误打
   const visible = new Set(lastMiners.map(m => m.ip));
   for (const ip of [...selected]) if (!visible.has(ip)) selected.delete(ip);
   $("minerCount").textContent = d.count != null ? d.count : lastMiners.length;
   const a = d.agg || {};
   $("segStat").textContent = `${seg ? seg + ".x ｜ " : ""}在线 ${a.online || 0} ｜ 算力 ${fmtHash(a.total_hr)} ｜ 功耗 ${fmtPower(a.total_power)}`;
-  $("minerBody").innerHTML = lastMiners.map(r => {
+
+  const rows = showAllRows ? lastMiners : lastMiners.slice(0, RENDER_CAP);
+  $("minerBody").innerHTML = rows.map(r => {
     const ck = selected.has(r.ip) ? "checked" : "";
     return `<tr class="${rowClass(r)} ${selected.has(r.ip) ? "sel" : ""}">`
-      + `<td class="cbcol"><input type="checkbox" data-ip="${r.ip}" ${ck}></td>`
-      + `<td class="ip-link" onclick="openMiner('${r.ip}')">${r.ip}</td>`
-      + `<td>${r.mstate === "repair" ? '<span class="pill repair">维修中</span>' : `<span class="pill ${r.status}">${r.status === "online" ? "在线" : "离线"}</span>`}</td>`
-      + `<td>${r.firmware ? `<span class="pill ${r.firmware}">${r.firmware}</span>` : "-"}</td>`
+      + `<td class="cbcol"><input type="checkbox" data-ip="${esc(r.ip)}" ${ck}></td>`
+      + `<td class="ip-link" onclick="openMiner('${esc(r.ip)}')">${esc(r.ip)}</td>`
+      + `<td>${r.mstate === "repair" ? '<span class="pill repair">维修中</span>' : `<span class="pill ${esc(r.status)}">${r.status === "online" ? "在线" : "离线"}</span>`}</td>`
+      + `<td>${r.firmware ? `<span class="pill ${esc(r.firmware)}">${esc(r.firmware)}</span>` : "-"}</td>`
       + `<td>${esc(r.model) || "-"}</td>`
       + hrCell(r) + `<td>${r.hr_avg != null ? fmtHash(r.hr_avg) : "-"}</td>`
-      + `<td>${r.power != null ? r.power + " W" : "-"}</td>`
-      + `<td>${r.eff != null ? r.eff + "" : "-"}</td>`
+      + `<td>${r.power != null ? safeVal(r.power) + " W" : "-"}</td>`
+      + `<td>${r.eff != null ? esc(r.eff) : "-"}</td>`
       + rejCell(r)
       + tempCell(r)
       + `<td>${fmtUptime(r.uptime)}</td>`
       + `<td>${esc(r.worker) || "-"}</td>`
-      + `<td>${esc(r.sn) || "-"}</td><td class="muted">${esc(r.note)}</td></tr>`;
+      + `<td>${esc(r.sn) || "-"}${r.mac ? `<br><small>${esc(r.mac)}</small>` : ""}</td>`
+      + `<td class="muted">${esc(r.note)}</td></tr>`;
   }).join("");
+  const more = $("renderNote");
+  if (more) {
+    if (!showAllRows && lastMiners.length > RENDER_CAP) {
+      more.innerHTML = `仅渲染前 <b>${RENDER_CAP}</b> 行（共 ${lastMiners.length} 台）以保证页面流畅。`
+        + `批量操作/「选中当前筛选」仍作用于全部 ${lastMiners.length} 台。`
+        + ` <button id="btnShowAll" class="mini-btn">仍要渲染全部</button>`;
+      more.classList.remove("hidden");
+      const b = $("btnShowAll");
+      if (b) b.onclick = () => { showAllRows = true; refreshMiners(); };
+    } else {
+      more.classList.add("hidden"); more.innerHTML = "";
+    }
+  }
   updateSelCount();
 }
 
 function updateSelCount() {
   $("selCount").textContent = `已选 ${selected.size} 台`;
-  const all = $("cbAll");   // 全选框跟随当前结果集同步，避免切筛选后仍显示已勾
+  const all = $("cbAll");   // 全选框跟随当前结果集同步
   if (all) all.checked = lastMiners.length > 0 && lastMiners.every(m => selected.has(m.ip));
 }
 
@@ -364,12 +408,12 @@ async function refreshRacks() {
   $("rackList").innerHTML = legend + (d.racks || []).map(rk => {
     const slots = rk.slots.map(s => {
       if (s.st === "empty")   // 空机位：灰、不可点
-        return `<div class="slot empty" title="${s.ip} · 空机位">${s.h}</div>`;
+        return `<div class="slot empty" title="${esc(s.ip)} · 空机位">${s.h}</div>`;
       const tip = `${s.ip}${s.hr != null ? " · " + fmtHash(s.hr) : ""}${s.temp != null ? " · " + s.temp + "℃" : ""}`;
-      return `<div class="slot ${s.st}" title="${tip}" onclick="openMiner('${s.ip}')">${s.h}</div>`;
+      return `<div class="slot ${s.st}" title="${esc(tip)}" onclick="openMiner('${esc(s.ip)}')">${s.h}</div>`;
     }).join("");
     const bad = rk.abnormal ? `零算力 <b class="bad">${rk.abnormal}</b> · ` : "";
-    return `<div class="rack"><div class="rack-head"><span class="name">${rk.name}.x</span>`
+    return `<div class="rack"><div class="rack-head"><span class="name">${esc(rk.name)}.x</span>`
       + `<span class="stat">在线 ${rk.online} · ${fmtHash(rk.hashrate)} · ${bad}离线 ${rk.offline} · 空 ${rk.empty}</span></div>`
       + `<div class="slots">${slots}</div></div>`;
   }).join("");
@@ -391,9 +435,9 @@ async function refreshWorkers() {
     }).join("") || '<div class="muted">无数据</div>';
   } else {
     const d = await jget(`/api/reports/customers?hours=${period}`);
-    // 周期超过快照保留期被截断时给出提示，避免把"近7天"标签下的实为~3天数据误读为7天
+    // 周期超过可用数据被截断时给出提示
     const note = d.truncated
-      ? `<div class="muted" style="margin-bottom:8px">⚠️ 数据实际仅覆盖近 ${(d.covered_hours / 24).toFixed(1)} 天（受保留期限制；更长周期请调大 db.retention_days）</div>`
+      ? `<div class="muted" style="margin-bottom:8px">⚠️ 数据实际仅覆盖近 ${(d.covered_hours / 24).toFixed(1)} 天（系统投运时间还不够长）</div>`
       : "";
     $("workerList").innerHTML = note + ((d.customers || []).map(c => {
       const up = c.uptime_pct;
@@ -432,7 +476,7 @@ function updateProgress(p) {
     bar.classList.remove("hidden");
     const pct = p.total ? Math.floor(p.done / p.total * 100) : 0;
     $("progFill").style.width = pct + "%";
-    $("progText").textContent = `${p.kind} 扫描中 ${p.done}/${p.total} (${pct}%)`;
+    $("progText").textContent = `${KIND_LABEL[p.kind] || p.kind} 扫描中 ${p.done}/${p.total} (${pct}%)`;
     btnF.disabled = btnQ.disabled = true;
   } else {
     bar.classList.add("hidden");
@@ -445,7 +489,7 @@ async function openMiner(ip) {
   const c = d.current || {};
   $("mTitle").textContent = `${ip}  ${c.model || ""}`;
   const h = d.history || [];
-  // 用真实时间戳做 x：关机/掉线的空档按时间比例显示；相邻点间隔>15分钟插断点让线断开(一眼看出停机)
+  // 用真实时间戳做 x：关机/掉线的空档按时间比例显示；相邻点间隔>15分钟插断点让线断开
   const hr = [], temp = [];
   let prevTs = null;
   for (const x of h) {
@@ -457,17 +501,17 @@ async function openMiner(ip) {
     prevTs = ts;
   }
   if (modalChart) modalChart.destroy();
-  modalChart = new Chart($("mChart"), {
+  if (window.Chart) modalChart = new Chart($("mChart"), {
     type: "line",
     data: { datasets: [
       { label: "算力 TH", data: hr, borderColor: "#1f6feb", yAxisID: "y", pointRadius: 0, tension: .3, spanGaps: false },
       { label: "芯片温 ℃", data: temp, borderColor: "#f85149", yAxisID: "y1", pointRadius: 0, tension: .3, spanGaps: false } ] },
     options: {
-      interaction: { mode: "index", intersect: false },   // 鼠标放上去显示数值
+      interaction: { mode: "index", intersect: false },
       scales: {
         y: { position: "left", ticks: { color: "#6e7681" } },
         y1: { position: "right", ticks: { color: "#6e7681" }, grid: { drawOnChartArea: false } },
-        x: { type: "linear",                              // 按真实时间间隔铺开
+        x: { type: "linear",
              ticks: { color: "#6e7681", maxTicksLimit: 7,
                       callback: (v) => new Date(v).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" }) } } },
       plugins: { legend: { labels: { color: "#adbac7" } },
@@ -475,18 +519,23 @@ async function openMiner(ip) {
   });
   $("mInfo").innerHTML =
     `固件：${esc(c.firmware) || "-"} ｜ 状态：${esc(c.status) || "-"} ｜ SN：${esc(c.sn) || "-"}<br>`
-    + `实时算力：${fmtHash(c.hr_rt)} ｜ 平均：${fmtHash(c.hr_avg)} ｜ 功耗：${c.power ?? "-"} W<br>`
-    + `能效：${c.eff ?? "-"} J/TH ｜ 芯片温：${c.temp ?? "-"}℃ ｜ 运行时长：${fmtUptime(c.uptime)}<br>`
-    + `矿工名：${esc(c.worker) || "-"} ｜ 接受/拒绝/陈旧：${c.accepted ?? "-"}/${c.rejected ?? "-"}/${c.stale ?? "-"}`
+    + `MAC：${esc(c.mac) || "-"}<br>`
+    + `实时算力：${c.hr_rt == null ? "无数据" : fmtHash(c.hr_rt)} ｜ 平均：${fmtHash(c.hr_avg)} ｜ 功耗：${safeVal(c.power)} W<br>`
+    + `能效：${safeVal(c.eff)} J/TH ｜ 芯片温：${safeVal(c.temp)}℃ ｜ 运行时长：${fmtUptime(c.uptime)}<br>`
+    + `矿工名：${esc(c.worker) || "-"} ｜ 接受/拒绝/陈旧：${safeVal(c.accepted)}/${safeVal(c.rejected)}/${safeVal(c.stale)}`
     + (c.note ? `<br>备注：${esc(c.note)}` : "");
   $("modal").classList.remove("hidden");
 }
 
 async function triggerScan(kind) {
-  await fetch(`/api/scan?kind=${kind}`, { method: "POST" });
+  try {
+    const d = await jpost(`/api/scan?kind=${kind}`, {});
+    if (d && d.started === false) toast("已有扫描在进行中，请稍候");
+  } catch (e) { return; }
   setTimeout(pollProgress, 500);
 }
 async function pollProgress() {
+  if (_wsStop) return;
   const p = await jget("/api/progress");
   updateProgress(p);
   if (p.running) setTimeout(pollProgress, 1000);
@@ -504,25 +553,25 @@ async function refreshContainers() {
     + (d.faulty ? ` · 故障 ${d.faulty}` : "") + (d.offline ? ` · 离线 ${d.offline}` : "");
   $("containerList").innerHTML = cs.map(c => {
     if (!c.online) {
-      return `<div class="cbox offline" onclick="openContainer('${c.ip}')">`
-        + `<div class="cbox-head"><span class="cbox-ip">${c.ip}</span>`
+      return `<div class="cbox offline" onclick="openContainer('${esc(c.ip)}')">`
+        + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
         + `<span class="fbadge crit">控制器离线</span></div>`
-        + `<div class="cbox-meta">最后进水 ${c.supply_temp ?? "-"}℃ / 出水 ${c.return_temp ?? "-"}℃</div></div>`;
+        + `<div class="cbox-meta">最后进水 ${safeVal(c.supply_temp)}℃ / 出水 ${safeVal(c.return_temp)}℃</div></div>`;
     }
     const dt = (c.supply_temp != null && c.return_temp != null) ? (c.return_temp - c.supply_temp).toFixed(1) : "-";
-    const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `<span class="pump ${v ? "on" : ""}">${k}</span>`).join("");
+    const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `<span class="pump ${v ? "on" : ""}">${esc(k)}</span>`).join("");
     // 忽略列表内的故障置灰(info)，其余按严重级；按阈值标红低压力
-    const faults = (c.faults || []).map(f => `<span class="fbadge ${ign.has(f.flag) ? "info" : f.sev}">${esc(f.label)}</span>`).join("");
+    const faults = (c.faults || []).map(f => `<span class="fbadge ${ign.has(f.flag) ? "info" : esc(f.sev)}">${esc(f.label)}</span>`).join("");
     const spLow = spMin && c.supply_pressure != null && c.supply_pressure < spMin;
     const rpLow = rpMin && c.return_pressure != null && c.return_pressure < rpMin;
     const realFault = (c.faults || []).some(f => !ign.has(f.flag)) || spLow || rpLow;
-    return `<div class="cbox ${realFault ? "fault" : ""}" onclick="openContainer('${c.ip}')">`
-      + `<div class="cbox-head"><span class="cbox-ip">${c.ip}</span>`
-      + `<span class="cbox-meta">矿机 ${c.miner_num ?? "-"} 台 ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span></div>`
-      + `<div class="cbox-temps"><div>进水 <span class="v in">${c.supply_temp ?? "-"}℃</span></div>`
-      + `<div>出水 <span class="v out">${c.return_temp ?? "-"}℃</span></div><div>ΔT <span class="v">${dt}℃</span></div></div>`
-      + `<div class="cbox-meta">箱内 ${c.internal_temp ?? "-"}℃ / ${c.internal_humidity ?? "-"}% ｜ 流量 ${c.flow ?? "-"} ｜ 压力 `
-      + `<span class="${spLow ? "res-fail" : ""}">${c.supply_pressure ?? "-"}</span>/<span class="${rpLow ? "res-fail" : ""}">${c.return_pressure ?? "-"}</span> ｜ 设定 ${c.set_temp ?? "-"}℃</div>`
+    return `<div class="cbox ${realFault ? "fault" : ""}" onclick="openContainer('${esc(c.ip)}')">`
+      + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
+      + `<span class="cbox-meta">矿机 ${safeVal(c.miner_num)} 台 ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span></div>`
+      + `<div class="cbox-temps"><div>进水 <span class="v in">${safeVal(c.supply_temp)}℃</span></div>`
+      + `<div>出水 <span class="v out">${safeVal(c.return_temp)}℃</span></div><div>ΔT <span class="v">${safeVal(dt)}℃</span></div></div>`
+      + `<div class="cbox-meta">箱内 ${safeVal(c.internal_temp)}℃ / ${safeVal(c.internal_humidity)}% ｜ 流量 ${safeVal(c.flow)} ｜ 压力 `
+      + `<span class="${spLow ? "res-fail" : ""}">${safeVal(c.supply_pressure)}</span>/<span class="${rpLow ? "res-fail" : ""}">${safeVal(c.return_pressure)}</span> ｜ 设定 ${safeVal(c.set_temp)}℃</div>`
       + `<div class="cbox-pumps">${pumps}</div>`
       + (faults ? `<div class="cbox-faults">${faults}</div>` : "")
       + `</div>`;
@@ -536,7 +585,7 @@ async function openContainer(ip) {
   const h = d.history || [];
   const labels = h.map(x => new Date(x.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }));
   if (modalChart) modalChart.destroy();
-  modalChart = new Chart($("mChart"), {
+  if (window.Chart) modalChart = new Chart($("mChart"), {
     type: "line",
     data: {
       labels, datasets: [
@@ -547,12 +596,12 @@ async function openContainer(ip) {
     options: { interaction: { mode: "index", intersect: false },
       scales: { x: { ticks: { color: "#6e7681", maxTicksLimit: 6 } }, y: { ticks: { color: "#6e7681" } } }, plugins: { legend: { labels: { color: "#adbac7" } } } }
   });
-  const faults = (c.faults || []).map(f => `<span class="fbadge ${f.sev}">${esc(f.label)}</span>`).join("") || "无";
-  const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${k}:${v ? "开" : "关"}`).join(" ｜ ");
+  const faults = (c.faults || []).map(f => `<span class="fbadge ${esc(f.sev)}">${esc(f.label)}</span>`).join("") || "无";
+  const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${esc(k)}:${v ? "开" : "关"}`).join(" ｜ ");
   $("mInfo").innerHTML =
-    `进水 ${c.supply_temp ?? "-"}℃ ｜ 出水 ${c.return_temp ?? "-"}℃ ｜ 设定 ${c.set_temp ?? "-"}℃<br>`
-    + `供/回压 ${c.supply_pressure ?? "-"}/${c.return_pressure ?? "-"} ｜ 流量 ${c.flow ?? "-"} ｜ 冷却塔进水 ${c.tower_inlet_temp ?? "-"}℃<br>`
-    + `箱内 ${c.internal_temp ?? "-"}℃ / ${c.internal_humidity ?? "-"}% ｜ 矿机 ${c.miner_num ?? "-"} 台 ｜ 芯片最高 ${c.chip_max_temp ?? "-"}℃<br>`
+    `进水 ${safeVal(c.supply_temp)}℃ ｜ 出水 ${safeVal(c.return_temp)}℃ ｜ 设定 ${safeVal(c.set_temp)}℃<br>`
+    + `供/回压 ${safeVal(c.supply_pressure)}/${safeVal(c.return_pressure)} ｜ 流量 ${safeVal(c.flow)} ｜ 冷却塔进水 ${safeVal(c.tower_inlet_temp)}℃<br>`
+    + `箱内 ${safeVal(c.internal_temp)}℃ / ${safeVal(c.internal_humidity)}% ｜ 矿机 ${safeVal(c.miner_num)} 台 ｜ 芯片最高 ${safeVal(c.chip_max_temp)}℃<br>`
     + `总功耗 ${fmtPower(boxPower(c))}（配电1 ${fmtPower(c.power1)} + 配电2 ${fmtPower(c.power2)}）<br>`
     + `泵/风扇：${pumps}<br>故障：${faults}`;
   $("modal").classList.remove("hidden");
@@ -565,7 +614,6 @@ function refreshAll() {
   else refreshMiners();
 }
 
-// events
 /* ---------------- 选择 + 远程命令 ---------------- */
 $("minerBody").addEventListener("change", (e) => {
   const cb = e.target;
@@ -575,21 +623,26 @@ $("minerBody").addEventListener("change", (e) => {
     updateSelCount();
   }
 });
+// 全选：作用于「当前筛选的全部结果」而不只是渲染出来的那几百行，
+// 否则渲染上限会让用户以为全选了、实际漏掉后面的机器。
 $("cbAll").onclick = (e) => {
-  document.querySelectorAll("#minerBody input[data-ip]").forEach(cb => {
-    cb.checked = e.target.checked;
-    if (e.target.checked) selected.add(cb.dataset.ip); else selected.delete(cb.dataset.ip);
-    cb.closest("tr").classList.toggle("sel", e.target.checked);
-  });
-  updateSelCount();
+  if (e.target.checked) lastMiners.forEach(m => selected.add(m.ip));
+  else selected.clear();
+  refreshMiners();
 };
 
 const CMD_META = {
-  "locate-on":  { action: "locate", params: { on: true },  title: "💡 开启定位灯", danger: false },
-  "locate-off": { action: "locate", params: { on: false }, title: "关闭定位灯", danger: false },
-  "reboot":     { action: "reboot", params: {}, title: "⟳ 重启矿机", danger: true },
-  "set-pools":  { action: "set_pools", params: {}, title: "⚙ 修改矿池", danger: true },
+  "locate-on":  { action: "locate", params: { on: true },  title: "💡 开启定位灯", short: "开定位灯", danger: false },
+  "locate-off": { action: "locate", params: { on: false }, title: "关闭定位灯", short: "关定位灯", danger: false },
+  "reboot":     { action: "reboot", params: {}, title: "⟳ 重启矿机", short: "重启", danger: true },
+  "set-pools":  { action: "set_pools", params: {}, title: "⚙ 修改矿池", short: "换矿池", danger: true },
 };
+// 破坏性命令(重启/换矿池)的「大批量」阈值。比 repair/remove 的 500 更低：换矿池直接改全场
+// 收益去向、重启让全场同时离线，误操作代价远高于标记维修，所以更早开始拦。
+const DANGER_BULK = 200;
+// 后端 /api/command 对 reboot/set_pools 强制要求请求体带 confirm:true，否则 400。
+// 字段名与 server.py 约定死，改这里必须同步改后端。
+const NEED_CONFIRM_FLAG = new Set(["reboot", "set_pools"]);
 
 document.querySelector(".cmdbar").addEventListener("click", (e) => {
   const cmd = e.target.dataset && e.target.dataset.cmd;
@@ -608,39 +661,52 @@ document.querySelector(".cmdbar").addEventListener("click", (e) => {
 async function doMachineState(action) {
   if (!selected.size) { toast("请先选择矿机"); return; }
   const ips = [...selected];
-  // 维修/下架影响大(停告警/删名册)，二次确认把后果讲清；大批量再确认一次，防手滑把全场"安静地标维修"
+  // 维修/下架影响大(停告警/删名册)，二次确认把后果讲清；大批量再确认一次
   if (action === "repair" && !confirm(`确认把 ${ips.length} 台标记「维修中」？\n期间这些机器掉线/零算力将不再报警、也不计入客户统计。`)) return;
   if (action === "remove" && !confirm(`确认从名册「下架移除」${ips.length} 台？\n将不再探测/告警；若机器仍通电，下次扫描可能被重新收录。`)) return;
   if (ips.length > 500 && !confirm(`⚠️ 本次将影响 ${ips.length} 台（数量很大），请再确认一次！`)) return;
-  const r = await fetch("/api/machine-state", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ips, action }),
-  });
-  const d = await r.json();
-  if (!d.ok) { toast("失败：" + (d.error || r.status)); return; }
-  toast(`${ { repair: "标记维修", active: "取消维修", remove: "下架移除" }[action] } ${d.count} 台`, "ok");
-  selected.clear(); refreshMiners();
+  try {
+    const d = await jpost("/api/machine-state", { ips, action });
+    if (!d.ok) { toast("失败：" + (d.error || "")); return; }
+    toast(`${ { repair: "标记维修", active: "取消维修", remove: "下架移除" }[action] } ${d.count} 台`, "ok");
+    selected.clear(); refreshMiners();
+  } catch (e) {}
 }
 
 let pendingCmd = null;
 function openCmdDialog(cmd) {
   if (!selected.size) { toast("请先选择矿机"); return; }
   const meta = CMD_META[cmd];
-  pendingCmd = { action: meta.action, params: { ...meta.params } };
+  pendingCmd = { action: meta.action, params: { ...meta.params }, danger: !!meta.danger, short: meta.short || meta.title };
   $("cmdTitle").textContent = meta.title;
   const ips = [...selected];
-  let html = `对 <b>${ips.length}</b> 台矿机执行：<b>${meta.title}</b>`;
+  let html = `对 <b>${ips.length}</b> 台矿机执行：<b>${esc(meta.title)}</b>`;
   if (meta.danger)
     html += `<div class="warn-box">⚠️ 这是破坏性操作，会立即影响矿机运行（${meta.action === "reboot" ? "重启会中断挖矿约数分钟" : "改矿池会切换挖矿目标"}）。请确认无误。</div>`;
+  // 规模分级提示：几台和几千台的后果完全不是一回事，弹窗里必须让人看清影响范围
+  if (meta.danger && ips.length > DANGER_BULK)
+    html += `<div class="warn-box" style="border-width:2px;font-weight:700;font-size:15px;line-height:1.7">`
+      + `🚨 即将对 <span style="font-size:19px">${ips.length}</span> 台矿机执行【${esc(meta.short || meta.title)}】<br>`
+      + (meta.action === "reboot"
+          ? `这会让这 ${ips.length} 台矿机同时离线数分钟（分批下发，仍有整片算力掉坑）。`
+          : `这会把这 ${ips.length} 台矿机的挖矿收益去向整体切换到新矿池。`)
+      + `<br>这是破坏性操作，请再次确认选中范围无误！</div>`;
   if (meta.action === "set_pools") {
-    html += `<div>矿池地址<input id="poolUrl" placeholder="stratum+tcp://host:port"></div>`
-      + `<div>矿工名<input id="poolUser" placeholder="worker"></div>`
-      + `<div>密码<input id="poolPass" value="x"></div>`;
+    // 后端支持 1-8 个池，这里给主池 + 两个备用池(矿场标准配置就是一主两备)
+    html += `<div class="muted" style="margin:6px 0">主池必填；备用池留空则不下发。矿机会在主池不可用时自动切备用池。</div>`;
+    for (let i = 0; i < 3; i++) {
+      html += `<div class="poolrow"><b>${i === 0 ? "主池" : "备用池" + i}</b>`
+        + `<input id="poolUrl${i}" placeholder="stratum+tcp://host:port">`
+        + `<input id="poolUser${i}" placeholder="矿工名 worker">`
+        + `<input id="poolPass${i}" value="x" placeholder="密码"></div>`;
+    }
   }
   html += `<div class="muted" style="margin-top:8px">目标 ${ips.length} 台：</div>`
     + `<div style="max-height:120px;overflow:auto;font-size:12px;line-height:1.6;border:1px solid #30363d;border-radius:6px;padding:6px;margin-top:4px">`
     + ips.map(esc).join("、") + `</div>`;
   $("cmdBody").innerHTML = html;
+  // 确认按钮上写清「几台 + 干什么」，避免用户凭肌肉记忆点掉一个通用的"确认执行"
+  $("cmdConfirm").textContent = `确认对 ${ips.length} 台执行【${meta.short || meta.title}】`;
   $("cmdModal").classList.remove("hidden");
 }
 
@@ -648,30 +714,41 @@ $("cmdConfirm").onclick = async () => {
   if (!pendingCmd) return;
   const ips = [...selected];
   if (pendingCmd.action === "set_pools") {
-    const url = $("poolUrl").value.trim();
-    if (!url) { toast("请填写矿池地址"); return; }
-    pendingCmd.params.pools = [{ url, user: $("poolUser").value.trim(), pass: $("poolPass").value || "x" }];
+    const pools = [];
+    for (let i = 0; i < 3; i++) {
+      const el = $(`poolUrl${i}`);
+      const url = el ? el.value.trim() : "";
+      if (!url) continue;
+      const user = $(`poolUser${i}`).value.trim();
+      if (!user) { toast(`第 ${i + 1} 个矿池填了地址但没填矿工名`); return; }
+      pools.push({ url, user, pass: $(`poolPass${i}`).value || "x" });
+    }
+    if (!pools.length) { toast("请至少填写主池地址与矿工名"); return; }
+    pendingCmd.params.pools = pools;
   }
+  // 大批量破坏性命令再拦一道原生确认，和 repair/remove 的交互保持一致
+  if (pendingCmd.danger && ips.length > DANGER_BULK &&
+      !confirm(`⚠️ 即将对 ${ips.length} 台矿机执行【${pendingCmd.short}】，数量很大且不可撤销。\n确定继续吗？`)) return;
+  const btnLabel = $("cmdConfirm").textContent;
   $("cmdConfirm").disabled = true; $("cmdConfirm").textContent = "执行中…";
   try {
-    const r = await fetch("/api/command", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ips, action: pendingCmd.action, params: pendingCmd.params }),
-    });
-    const d = await r.json();
-    if (!d.ok) { toast("失败：" + (d.error || r.status)); }
+    const body = { ips, action: pendingCmd.action, params: pendingCmd.params };
+    // 后端对 reboot/set_pools 强制校验 confirm===true，缺了直接 400
+    if (NEED_CONFIRM_FLAG.has(pendingCmd.action)) body.confirm = true;
+    const d = await jpost("/api/command", body);
+    if (!d.ok) { toast("失败：" + (d.error || "")); }
     else if (d.async) {   // 分批重启：后台执行，轮询进度，界面不卡
       toast(`已开始分批重启 ${d.count} 台（打乱顺序，每批 ${d.batch} 台、间隔 ${d.delay}s，防变压器浪涌），后台执行中…`, "ok");
       pollCmdProgress();
       selected.clear();
     } else {
-      const fails = d.results.filter(x => !x.ok);
+      const fails = (d.results || []).filter(x => !x.ok);
       let msg = `${pendingCmd.action}：成功 ${d.success} / 失败 ${d.failed}`;
       if (fails.length) msg += "\n" + fails.slice(0, 5).map(x => `${x.ip}: ${x.msg}`).join("\n");
       toast(msg, fails.length ? "fail" : "ok");
     }
-  } catch (err) { toast("请求出错：" + err); }
-  $("cmdConfirm").disabled = false; $("cmdConfirm").textContent = "确认执行";
+  } catch (err) { /* 401/403 已在 jpost 里处理 */ }
+  $("cmdConfirm").disabled = false; $("cmdConfirm").textContent = btnLabel;
   $("cmdModal").classList.add("hidden");
   pendingCmd = null;
 };
@@ -695,10 +772,17 @@ async function pollCmdProgress() {
   } catch (e) { if (!_wsStop) setTimeout(pollCmdProgress, 5000); }
 }
 
+// toast 用 textContent 而不是 innerHTML：内容里会拼进矿机/矿池返回的错误串(control.py 把异常
+// 原样放进 msg)。内网一台被攻陷的设备返回带 <img onerror=...> 的报错，就能在 ops/admin 的
+// 浏览器里执行 JS，进而调用 /api/command 重启全场。换行靠 CSS 的 white-space 处理。
 function toast(text, kind) {
   const t = document.createElement("div");
   t.className = "toast";
-  t.innerHTML = `<span class="${kind === "fail" ? "res-fail" : kind === "ok" ? "res-ok" : ""}">${text.replace(/\n/g, "<br>")}</span>`;
+  const span = document.createElement("span");
+  if (kind === "fail") span.className = "res-fail";
+  else if (kind === "ok") span.className = "res-ok";
+  span.textContent = String(text);
+  t.appendChild(span);
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 6000);
 }
@@ -709,7 +793,9 @@ async function openSeg() {
   $("segText").value = (d.segments || []).join("\n");
   $("segHs").value = d.host_start; $("segHe").value = d.host_end;
   const s = await jget("/api/settings");
-  $("setInterval").value = s.scan_interval; $("setPps").value = s.max_pps;
+  $("setInterval").value = s.scan_interval;
+  if ($("setFullInterval")) $("setFullInterval").value = s.full_interval;
+  $("setPps").value = s.max_pps;
   if (s.cloud) {   // 云端上报配置(仅 admin 下发)
     $("cloudEnabled").checked = !!s.cloud.enabled;
     $("cloudName").value = s.cloud.site_name || "";
@@ -718,17 +804,20 @@ async function openSeg() {
     $("cloudToken").value = s.cloud.token || "";
     $("cloudSiteId").textContent = s.site_id || "-";
   }
+  $("cloudToken").type = "password";   // 每次打开都回到遮蔽态
+  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = "👁 显示";
   $("segModal").classList.remove("hidden");
 }
 async function saveSeg(scan) {
   const segs = $("segText").value.split(/[\n,\s]+/).map(s => s.trim()).filter(Boolean);
-  const body = { segments: segs, host_start: parseInt($("segHs").value) || 1, host_end: parseInt($("segHe").value) || 254 };
-  const r = await fetch("/api/segments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  const d = await r.json();
-  if (!d.ok) { toast("保存失败：" + (d.error || r.status)); return; }
-  const r2 = await fetch("/api/settings", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+  try {
+    const d = await jpost("/api/segments", {
+      segments: segs,
+      host_start: parseInt($("segHs").value) || 1,
+      host_end: parseInt($("segHe").value) || 254,
+    });
+    if (!d.ok) { toast("保存失败：" + (d.error || "")); return; }
+    const body = {
       scan_interval: parseInt($("setInterval").value) || 300,
       max_pps: parseInt($("setPps").value) || 0,
       cloud: {
@@ -738,16 +827,28 @@ async function saveSeg(scan) {
         url: $("cloudUrl").value.trim(),
         token: $("cloudToken").value.trim(),
       },
-    }),
-  });
-  const d2 = await r2.json();
-  if (!d2.ok) { toast("保存失败：" + (d2.error || r2.status)); return; }
-  $("segModal").classList.add("hidden");
-  toast(`已保存 网段/扫描/云端上报设置` + ($("cloudEnabled").checked ? "（上报已启用，即时生效）" : ""), "ok");
-  if (scan) { await fetch("/api/scan?kind=full", { method: "POST" }); toast("已触发全网扫描", "ok"); setTimeout(pollProgress, 500); }
+    };
+    if ($("setFullInterval")) body.full_interval = parseInt($("setFullInterval").value) || 3600;
+    const d2 = await jpost("/api/settings", body);
+    if (!d2.ok) { toast("保存失败：" + (d2.error || "")); return; }
+    $("segModal").classList.add("hidden");
+    toast(`已保存 网段/扫描/云端上报设置` + ($("cloudEnabled").checked ? "（上报已启用，即时生效）" : ""), "ok");
+    if (scan) { await jpost("/api/scan?kind=full", {}); toast("已触发全网扫描", "ok"); setTimeout(pollProgress, 500); }
+  } catch (e) {}
 }
 $("btnSeg").onclick = openSeg;
-$("segClose").onclick = $("segCancel").onclick = () => $("segModal").classList.add("hidden");
+// 上报token 默认按密码框遮住（机房里投屏/旁人围观是常态），需要核对时点👁临时显示
+if ($("cloudTokenEye")) $("cloudTokenEye").onclick = () => {
+  const el = $("cloudToken"), show = el.type === "password";
+  el.type = show ? "text" : "password";
+  $("cloudTokenEye").textContent = show ? "🙈 隐藏" : "👁 显示";
+};
+$("segClose").onclick = $("segCancel").onclick = () => {
+  $("segModal").classList.add("hidden");
+  const el = $("cloudToken");   // 关窗即复位成遮蔽态，别下次打开还明晃晃亮着
+  if (el) el.type = "password";
+  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = "👁 显示";
+};
 $("segSave").onclick = () => saveSeg(false);
 $("segSaveScan").onclick = () => saveSeg(true);
 
@@ -760,7 +861,7 @@ $("btnTestVoice").onclick = () => {
     if (audioCtx.state === "suspended") audioCtx.resume();
   } catch (e) {}
   beep(880, 0.3); setTimeout(() => beep(660, 0.3), 350);
-  speak("测试，一台矿机掉线，172 点 16 点 119 点 21");
+  speak("测试，一台矿机掉线");
   const hasVoice = ("speechSynthesis" in window);
   toast(hasVoice ? "已播放测试音。没声音的话：查电脑音量/静音、或浏览器是否给本页面静音了" :
         "你的浏览器不支持语音播报，建议用 Chrome/Edge", hasVoice ? "ok" : "fail");
@@ -768,7 +869,10 @@ $("btnTestVoice").onclick = () => {
 setVoice(voiceOn, false);   // 仅刷新按钮文字，不播放（无手势）
 $("mClose").onclick = () => $("modal").classList.add("hidden");
 $("modal").onclick = (e) => { if (e.target.id === "modal") $("modal").classList.add("hidden"); };
-["search", "fStatus", "fFw", "fSeg"].forEach(id => $(id).addEventListener("input", refreshMiners));
+["search", "fStatus", "fFw", "fSeg"].forEach(id => $(id).addEventListener("input", () => {
+  showAllRows = false;   // 换筛选条件后回到限量渲染，避免一直背着全量
+  refreshMiners();
+}));
 
 async function loadSegOptions() {
   try {
@@ -801,19 +905,28 @@ function applyRole() {
 
 let _ws = null;
 let _wsStop = false;   // 登出/会话失效后置真，停止重连风暴
+let _wsRetry = 0;      // 连续重连失败次数，连上就归零
+// 指数退避 + 随机抖动：固定 5 秒重连会让服务重启后所有在线浏览器在同一秒一起敲门，
+// 几十个页面同时握手把刚起来的服务再压一遍。等得越久 + 抖开，避免同步重连风暴。
+function wsRetryDelay() {
+  return Math.min(30000, 5000 * Math.pow(1.5, _wsRetry)) + Math.random() * 1000;
+}
 function connectWS() {
   if (_wsStop) return;
   try {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     _ws = new WebSocket(`${proto}://${location.host}/ws`);
+    _ws.onopen = () => { _wsRetry = 0; };     // 连上了，退避计数归零
     _ws.onmessage = () => refreshAll();      // 扫描完成/告警 → 即时刷新
-    _ws.onclose = (ev) => {                   // 1008=后端判会话失效 → 弹登录并停重连，避免每5秒握手风暴
+    _ws.onclose = (ev) => {                   // 1008=后端判会话失效 → 弹登录并停重连
       _ws = null;
       if (ev && ev.code === 1008) { showLogin(); return; }
-      if (!_wsStop) setTimeout(connectWS, 5000);
+      if (!_wsStop) { const d = wsRetryDelay(); _wsRetry++; setTimeout(connectWS, d); }
     };
     _ws.onerror = () => { try { _ws.close(); } catch (e) {} };
-  } catch (e) {}
+  } catch (e) {
+    if (!_wsStop) { const d = wsRetryDelay(); _wsRetry++; setTimeout(connectWS, d); }
+  }
 }
 function stopDashboard() {   // 会话失效/登出：停轮询与 WS 重连，避免登录页后台空转
   _wsStop = true;
@@ -823,6 +936,7 @@ function stopDashboard() {   // 会话失效/登出：停轮询与 WS 重连，�
 
 function startDashboard() {
   _wsStop = false;
+  _wsRetry = 0;   // 重新登录 = 全新一轮连接，别背着上一轮的退避时长
   lastOkMs = Date.now();   // 登录成功，重置失联计时，避免刚进来误报
   loadSegOptions();
   refreshAll();
@@ -848,9 +962,11 @@ $("loginBtn").onclick = doLogin;
 $("loginPass").addEventListener("keydown", e => { if (e.key === "Enter") doLogin(); });
 $("btnLogout").onclick = doLogout;
 $("btnScanContainers").onclick = async () => {
-  await fetch("/api/containers/scan", { method: "POST" });
-  toast("已触发集装箱刷新", "ok");
-  setTimeout(refreshContainers, 1500);
+  try {
+    await jpost("/api/containers/scan", {});
+    toast("已触发集装箱刷新", "ok");
+    setTimeout(refreshContainers, 1500);
+  } catch (e) {}
 };
 $("tabList").onclick = () => setView("list");
 $("tabRack").onclick = () => setView("rack");

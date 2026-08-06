@@ -107,21 +107,56 @@
 - **segment_down**：基于**当前绝对离线率**（不是"本轮新跌落"），分母只数 `roster` 内真机；离线率回落→恢复，但**只对"本轮有样本(seg_total>0)"的段判恢复**（整段掉出名册时保持告警，防长期断电被误恢复）。
 - **offline**：维修中 / 被网段事件覆盖 → 不报；否则"上次在线本次离线"→ crit。
 - **zero**：`hr_rt==0` 才算（`None`=读不到，不动）；维修中 / `uptime<grace`（刚开机升频）→ 不报。
+- **low_hashrate**：低于同机型在线机中位数的 `low_hashrate_ratio`，连续 `low_hashrate_rounds` 轮成立才报。
+  基线由 `miner_core.model_baselines` 算，**只取有正算力的机器**（零算力机算进去会把基线拉低导致漏报）；
+  同机型样本 < `low_hashrate_min_peers` 不做判定。连续计数存在 `MonitorService._alert_state`（跨轮内存态）。
+- **overheat**：`temp >= overheat_c` → crit，`temp < overheat_clear_c` 才消（滞回）。
 - **reject**：只在 accepted/rejected 非空时算，拒绝率 ≥ 阈值 → warn。
-- **cooldown**：刚恢复不久（`< cooldown`）的同机同类抖动不再报（`db.recent_alert`）。
-- **恢复**用 `db.active_alerts_by_type`（**无 limit**，避免大面积告警时早期告警被 `list_alerts` 的 200 条截断而永不恢复）。
+- **cooldown**：刚恢复不久（`< cooldown`）的同机同类抖动不再报。
+
+**批量写是硬约束**：一轮评估对 N 台机器只做 **2 次读 + 2 次批量写**——
+开头 `db.alert_state()` 一次性把「活跃告警键集合」和「冷却期内的恢复时间」读进内存，
+`_Batch.fire/resolve` 全在内存里判重，最后 `commit()` 两条 `executemany` 落库。
+**不要退回逐台 `active_alert()/resolve_alert()`**：那样 5000 台每轮上万次事务提交，
+是把 WAL 撑到 800MB 的直接原因（`tests/test_alerts.py::test_batch_does_not_write_for_nonexistent_alerts` 守这条线）。
+- **恢复**用 `db.active_alerts_by_type`（**无 limit**，避免大面积告警时早期告警被 `list_alerts` 的截断而永不恢复）。
+- **推送**走 `alerts._push_q` 独立线程：Telegram 超时 10s，绝不能卡在扫描落库路径上。
 
 ### 5.3 集装箱循环 `_container_loop`（10s）
 独立于矿机扫描，只打 `/cooler`。与全网扫描**共用 `_scan_lock` 互斥**（全扫在跑时本轮跳过，全扫已处理集装箱）。`evaluate_containers` 做故障位/压力阈值告警 + 箱体离线判定 + 恢复消警。
 
 ### 5.4 看门狗 `_watchdog_loop`（60s）
-超过 `watchdog_minutes`（0=`scan_interval×3`）无成功扫描 → `stalled` crit 告警 + Telegram。看门狗自身 try/except（"检测停摆的机制不能自己先停摆"）。
+超过 `watchdog_minutes`（0=自动取 `max(scan_interval×3, full_interval×1.5)`）无成功扫描
+→ `stalled` crit 告警 + 推送 + `_force_recover`。看门狗自身 try/except（"检测停摆的机制不能自己先停摆"）；
+`server.py` 的 `_guardian_loop` 在主事件循环里每 60s 调 `health_tick` 再兜一层（Web 活着就有人盯）。
+所有自愈路径都过 `_scheduling_on()`：配置里 `schedule.enabled=false` 时不会被偷偷拉起来。
+
+### 5.5 数据库维护 `_maintenance_loop`（60s tick）
+以前这三件事要么没有、要么挂在扫描路径上：
+- **每5分钟**：`db.rollup_hours()` 归档已结束的整点小时 → `worker_hourly`；随后 `db.prune()`
+  清过期明细（**删除线永不越过归档进度**；一次都没归档过时一条明细都不删）。
+- **每 `db.checkpoint_minutes`(10分钟)**：`PRAGMA wal_checkpoint(TRUNCATE)`。不做这件事 WAL 只涨不缩。
+- **每天 `db.vacuum_hour`(4点)**：`VACUUM` 回收空页（SQLite 删行不缩文件）。扫描进行中会跳过。
 
 ---
 
 ## 6. 关键设计决策
 
-- **H7：死 IP 不落库**。全扫 2 万 IP 里约 1.5 万是从未是矿机的死 IP；`save_scan(keep_ips=roster)` 只存"在线机 + 名册内（曾在线/维修）的离线机"，每次约 5 千行而非 2 万行（省 74% 写放大）。`scans.total/online/offline` 随之表示**真实机器**口径（前端"总数/掉线"更有意义）。首轮名册为空时退化为全量落库（否则 offline 恒 0）。
+- **两档扫描**。`quick` 只探名册（约5千台，`scan_interval` 300s），`full` 展开全网段发现新机
+  （约1.5万地址，`full_interval` 3600s）。合成一档 = 扫描耗时逼近间隔 = 系统"永远在扫"，
+  既压三层也让 WAL checkpoint 追不上。单轮耗时超过巡检间隔时 `_do_scan` 会打 warning。
+- **H7：死 IP 不落库**。全扫地址里大部分是从未是矿机的死 IP；`save_scan(keep_ips=roster)` 只存
+  "在线机 + 名册内（曾在线/维修）的离线机"。`scans.total/online/offline` 随之表示**真实机器**口径。
+  只有**全新部署的第一轮**退化为全量落库（否则 offline 恒 0、面板误显示全在线）；
+  判据是 `db.latest_scan() is None` 而**不是**"名册为空"——后者会被 IP 迁移批量下架清空名册的
+  情况误伤，导致某一轮突然把上万个死地址写进库。
+- **扫描世代号 `_scan_gen`**。被判卡死的旧扫描线程在 Python 里杀不掉。`_force_recover` 换锁的同时
+  把世代 +1；旧线程醒来后在落库前发现自己已作废 → 丢弃结果。没有这个守卫，一份十几分钟前的
+  探测会以更大的 scan_id 覆盖现状，把刚恢复的机器标回离线并触发一轮误告警。
+- **API 读内存快照**。`MonitorService.snapshot` 保存最近一轮落库结果，`SVC.latest()` 供所有
+  "当前状态"类接口用；只有历史/报表才查 DB。`save_scan` 返回的 `kept` 与数据库行**同构**
+  （同一套字段），保证走内存和回落查库返回完全一致。快照是共享只读的，
+  `/api/miners` 挂 `mstate` 前必须先 `dict(r, ...)` 拷贝。
 - **机器身份按 IP 而非 SN**（已知局限，**人工处理，不改代码**）：机器换 IP（动态→静态）时旧 IP 在名册滞留 7 天成"幽灵"，可能误触发 segment_down。决定：运维对旧网段离线机点"下架移除"即可，或等 7 天名册过期。
 - **RBAC**：`viewer<ops<admin`。读=viewer，写（命令/扫描/改设置/下架）=ops，审计/改网段=admin。**关 auth=匿名只读**（viewer），写操作仍需开 auth 登录（不是"全员 admin"）。
 - **CoPP 限速**：`max_pps` 令牌桶是核心保护；提高并发≠更快，反而更易冲破 ARP 限制（要慢扫就低并发）。
@@ -134,26 +169,39 @@
 
 | 来源 | 内容 | 谁改 |
 |---|---|---|
-| `config.yaml` | 全部默认（扫描/告警/控制/鉴权/db/server/telegram/public_api） | 手工，启动加载 |
+| `config.yaml` | 覆盖项（缺的用 `appconfig.DEFAULTS` 补齐并校验） | 手工，启动加载 |
 | `segments.json` | 扫描网段 + 主机号范围 | 网页「⚙网段」(admin)，即时生效 |
-| 运行时 settings（`service.load_settings`） | `scan_interval`/`max_pps`/`container_interval` 等 | 网页「设置」，`apply_settings` 原地改 CFG + `SVC.wake()` 即时生效 |
+| 运行时 settings（`appconfig.load_settings`） | `scan_interval`/`full_interval`/`max_pps`/`container_interval`/`discovery_workers`/`cloud` | 网页「设置」，`apply_settings` 原地改 CFG + `SVC.wake()` 即时生效 |
 
-**`config.yaml` 关键段**（详见文件内中文注释）：
-- `scan`：`online_timeout`/`data_timeout`/`max_pps`/`liveness_gate`/`reconfirm_*`/`roster_retention_days`/`passwords`。
-- `schedule`：`scan_interval`(默认300)/`container_interval`(10)/`watchdog_minutes`。
-- `alerts`：`cooldown`/`zero_grace_sec`/`reject_pct`/`segment_down_ratio/min`/`container_faults_ignore`/压力阈值。
-- `control`：`enabled`(总开关)/`uniplus_password`/`timeout`/`max_batch`(批量上限)。
+装载入口是 `appconfig.load_config()`：**深合并默认值 + 校验收敛**。
+所以代码里可以放心写 `CFG["db"]["retention_days"]`——配置少一整段也不会让后台线程
+在运行中抛 `KeyError` 静默停摆（这是以前的真实风险）。不合法的值会被夹到安全范围并打 warning。
+
+**`config.yaml` 关键段**（详见 `config.example.yaml` 内中文注释）：
+- `scan`：`online_timeout`/`data_timeout`/`max_pps`/`liveness_gate`/`gate_timeout`/`reconfirm_*`/`roster_retention_days`/`migrate_max`/`passwords`。
+- `schedule`：`scan_interval`(巡检300)/`full_interval`(发现3600)/`container_interval`(10)/`watchdog_minutes`。
+- `alerts`：`cooldown`/`zero_grace_sec`/`reject_pct`/`segment_down_ratio/min`/`low_hashrate_*`/`overheat_*`/`container_faults_ignore`/压力阈值。
+- `control`：`enabled`(总开关)/`uniplus_password`/`timeout`/`max_batch`(批量上限)/`reboot_*`(浪涌保护)。
 - `auth`：`enabled`/`secure_cookie`/`users`(password 用 `python auth.py 新密码` 生成的 pbkdf2$ 哈希)。
-- `db`：`path`/`retention_days`(默认3，影响客户报表最长周期)。
+- `db`：`path`/`retention_days`(明细3天)/`rollup_retention_days`(计费400天)/`checkpoint_minutes`/`vacuum_hour`。
+- `server`：`host`/`port`/`trusted_proxies`(空=不信任 X-Forwarded-For，直连部署的正确选择)。
 - `public_api`：`token`(外部 Agent API 共享密钥，空=该 API 关闭/404)。
+- `logging`：`level`/`file`/`max_mb`/`backups`（统一走 `logs.py`，**不要再用 print**）。
 
 ---
 
 ## 8. 线程与并发模型
 
-- FastAPI **同步端点**跑在 uvicorn 线程池；后台 3 个 daemon 线程（`_loop`/`_container_loop`/`_watchdog_loop`）。
-- DB 单连接 + `RLock`（可重入，读函数可嵌套调用）；写用 `with _lock, conn:`。
+- FastAPI **同步端点**跑在 uvicorn 线程池；后台 4 个 daemon 线程
+  （`_loop`/`_container_loop`/`_watchdog_loop`/`_maintenance_loop`）+ 告警推送线程。
+- **DB 并发模型**：写走唯一一条写连接、由 `db._wlock` 串行化（SQLite 本来也只允许一个写者）；
+  **读走各线程自己的只读连接**（`db._r()`，`PRAGMA query_only`），WAL 下读不阻塞写、写不阻塞读。
+  早期实现读写共用一把全局锁 = 把 WAL 的并发优势完全抵消：每轮落库和告警评估期间所有 API 请求排队。
+  只读连接按 `(路径, 代数)` 缓存在线程本地，`close_readers()` 会 +1 代数使旧句柄失效。
 - `_scan_lock`(普通 Lock，非重入)：保证同一时刻只有一类扫描在发包（护 CoPP + 防并发评估重复推送）。
+  `_force_recover` 会**换掉**这把锁，所以 `_do_scan`/`scan_containers` 必须持**局部引用**释放自己拿到的那把。
+- `scan_now_async` 用 `_trigger_lock` + `progress["pending"]` 占位判重，否则两个并发请求都会
+  通过"锁空闲"检查并各自返回 `started:True`，实际只有一个真跑起来。
 - WS 广播：后台线程经 `asyncio.run_coroutine_threadsafe` 投递到主事件循环；`done_callback` 清理死连接。
 - 会话/限流字典在 `auth._slock` 下；登录失败按来源 IP 限流（8 次锁 5 分钟）。
 

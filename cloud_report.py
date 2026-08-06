@@ -34,6 +34,10 @@ import time
 
 import requests
 
+import logs
+
+log = logs.get(__name__)
+
 _ID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cloud_site_id.txt")
 
 
@@ -43,12 +47,18 @@ def site_id(cfg):
     if c.get("site_id"):
         return str(c["site_id"]).strip()
     try:
-        with open(_ID_FILE, encoding="ascii") as f:
+        # errors="replace": 文件被断电写残/误编辑成含中文时不抛 UnicodeDecodeError，
+        # 脏内容由下面的 isascii/isprintable 校验拦掉并重新生成；except 再兜一层。
+        with open(_ID_FILE, encoding="ascii", errors="replace") as f:
             sid = f.read().strip()
-        if sid:
+        if sid and sid.isascii() and sid.isprintable():
             return sid
-    except OSError:
-        pass
+        if sid:
+            log.warning("%s 内容异常(%r)，忽略并重新生成场地ID", _ID_FILE, sid[:40])
+    except FileNotFoundError:
+        pass                      # 首次运行，正常
+    except (OSError, UnicodeError, ValueError) as e:
+        log.warning("读取场地ID文件失败(%s)，将重新生成", e)
     sid = "st-" + secrets.token_hex(6)
     with open(_ID_FILE, "w", encoding="ascii") as f:
         f.write(sid + "\n")
@@ -68,15 +78,21 @@ def start(cfg, get_summary, get_customers):
     get_summary: () -> /api/public/summary 同构 dict
     get_customers: (hours:int) -> customers 列表(worker/machines/uptime_pct/delivered_th_h/power_kwh)"""
     global _GEN
-    _GEN += 1
-    if not enabled(cfg):
+    _GEN += 1        # 先递增：即使下面初始化失败，旧线程也必须停掉
+    try:
+        if not enabled(cfg):
+            return None
+        c = dict(cfg.get("cloud") or {})
+        sid = site_id(cfg)
+        if str(c.get("url") or "").strip().lower().startswith("http://"):
+            log.warning("云端上报地址使用了非加密的 http:// 协议，token 将明文传输，建议改用 https://")
+        t = threading.Thread(target=_loop, args=(_GEN, c, sid, get_summary, get_customers),
+                             daemon=True, name="cloud-report")
+        t.start()
+        return t
+    except Exception as e:  # noqa: BLE001  上报是附加功能，绝不能拖垮主服务启动
+        log.error("云端上报初始化失败，本功能已禁用，原因：%s", e, exc_info=True)
         return None
-    t = threading.Thread(target=_loop,
-                         args=(_GEN, dict(cfg.get("cloud") or {}), site_id(cfg),
-                               get_summary, get_customers),
-                         daemon=True, name="cloud-report")
-    t.start()
-    return t
 
 
 def _post(c, path, payload):
@@ -84,6 +100,16 @@ def _post(c, path, payload):
                       timeout=float(c.get("timeout", 10)),
                       headers={"Authorization": f"Bearer {c.get('token', '')}"})
     r.raise_for_status()
+
+
+def _sleep(gen, secs):
+    """分片休眠：代数一变(网页改配置热重启)立刻醒来退出，避免旧线程占着整轮 sleep。"""
+    end = time.time() + secs
+    while gen == _GEN:
+        left = end - time.time()
+        if left <= 0:
+            return
+        time.sleep(min(1.0, left))
 
 
 def _loop(gen, c, sid, get_summary, get_customers):
@@ -100,6 +126,8 @@ def _loop(gen, c, sid, get_summary, get_customers):
             if s.get("ok") and s.get("scanned"):   # 尚未完成首扫时不推零数据
                 now = int(time.time())
                 scan_ts = s.get("scan_ts") or 0
+                if gen != _GEN:   # 取数期间配置被改：这一轮别再用旧token/旧名字推了
+                    break
                 _post(c, "/api/ingest/summary", {
                     "site_id": sid, "site": c["site_name"],
                     "type": c.get("site_type", "air"), "ts": now,
@@ -114,20 +142,24 @@ def _loop(gen, c, sid, get_summary, get_customers):
                 })
                 pushed = True
                 if fails:
-                    print(f"[cloud] 上报恢复(此前连续失败 {fails} 次)")
+                    log.info("上报恢复(此前连续失败 %d 次)", fails)
                 fails = 0
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             fails += 1
             if fails <= 3 or fails % 30 == 0:   # 断网时别刷屏
-                print(f"[cloud] 上报失败×{fails}: {e}")
+                log.warning("上报失败×%d: %s", fails, e)
+        if gen != _GEN:   # 每次发请求前都重新确认代数，缩短热重启时新旧线程重叠窗口
+            break
         # 客户报表独立重试：失败不推迟到下个 cust_iv，下一轮(interval)就再试
         if pushed and t0 - last_cust >= cust_iv:
             try:
                 rows = get_customers(cust_hours) or []
+                if gen != _GEN:
+                    break
                 _post(c, "/api/ingest/customers",
                       {"site_id": sid, "site": c["site_name"],
                        "hours": cust_hours, "customers": rows})
                 last_cust = t0
-            except Exception as e:
-                print(f"[cloud] 客户报表上报失败(下轮重试): {e}")
-        time.sleep(max(5.0, interval - (time.time() - t0)))
+            except Exception as e:  # noqa: BLE001
+                log.warning("客户报表上报失败(下轮重试): %s", e)
+        _sleep(gen, max(5.0, interval - (time.time() - t0)))
