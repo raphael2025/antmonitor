@@ -135,15 +135,20 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     b = _Batch(conn, cooldown, now)
 
     # —— 网段级故障(基于当前绝对离线率)：交换机持续挂着会一直维持事件 ——
-    seg_total, seg_off = {}, {}
+    # unknown(本轮未探测)不计入分子/分母——理由跟单机判断一致：拥堵时"没问过"
+    # 不该被当成"问了没事"，否则真出大面积故障时反而因为分母被冲淡而更难触发。
+    # 但同时要记 seg_unknown：用于下面"回落判定"时识别"这轮数据不完整、不可信"。
+    seg_total, seg_off, seg_unknown = {}, {}, {}
     for ip, r in cur.items():
-        if r["status"] == "unknown":   # 本轮未探测：不确定死活，不计入网段分母/分子
+        if ip not in roster:
             continue
-        if ip in roster:
-            seg = ".".join(ip.split(".")[:3])
-            seg_total[seg] = seg_total.get(seg, 0) + 1
-            if r["status"] == "offline":
-                seg_off[seg] = seg_off.get(seg, 0) + 1
+        seg = ".".join(ip.split(".")[:3])
+        if r["status"] == "unknown":
+            seg_unknown[seg] = seg_unknown.get(seg, 0) + 1
+            continue
+        seg_total[seg] = seg_total.get(seg, 0) + 1
+        if r["status"] == "offline":
+            seg_off[seg] = seg_off.get(seg, 0) + 1
     down_segments = set()
     for seg, off in seg_off.items():
         tot = seg_total.get(seg, 0)
@@ -153,9 +158,15 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                    f"网段 {seg}.x 大面积掉线 {off}/{tot}（疑似交换机/断电）")
     for a in db.active_alerts_by_type(conn, "segment_down"):   # 离线率回落 → 恢复
         seg = a["ip"][:-2] if a["ip"].endswith(".x") else a["ip"]
-        # 只对"本轮有样本"的段做回落判定；整段掉出名册/已拆除(无样本)时保持告警不动，
-        # 否则长期整段断电会因分母消失被误判为已恢复而永久消音(漏报真故障)
-        if seg_total.get(seg, 0) > 0 and seg not in down_segments:
+        tot = seg_total.get(seg, 0)
+        unk = seg_unknown.get(seg, 0)
+        # 只对"本轮有足够样本、数据可信"的段做回落判定：
+        # 1) 整段掉出名册/已拆除(无样本)时保持告警不动，否则长期整段断电会因分母消失
+        #    被误判为已恢复而永久消音(漏报真故障)
+        # 2) 扫描拥堵导致该段大量机器本轮变成 unknown 时，剩下的样本已经不能代表
+        #    真实情况——unknown 数量追上甚至超过确认样本数，说明这轮数据不可信，
+        #    暂不消警，等下一轮拿到更完整的数据再判断(防止拥堵期间误判"已恢复")
+        if tot > 0 and unk <= tot and seg not in down_segments:
             b.resolve(a["ip"], "segment_down")
 
     # —— 掉算力基线：同机型在线机的实时算力中位数 ——
