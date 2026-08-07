@@ -61,6 +61,7 @@ class MonitorService:
         self._last_checkpoint = 0.0
         self._last_rollup = 0.0
         self._last_vacuum_day = None
+        self._last_reader_sweep = 0.0
         self.notify = None            # 可选回调：扫描完成/告警时推送(WS)
 
     def wake(self):
@@ -570,6 +571,18 @@ class MonitorService:
     def _maintenance_tick(self, now=None):
         now = now or time.monotonic()
         dbc = self.cfg["db"]
+        # 只读连接是"每个碰过DB的线程各开一个、用到进程退出才关"(db._r())，FastAPI的
+        # sync路由跑在会动态开关线程的线程池里，线程一多、活得越久就攒得越多——
+        # 面板被人盯着看、上报/告警轮询越频繁，攒的速度越快，攒够 1024 就把服务打
+        # 到句柄耗尽、连上报的新 socket 都开不出来(生产上实测复现过)。定期强制关闭
+        # 重来，跟写连接完全独立，不用等扫描空闲，代价只是极小概率撞上某个读请求
+        # 正查到一半、报一次可忽略的失败。
+        sweep_iv = max(60, int(dbc.get("reader_sweep_minutes", 15)) * 60)
+        if now - self._last_reader_sweep >= sweep_iv:
+            self._last_reader_sweep = now
+            n = db.close_readers()
+            if n:
+                log.info("已关闭 %d 个只读连接句柄(定期清理，防句柄泄漏)", n)
         if now - self._last_rollup >= 300:          # 每5分钟归档一次已结束的小时
             self._last_rollup = now
             db.rollup_hours(self.conn)

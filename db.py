@@ -70,16 +70,18 @@ def _r(conn):
 
 
 def close_readers():
-    """关闭所有只读连接并作废缓存(各线程下次访问时会自动重建)。"""
+    """关闭所有只读连接并作废缓存(各线程下次访问时会自动重建)。返回关闭的连接数。"""
     global _reader_gen
     with _readers_lock:
         _reader_gen += 1
+        n = len(_readers)
         for c in _readers:
             try:
                 c.close()
             except Exception:  # noqa: BLE001
                 pass
         _readers.clear()
+        return n
 
 
 SCHEMA = """
