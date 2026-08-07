@@ -117,6 +117,9 @@ db:
   checkpoint_minutes: 10     # 每 N 分钟做一次 WAL checkpoint(TRUNCATE)
                              # ⚠ 不做这件事 WAL 会长到几百MB，读越来越慢、崩溃恢复越来越久
   vacuum_hour: 4             # 每天几点 VACUUM 回收删除留下的空页；-1=关闭
+  reader_sweep_minutes: 15   # 每 N 分钟强制关闭所有只读连接一次
+                             # ⚠ 只读连接是"每个碰过DB的线程各开一个、不主动关"，面板访问越
+                             # 频繁攒得越快，不定期清理会攒满进程文件句柄上限(实测复现过)
                              # (SQLite 删行不缩文件；VACUUM 期间独占数据库，故放低峰期)
 
 server:

@@ -87,6 +87,7 @@ DEFAULTS = {
         "rollup_retention_days": 400,    # 小时级计费聚合保留天数(结算依据，长期保留)
         "checkpoint_minutes": 10,        # 每 N 分钟 wal_checkpoint(TRUNCATE)，防 WAL 无限膨胀
         "vacuum_hour": 4,                # 每天几点做一次 VACUUM 回收空间；-1=关闭
+        "reader_sweep_minutes": 15,      # 每 N 分钟强制关闭所有只读连接一次，防句柄泄漏
     },
     "server": {
         "host": "0.0.0.0", "port": 8800,
@@ -143,6 +144,7 @@ def _validate(cfg):
     clamp("db", "retention_days", 1, 3650, int)
     clamp("db", "rollup_retention_days", 1, 3650, int)
     clamp("db", "checkpoint_minutes", 1, 1440, int)
+    clamp("db", "reader_sweep_minutes", 1, 1440, int)
     clamp("alerts", "cooldown", 0, 86400, int)
     clamp("control", "max_batch", 1, 100000, int)
     # 超时类：0/负数会一路传到 socket.settimeout()/requests(timeout=)，
