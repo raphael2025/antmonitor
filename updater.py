@@ -16,6 +16,7 @@
 - 生产建议跟踪专用 release 分支(update.branch)，开发分支随便推不影响线上。
 - Docker 部署不用本更新器（重建镜像），见 docs/DEPLOY.md。
 """
+import json
 import os
 import py_compile
 import shutil
@@ -30,6 +31,12 @@ import logs
 log = logs.get(__name__)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+# 更新状态(已 .gitignore)：{"bad": [自检没过的远端提交], "pending": {"prev","to","attempts"}}
+STATE_FILE = os.path.join(BASE, ".update_state.json")
+# 新版本连续启动这么多次都没能稳定运行 60 秒 → 自动回滚到上一版
+MAX_BOOT_ATTEMPTS = 3
+HEALTHY_AFTER_SEC = 60
 
 # 更新互斥：apply() 全程串行。两次 POST /api/update/apply 撞车(人为双击、或自动检测
 # 线程与手动调用同时触发)会让两串 git fetch/merge/reset 打在同一个 .git 索引上，
@@ -98,6 +105,80 @@ _GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never",
             "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=15"}
 
 
+def _load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            st = json.load(f)
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_state(st):
+    try:
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        log.warning("写更新状态失败: %s", e)
+
+
+def _mark_bad(sha):
+    st = _load_state()
+    bad = [b for b in st.get("bad", []) if b != sha][-19:]
+    st["bad"] = bad + [sha]
+    _save_state(st)
+
+
+def _set_pending(prev, to):
+    st = _load_state()
+    st["pending"] = {"prev": prev, "to": to, "attempts": 0, "ts": int(time.time())}
+    _save_state(st)
+
+
+def boot_guard():
+    """服务启动最开始调用(在 import 其余业务模块之前，模块级崩溃也算一次失败启动)。
+
+    刚更新过(有 pending)：记一次启动尝试；连续 MAX_BOOT_ATTEMPTS 次都没撑到 mark_healthy()，
+    说明新版本一启动就崩(自检只 import 了一遍，挡不住读真实配置/真实库才出的错)：
+    git reset 回上一版、把这个提交记为坏版本，然后重启——守护(run.bat/NSSM)会用旧代码拉起。
+    赶在 run.bat 连续 5 次快速失败熔断之前完成。"""
+    st = _load_state()
+    p = st.get("pending")
+    if not isinstance(p, dict) or not p.get("prev"):
+        return
+    p["attempts"] = int(p.get("attempts", 0)) + 1
+    if p["attempts"] <= MAX_BOOT_ATTEMPTS:
+        _save_state(st)
+        return
+    msg = (f"新版本 {str(p.get('to'))[:10]} 连续 {MAX_BOOT_ATTEMPTS} 次启动失败，"
+           f"自动回滚到 {str(p['prev'])[:10]}")
+    try:
+        sys.stderr.write(msg + "\n")
+        log.error("%s", msg)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _git("reset", "--hard", p["prev"])
+    except Exception as e:  # noqa: BLE001
+        log.error("自动回滚失败，需要人工处理: git reset --hard %s (%s)", p["prev"], e)
+        return
+    st.pop("pending", None)
+    _save_state(st)
+    if p.get("to"):
+        _mark_bad(p["to"])
+    _restart()
+
+
+def mark_healthy():
+    """新版本稳定运行 HEALTHY_AFTER_SEC 秒后调用：更新确认成功，清掉 pending。"""
+    st = _load_state()
+    if st.pop("pending", None) is not None:
+        _save_state(st)
+        log.info("新版本已稳定运行，更新确认完成")
+
+
 def _git(*args, timeout=60):
     r = subprocess.run(["git", "-c", "i18n.logOutputEncoding=utf-8", *args], cwd=BASE,
                        capture_output=True, text=True, stdin=subprocess.DEVNULL,
@@ -134,7 +215,8 @@ def check(branch=None):
         changes = (_git("log", "--oneline", f"HEAD..origin/{branch}", "-10").splitlines()
                    if behind else [])
         return {"git": True, "branch": branch, "local": local[:10], "remote": remote[:10],
-                "behind": behind, "changes": changes, "checked_ts": int(time.time())}
+                "behind": behind, "changes": changes, "checked_ts": int(time.time()),
+                "remote_full": remote, "known_bad": remote in _load_state().get("bad", [])}
     except Exception as e:
         return {"git": True, "error": str(e)[:300]}
 
@@ -225,6 +307,9 @@ def _apply(branch=None, restart=True):
     st = check(branch)
     if st.get("error") or not st.get("behind"):
         return {"ok": False, "msg": st.get("error") or "已是最新版本", "check": st}
+    if st.get("known_bad"):   # 同一个坏提交不再反复"合并→自检失败→回滚"(每小时一次，期间磁盘上是坏代码)
+        return {"ok": False, "msg": f"远端版本 {st['remote']} 之前自检未通过或启动失败已回滚，等待新的提交",
+                "check": st}
     prev = _git("rev-parse", "HEAD")
     try:
         _git("merge", "--ff-only", f"origin/{st['branch']}")
@@ -232,10 +317,22 @@ def _apply(branch=None, restart=True):
         return {"ok": False, "msg": f"合并失败(本地有改动或分叉?): {e}"}
     err = _selfcheck()   # 自检不过就立刻回滚，绝不带病重启
     if err:
-        _git("reset", "--hard", prev)
+        _mark_bad(st.get("remote_full") or "")
+        for attempt in (1, 2):
+            try:
+                _git("reset", "--hard", prev)
+                break
+            except Exception as e:  # noqa: BLE001 - 文件被占用/index.lock 时再试一次
+                if attempt == 2:
+                    log.error("新代码自检失败且回滚失败，磁盘上是坏版本，下次重启会加载它！"
+                              "请人工执行 git reset --hard %s (%s)", prev, e)
+                    return {"ok": False, "msg": f"新代码自检失败，且回滚失败(需人工执行 git reset "
+                                                f"--hard {prev[:10]}): {e}"[:300]}
+                time.sleep(2)
         return {"ok": False, "msg": f"新代码自检失败，已回滚到 {prev[:10]}: {err}"[:300]}
     new = _git("rev-parse", "HEAD")
     if restart:
+        _set_pending(prev, new)                  # 新版本若一启动就崩，boot_guard 会自动回滚
         threading.Timer(1.5, _restart).start()   # 等响应发出去再退
     return {"ok": True, "from": prev[:10], "to": new[:10],
             "changes": st.get("changes"), "restarting": restart,

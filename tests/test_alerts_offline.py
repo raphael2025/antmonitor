@@ -129,3 +129,17 @@ def test_reboot_that_never_comes_back_after_a_recent_flap_is_not_lost(conn, cfg,
     clock.tick(1800)
     _round(conn, cfg, clock, [rec(IP, status="offline")], st)
     assert _active(conn) == [IP]
+
+
+def test_machines_under_repair_do_not_count_toward_segment_down(conn, cfg, clock):
+    """送修拔电的机器不能算进网段掉线比例：10 台里 6 台在修 → 以前报 crit 网段掉线且不消，
+    同段剩下机器的真实故障(零算力/掉线)全被网段事件静音。"""
+    ips = [f"10.0.1.{i}" for i in range(1, 11)]
+    st = {}
+    _round(conn, cfg, clock, [rec(ip) for ip in ips], st)
+    db.set_machine_state(conn, ips[:6], "repair")
+    recs = [rec(ip, status="offline") for ip in ips[:6]] + [rec(ip) for ip in ips[6:9]] \
+        + [rec(ips[9], status="offline")]
+    fired = _round(conn, cfg, clock, recs, st)
+    assert _active(conn, "segment_down") == []
+    assert (ips[9], "offline") in fired                 # 同段真掉线的那台照常报

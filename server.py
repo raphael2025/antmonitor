@@ -6,6 +6,12 @@
 (SVC.latest())，不再每个请求回查 SQLite。一个浏览器每 30 秒刷新会打 3~4 个接口，
 每个都拉 5000 行是纯粹的浪费，而且会和扫描落库抢数据库。历史/报表类查询才走 DB。
 """
+if __name__ == "__main__":
+    # 刚网页/自动更新过：先于其它业务模块 import 记一次启动尝试。新版本若在模块级就崩，
+    # 连续几次后在这里自动回滚到上一版(见 updater.boot_guard)
+    import updater as _updater
+    _updater.boot_guard()
+
 import asyncio
 import contextlib
 import hmac as _hmac
@@ -65,6 +71,10 @@ async def lifespan(app_):
         log.info("云端上报已启动 → %s (场地: %s, ID: %s)", CFG["cloud"]["url"],
                  CFG["cloud"]["site_name"], cloud_report.site_id(CFG))
     updater.start_auto(CFG.get("update") or {})
+    # 新版本稳定运行 60 秒 → 确认更新成功(清掉回滚标记)
+    _h = threading.Timer(updater.HEALTHY_AFTER_SEC, updater.mark_healthy)
+    _h.daemon = True
+    _h.start()
     _startup_selfcheck()
     try:
         yield
@@ -310,11 +320,19 @@ def _cached(key, ttl, builder, want_hit=False):
             return (ent[1], True) if want_hit else ent[1]
     data = builder()
     with _cache_lock:
-        _cache[key] = (now, data)
-        if len(_cache) > 300:   # 顺手清过期项防无界增长
-            for k in [k for k, v in _cache.items() if now - v[0] > 300]:
+        _cache[key] = (now, data, ttl)
+        if len(_cache) > _CACHE_MAX:
+            # 先按各自 ttl 清过期项；还超就按时间丢最旧的。键里带 limit/q 等任意参数，
+            # 以前只清"超过 300 秒"的，一个换参数狂刷的脚本 5 分钟能攒上百份全场快照撑爆内存
+            for k in [k for k, v in _cache.items() if now - v[0] >= v[2]]:
                 _cache.pop(k, None)
+            if len(_cache) > _CACHE_MAX:
+                for k, _v in sorted(_cache.items(), key=lambda kv: kv[1][0])[:len(_cache) - _CACHE_MAX // 2]:
+                    _cache.pop(k, None)
     return (data, False) if want_hit else data
+
+
+_CACHE_MAX = 64
 
 
 def _rate_ok(src):
@@ -336,9 +354,11 @@ def _rate_ok(src):
 @app.get("/api/summary")
 def api_summary(_: dict = Depends(require_viewer)):
     ls, recs = _latest_records()
+    # stale_after：前端"数据过期"横幅用服务端看门狗同一阈值(以前写死 900 秒，巡检间隔调大后每轮都误报)
+    extra = {"progress": SVC.progress, "stale_after": int(SVC._stale_threshold())}
     if not ls:
-        return {"scanned": False, "progress": SVC.progress}
-    return {"scanned": True, **_summary_stats(ls, recs), "progress": SVC.progress}
+        return {"scanned": False, **extra}
+    return {"scanned": True, **_summary_stats(ls, recs), **extra}
 
 
 def _container_faulty(c, ignore):
@@ -346,7 +366,16 @@ def _container_faulty(c, ignore):
     否则用户明明已经把某个故障位加进忽略列表(不报警)，总览/列表的"故障"计数却还在算它。"""
     if not c.get("online"):
         return False
-    return any(f["flag"] not in ignore for f in (c.get("faults") or []))
+    if any(f["flag"] not in ignore for f in (c.get("faults") or [])):
+        return True
+    # 供/回液压力低也是告警条件(alerts 里按阈值判)：以前卡片标红、告警也报了，"故障 N"却不算它
+    a = CFG.get("alerts", {})
+    for key, lim in (("supply_pressure", a.get("container_supply_pressure_min", 0) or 0),
+                     ("return_pressure", a.get("container_return_pressure_min", 0) or 0)):
+        v = c.get(key)
+        if lim and isinstance(v, (int, float)) and v < lim:
+            return True
+    return False
 
 
 def _summary_stats(ls, recs):
@@ -659,7 +688,10 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
     # 空值(离线/无算力)始终排在最后，不受升降序影响
     nn = [r for r in out if r.get(sort) not in (None, "")]
     nul = [r for r in out if r.get(sort) in (None, "")]
-    nn.sort(key=lambda r: r.get(sort), reverse=rev)
+    if sort == "ip":   # 按数值排：字符串序会排成 .1 .10 .100 .2，巡架时对不上机位
+        nn.sort(key=miner_core._ip_sort_key, reverse=rev)
+    else:
+        nn.sort(key=lambda r: r.get(sort), reverse=rev)
     page = (nn + nul)[:limit]
     # 拷贝后再挂 mstate：recs 是所有请求共享的内存快照，绝不能原地改
     return {"count": len(out), "agg": agg,
@@ -804,7 +836,7 @@ def api_alert_ack(body: dict = Body(...), sess: dict = Depends(require_ops)):
     """确认矿机告警（集装箱告警不允许确认，修复后自动消失）。"""
     try:
         aid = int(body.get("id"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # 请求体里的 Infinity 会被 JSON 解析成 inf
         return JSONResponse({"ok": False, "error": "id 非法"}, status_code=400)
     a = db.get_alert(SVC.conn, aid)
     if not a:
@@ -913,7 +945,7 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     if effective_full < effective_scan:
         return JSONResponse({"ok": False, "error": "全网发现间隔不能小于巡检间隔"},
                             status_code=400)
-    appconfig.save_settings({**appconfig.load_settings(), **s})
+    appconfig.update_settings(s)       # 读-合并-写在同一把锁内：两个 admin 同时保存不互相覆盖
     appconfig.apply_settings(CFG, s)   # 即时生效，无需重启
     SVC.wake()                         # 唤醒调度循环立即按新间隔重排
     out = {"ok": True, **s}
@@ -955,7 +987,7 @@ def api_segments_save(body: dict = Body(...), _: dict = Depends(require_admin)):
     try:
         hs = max(1, min(254, int(body.get("host_start", 1))))
         he = max(hs, min(254, int(body.get("host_end", 254))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return JSONResponse({"ok": False, "error": "host_start/host_end 须为数字"},
                             status_code=400)
     appconfig.save_segments(norm, hs, he)
@@ -1115,6 +1147,9 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
              "rejected": out_of_scope[:100], "rejected_count": len(out_of_scope)},
             status_code=400)
     params = body.get("params") or {}
+    if not isinstance(params, dict):
+        _audit_reject(user, action, "params 结构非法")
+        return JSONResponse({"ok": False, "error": "params 须为对象"}, status_code=400)
     if action == "set_pools":   # 换矿池: 校验 pools 结构与 URL，避免下发非法/恶意配置
         pools = params.get("pools")
         if not isinstance(pools, list) or not pools or len(pools) > 8:

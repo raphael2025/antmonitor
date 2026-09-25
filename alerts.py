@@ -154,7 +154,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     # 但同时要记 seg_unknown：用于下面"回落判定"时识别"这轮数据不完整、不可信"。
     seg_total, seg_off, seg_unknown = {}, {}, {}
     for ip, r in cur.items():
-        if ip not in roster or ip in rb_quiet:
+        if ip not in roster or ip in rb_quiet or ip in repair:   # 送修拔电的不算"网段掉线"
             continue
         seg = ".".join(ip.split(".")[:3])
         if r["status"] == "unknown":

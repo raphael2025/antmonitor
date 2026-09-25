@@ -17,6 +17,7 @@ def app(monkeypatch, tmp_path):
     server = importlib.import_module("server")
     monkeypatch.setattr(server.appconfig, "save_segments", lambda *a: None)
     monkeypatch.setattr(server.appconfig, "save_settings", lambda *a, **k: None)
+    monkeypatch.setattr(server.appconfig, "update_settings", lambda *a, **k: {})
     monkeypatch.setattr(server.appconfig, "load_segments", lambda cfg: (["10.0.0"], 1, 254))
     auth._fails.clear()
     auth._ufails.clear()
@@ -109,3 +110,39 @@ def test_settings_cannot_silently_stall_scanning(app, monkeypatch):
         assert server.CFG["scan"]["max_pps"] == 100
     r = c.post("/api/settings", json={"max_pps": 200})
     assert r.status_code == 200 and r.json()["max_pps"] == 200 == server.CFG["scan"]["max_pps"]
+
+
+def test_low_pressure_container_counts_as_faulty(app, monkeypatch):
+    server, _c = app
+    monkeypatch.setitem(server.CFG["alerts"], "container_supply_pressure_min", 0.2)
+    assert server._container_faulty({"online": True, "faults": [], "supply_pressure": 0.1}, set())
+    assert not server._container_faulty({"online": True, "faults": [], "supply_pressure": 0.3}, set())
+    assert not server._container_faulty({"online": True, "faults": [], "supply_pressure": None}, set())
+
+
+def test_ip_sort_is_numeric(app, monkeypatch):
+    server, c = app
+    from conftest import rec
+    recs = [rec(f"10.0.0.{n}") for n in (100, 2, 10, 1)]
+    monkeypatch.setattr(server, "_latest_records", lambda: (None, recs))
+    got = [m["ip"] for m in c.get("/api/miners?sort=ip&order=asc").json()["miners"]]
+    assert got == ["10.0.0.1", "10.0.0.2", "10.0.0.10", "10.0.0.100"]
+
+
+def test_hostile_inputs_get_400_not_500(app):
+    _server, c = app
+    J = {"Content-Type": "application/json"}
+    assert c.post("/api/alerts/ack", content=b'{"id": Infinity}', headers=J).status_code == 400
+    assert c.post("/api/segments", content=b'{"segments": ["10.0.0"], "host_start": Infinity}',
+                  headers=J).status_code == 400
+    r = c.post("/api/command", json={"ips": ["10.0.0.1"], "action": "set_pools",
+                                     "confirm": True, "params": ["x"]})
+    assert r.status_code == 400
+
+
+def test_short_cache_is_bounded(app):
+    server, _c = app
+    server._cache.clear()
+    for i in range(1000):
+        server._cached(("k", i), 30, lambda: [0] * 10)
+    assert len(server._cache) <= server._CACHE_MAX

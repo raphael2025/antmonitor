@@ -14,6 +14,7 @@ const safeVal = (v) => v == null ? "-" : esc(v);
 
 let lastOkMs = Date.now();   // 最近一次成功从服务器拿到数据(失联自检用)
 let lastScanTs = 0;          // 服务器最近一次完成扫描的时间戳
+let staleAfter = 900;        // 多久没有新扫描算过期：取服务端看门狗阈值(随巡检间隔变)
 let _staleOn = false;
 let _staleTimer = null;
 
@@ -55,7 +56,7 @@ function checkStale() {
   let cls = "", msg = "";
   if (noContact > 90) {
     cls = "lost"; msg = `⚠ 监控失联：已 ${noContact} 秒连不上服务器，屏幕上的数据可能已停止更新！请立即检查监控程序/网络`;
-  } else if (lastScanTs && scanAge > 900) {
+  } else if (lastScanTs && scanAge > staleAfter) {
     cls = "stale"; msg = `⚠ 数据已约 ${Math.round(scanAge / 60)} 分钟未更新，扫描可能已停滞，请核实监控是否正常`;
   }
   if (cls) {
@@ -120,6 +121,7 @@ async function refreshSummary() {
   const s = await jget("/api/summary");
   updateProgress(s.progress);
   if (s.scan_ts) lastScanTs = s.scan_ts;   // 记录服务器最近完成扫描时间(失联自检用)
+  if (s.stale_after) staleAfter = s.stale_after;
   if (!s.scanned) { $("lastScan").textContent = "尚未扫描，等待首轮…"; return; }
   $("cOnline").textContent = `${s.online} / ${s.total}`;
   $("cTotalHr").textContent = fmtHash(s.total_hashrate_th);
@@ -149,9 +151,21 @@ async function removeFromAlert(ip) {
   } catch (e) {}
 }
 function alertClick(x) {
-  if (x.type && x.type.startsWith("cooler")) return `openContainer('${x.ip}')`;
-  if (x.ip && x.ip.split(".").length === 4) return `openMiner('${x.ip}')`;
+  if (x.type && x.type.startsWith("cooler")) return `openContainer('${esc(x.ip)}')`;
+  // 网段事件的 ip 是 "172.16.101.x"：以前被当成单台矿机打开一个空详情；改为筛出该段离线机
+  if (x.ip && x.ip.endsWith(".x")) return `focusSegment('${esc(x.ip.slice(0, -2))}')`;
+  if (x.ip && x.ip.split(".").length === 4) return `openMiner('${esc(x.ip)}')`;
   return "";
+}
+function focusSegment(seg) {
+  const sel = $("fSeg");
+  if (![...sel.options].some(o => o.value === seg)) {
+    const o = document.createElement("option"); o.value = seg; o.textContent = seg + ".x"; sel.appendChild(o);
+  }
+  sel.value = seg; $("fStatus").value = "offline";
+  if (typeof setView === "function") setView("list");
+  refreshMiners();
+  $("minerTable").scrollIntoView({ behavior: "smooth" });
 }
 async function refreshAlerts() {
   const d = await jget("/api/alerts?active=true");
@@ -348,15 +362,25 @@ let lastMiners = [];            // 当前筛选结果全集（选择/命令都�
 const selected = new Set();     // 选中的 IP
 let showAllRows = false;
 
+let _minerSeq = 0;            // 列表请求序号：慢的旧响应晚到时丢弃，别覆盖新筛选的结果
+let _lastFilterKey = null;    // 上次渲染用的筛选条件
 async function refreshMiners() {
   const q = $("search").value.trim();
   const st = $("fStatus").value, fw = $("fFw").value, seg = $("fSeg").value;
   const u = `/api/miners?sort=${sortKey}&order=${sortOrder}&status=${st}&fw=${fw}&seg=${seg}&q=${encodeURIComponent(q)}`;
+  const seq = ++_minerSeq;
   const d = await jget(u);
+  if (seq !== _minerSeq) return;   // 期间又发了新请求(换了筛选/自动刷新)，这个结果已过时
   lastMiners = d.miners || [];   // 后端异常响应(无miners字段)时兜底为空
-  // 防误操作：把选择集收敛为当前结果集内的IP，避免切网段/筛选后残留的不可见机器被命令误打
-  const visible = new Set(lastMiners.map(m => m.ip));
-  for (const ip of [...selected]) if (!visible.has(ip)) selected.delete(ip);
+  // 防误操作：用户自己换了筛选条件时，把选择集收敛到当前结果集，别让看不见的机器被命令误打。
+  // 后台自动刷新(同一筛选条件)不动选择集：按"离线"勾了 300 台，期间 30 台恢复在线，
+  // 以前会被悄悄移出选择、实际只下发 270 台且没有任何提示
+  const filterKey = [st, fw, seg, q].join("|");
+  if (filterKey !== _lastFilterKey) {
+    const visible = new Set(lastMiners.map(m => m.ip));
+    for (const ip of [...selected]) if (!visible.has(ip)) selected.delete(ip);
+    _lastFilterKey = filterKey;
+  }
   $("minerCount").textContent = d.count != null ? d.count : lastMiners.length;
   const a = d.agg || {};
   $("segStat").textContent = `${seg ? seg + ".x ｜ " : ""}在线 ${a.online || 0} ｜ 算力 ${fmtHash(a.total_hr)} ｜ 功耗 ${fmtPower(a.total_power)}`;
@@ -397,7 +421,9 @@ async function refreshMiners() {
 }
 
 function updateSelCount() {
-  $("selCount").textContent = `已选 ${selected.size} 台`;
+  const visible = new Set(lastMiners.map(m => m.ip));
+  const hidden = [...selected].filter(ip => !visible.has(ip)).length;
+  $("selCount").textContent = `已选 ${selected.size} 台` + (hidden ? `（其中 ${hidden} 台已不在当前列表）` : "");
   const all = $("cbAll");   // 全选框跟随当前结果集同步
   if (all) all.checked = lastMiners.length > 0 && lastMiners.every(m => selected.has(m.ip));
 }
@@ -675,20 +701,28 @@ async function doMachineState(action) {
   if (action === "remove" && !confirm(`确认从名册「下架移除」${ips.length} 台？\n将不再探测/告警；若机器仍通电，下次扫描可能被重新收录。`)) return;
   if (ips.length > 500 && !confirm(`⚠️ 本次将影响 ${ips.length} 台（数量很大），请再确认一次！`)) return;
   try {
-    const d = await jpost("/api/machine-state", { ips, action });
-    if (!d.ok) { toast("失败：" + (d.error || "")); return; }
-    toast(`${ { repair: "标记维修", active: "取消维修", remove: "下架移除" }[action] } ${d.count} 台`, "ok");
+    let count = 0;
+    for (let i = 0; i < ips.length; i += 500) {   // 分批提交：后端单次上限 control.max_batch(默认1000)
+      const d = await jpost("/api/machine-state", { ips: ips.slice(i, i + 500), action });
+      if (!d.ok) { toast(`失败（已处理 ${count} 台）：` + (d.error || "")); refreshMiners(); return; }
+      count += d.count || 0;
+    }
+    toast(`${ { repair: "标记维修", active: "取消维修", remove: "下架移除" }[action] } ${count} 台`, "ok");
     selected.clear(); refreshMiners();
   } catch (e) {}
 }
 
 let pendingCmd = null;
+let _cmdInFlight = false;   // 命令在途：禁止再开新命令弹窗，防两次执行的结果/按钮串台
 function openCmdDialog(cmd) {
+  if (_cmdInFlight) { toast("上一条命令还在执行，完成后会弹出结果，请稍候"); return; }
   if (!selected.size) { toast("请先选择矿机"); return; }
   const meta = CMD_META[cmd];
-  pendingCmd = { action: meta.action, params: { ...meta.params }, danger: !!meta.danger, short: meta.short || meta.title };
-  $("cmdTitle").textContent = meta.title;
   const ips = [...selected];
+  // 目标在打开弹窗这一刻冻结：弹窗里列的就是确认后下发的，期间自动刷新不会改变目标
+  pendingCmd = { action: meta.action, params: { ...meta.params }, danger: !!meta.danger,
+                 short: meta.short || meta.title, ips };
+  $("cmdTitle").textContent = meta.title;
   let html = `对 <b>${ips.length}</b> 台矿机执行：<b>${esc(meta.title)}</b>`;
   if (meta.danger)
     html += `<div class="warn-box">⚠️ 这是破坏性操作，会立即影响矿机运行（${meta.action === "reboot" ? "重启会中断挖矿约数分钟" : "改矿池会切换挖矿目标"}）。请确认无误。</div>`;
@@ -720,9 +754,10 @@ function openCmdDialog(cmd) {
 }
 
 $("cmdConfirm").onclick = async () => {
-  if (!pendingCmd) return;
-  const ips = [...selected];
-  if (pendingCmd.action === "set_pools") {
+  if (!pendingCmd || _cmdInFlight) return;
+  const cmd = pendingCmd;          // 局部持有：执行中点了取消/×，结果也照样显示，不影响下一个弹窗
+  const ips = cmd.ips;
+  if (cmd.action === "set_pools") {
     const pools = [];
     for (let i = 0; i < 3; i++) {
       const el = $(`poolUrl${i}`);
@@ -733,41 +768,48 @@ $("cmdConfirm").onclick = async () => {
       pools.push({ url, user, pass: $(`poolPass${i}`).value || "x" });
     }
     if (!pools.length) { toast("请至少填写主池地址与矿工名"); return; }
-    pendingCmd.params.pools = pools;
+    cmd.params.pools = pools;
   }
   // 大批量破坏性命令再拦一道原生确认，和 repair/remove 的交互保持一致
-  if (pendingCmd.danger && ips.length > DANGER_BULK &&
-      !confirm(`⚠️ 即将对 ${ips.length} 台矿机执行【${pendingCmd.short}】，数量很大且不可撤销。\n确定继续吗？`)) return;
+  if (cmd.danger && ips.length > DANGER_BULK &&
+      !confirm(`⚠️ 即将对 ${ips.length} 台矿机执行【${cmd.short}】，数量很大且不可撤销。\n确定继续吗？`)) return;
   const btnLabel = $("cmdConfirm").textContent;
+  _cmdInFlight = true;
   $("cmdConfirm").disabled = true; $("cmdConfirm").textContent = "执行中…";
+  $("cmdCancel").textContent = "后台执行，关闭窗口";
   try {
-    const body = { ips, action: pendingCmd.action, params: pendingCmd.params };
+    const body = { ips, action: cmd.action, params: cmd.params };
     // 后端对 reboot/set_pools 强制校验 confirm===true，缺了直接 400
-    if (NEED_CONFIRM_FLAG.has(pendingCmd.action)) body.confirm = true;
+    if (NEED_CONFIRM_FLAG.has(cmd.action)) body.confirm = true;
     const d = await jpost("/api/command", body);
     if (!d.ok) { toast("失败：" + (d.error || "")); }
     else if (d.async) {   // 分批重启：后台执行，轮询进度，界面不卡
       toast(`已开始分批重启 ${d.count} 台（打乱顺序，每批 ${d.batch} 台、间隔 ${d.delay}s，防变压器浪涌），后台执行中…`, "ok");
       pollCmdProgress();
-      selected.clear();
+      selected.clear(); updateSelCount(); refreshMiners();   // 勾选框和"已选 N 台"一起清掉
     } else {
       const fails = (d.results || []).filter(x => !x.ok);
-      let msg = `${pendingCmd.action}：成功 ${d.success} / 失败 ${d.failed}`;
+      let msg = `${cmd.action}：成功 ${d.success} / 失败 ${d.failed}`;
       if (fails.length) msg += "\n" + fails.slice(0, 5).map(x => `${x.ip}: ${x.msg}`).join("\n");
       toast(msg, fails.length ? "fail" : "ok");
     }
   } catch (err) { /* 401/403 已在 jpost 里处理 */ }
+  _cmdInFlight = false;
   $("cmdConfirm").disabled = false; $("cmdConfirm").textContent = btnLabel;
-  $("cmdModal").classList.add("hidden");
-  pendingCmd = null;
+  $("cmdCancel").textContent = "取消";
+  if (pendingCmd === cmd) { $("cmdModal").classList.add("hidden"); pendingCmd = null; }
 };
-$("cmdCancel").onclick = $("cmdClose").onclick = () => { $("cmdModal").classList.add("hidden"); pendingCmd = null; };
+$("cmdCancel").onclick = $("cmdClose").onclick = () => {
+  $("cmdModal").classList.add("hidden");
+  if (!_cmdInFlight) pendingCmd = null;   // 执行中关窗只是隐藏，命令照常跑完并提示结果
+};
 
 // 分批重启后台进度轮询：界面不卡，跑完弹最终结果
-async function pollCmdProgress() {
+async function pollCmdProgress(onlyIfRunning) {
   if (_wsStop) return;   // 登出/会话失效后停止，别成僵尸轮询
   try {
     const p = await jget("/api/command/progress");
+    if (onlyIfRunning && !p.running) return;   // 刷新页面时：没有在跑的就别弹旧结果
     if (p.running) {
       document.title = `重启 ${p.done}/${p.total} · 矿机监控面板`;
       setTimeout(pollCmdProgress, 3000);
@@ -881,16 +923,20 @@ $("btnTestVoice").onclick = () => {
 setVoice(voiceOn, false);   // 仅刷新按钮文字，不播放（无手势）
 $("mClose").onclick = () => $("modal").classList.add("hidden");
 $("modal").onclick = (e) => { if (e.target.id === "modal") $("modal").classList.add("hidden"); };
+let _searchTimer = null;
 ["search", "fStatus", "fFw", "fSeg"].forEach(id => $(id).addEventListener("input", () => {
   showAllRows = false;   // 换筛选条件后回到限量渲染，避免一直背着全量
-  refreshMiners();
+  clearTimeout(_searchTimer);   // 搜索框每敲一个字都拉一次全表太重：停手 250ms 再查
+  _searchTimer = setTimeout(refreshMiners, id === "search" ? 250 : 0);
 }));
 
 async function loadSegOptions() {
   try {
     const d = await jget("/api/segments");
     const sel = $("fSeg");
-    (d.segments || []).forEach(s => {
+    [...sel.options].forEach(o => { if (o.value && o.value !== sel.value) o.remove(); });   // 重新登录/改网段后别重复追加
+    const have = new Set([...sel.options].map(o => o.value));
+    (d.segments || []).filter(s => !have.has(s)).forEach(s => {
       const o = document.createElement("option"); o.value = s; o.textContent = s + ".x"; sel.appendChild(o);
     });
   } catch (e) {}
@@ -950,7 +996,7 @@ let _updInfo = null;
 let _updating = false;
 
 function markUpdateBtn(d) {
-  const n = (d && !d.error && d.behind) || 0;
+  const n = (d && !d.error && !d.known_bad && d.behind) || 0;
   $("btnUpdate").textContent = n ? `⬆ 有新版本(${n})` : "⬆ 版本";
   $("btnUpdate").classList.toggle("has-update", !!n);
 }
@@ -983,6 +1029,9 @@ function renderUpdate(d) {
     <div class="muted">检查时间 ${esc(when)}</div>`;
   if (!d.behind) {
     h += `<div class="upd-ok">✓ 已是最新版本</div>`;
+  } else if (d.known_bad) {
+    h += `<div class="upd-err">远端最新版本 <code>${esc(d.remote)}</code> 之前自检未通过（或启动失败）已自动回滚，
+      不会再拉取它；等开发者推送修复后的新提交再更新。</div>`;
   } else {
     h += `<div>有 <b>${d.behind}</b> 个新提交${d.behind > 10 ? "（下面只列最近 10 个）" : ""}：</div>
       <ul>${(d.changes || []).map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
@@ -1053,27 +1102,37 @@ let _wsRetry = 0;      // 连续重连失败次数，连上就归零
 function wsRetryDelay() {
   return Math.min(30000, 5000 * Math.pow(1.5, _wsRetry)) + Math.random() * 1000;
 }
+let _wsRetryTimer = null;   // 只允许一条重连链：重新登录前留下的旧定时器会再建一条，推送就刷两遍
+function scheduleWS() {
+  if (_wsStop || _wsRetryTimer) return;
+  const d = wsRetryDelay(); _wsRetry++;
+  _wsRetryTimer = setTimeout(() => { _wsRetryTimer = null; connectWS(); }, d);
+}
 function connectWS() {
   if (_wsStop) return;
+  if (_ws && (_ws.readyState === WebSocket.OPEN || _ws.readyState === WebSocket.CONNECTING)) return;
   try {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    _ws = new WebSocket(`${proto}://${location.host}/ws`);
-    _ws.onopen = () => { _wsRetry = 0; };     // 连上了，退避计数归零
-    _ws.onmessage = () => refreshAll();      // 扫描完成/告警 → 即时刷新
-    _ws.onclose = (ev) => {                   // 1008=后端判会话失效 → 弹登录并停重连
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    _ws = ws;
+    ws.onopen = () => { _wsRetry = 0; };     // 连上了，退避计数归零
+    ws.onmessage = () => refreshAll();      // 扫描完成/告警 → 即时刷新
+    ws.onclose = (ev) => {                   // 1008=后端判会话失效 → 弹登录并停重连
+      if (_ws !== ws) return;                // 已被新连接取代的旧连接，别动全局状态
       _ws = null;
       if (ev && ev.code === 1008) { showLogin(); return; }
-      if (!_wsStop) { const d = wsRetryDelay(); _wsRetry++; setTimeout(connectWS, d); }
+      scheduleWS();
     };
-    _ws.onerror = () => { try { _ws.close(); } catch (e) {} };
+    ws.onerror = () => { try { ws.close(); } catch (e) {} };
   } catch (e) {
-    if (!_wsStop) { const d = wsRetryDelay(); _wsRetry++; setTimeout(connectWS, d); }
+    scheduleWS();
   }
 }
 function stopDashboard() {   // 会话失效/登出：停轮询与 WS 重连，避免登录页后台空转
   _wsStop = true;
   if (_timer) { clearInterval(_timer); _timer = null; }
-  if (_ws) { try { _ws.close(); } catch (e) {} _ws = null; }
+  if (_wsRetryTimer) { clearTimeout(_wsRetryTimer); _wsRetryTimer = null; }
+  if (_ws) { const w = _ws; _ws = null; try { w.close(); } catch (e) {} }
 }
 
 function startDashboard() {
@@ -1085,6 +1144,7 @@ function startDashboard() {
   connectWS();
   if (!_timer) _timer = setInterval(refreshAll, 30000);  // WS 推送为主，轮询兜底
   if (!_staleTimer) _staleTimer = setInterval(checkStale, 10000);  // 失联自检，每10秒
+  if (myRole === "ops" || myRole === "admin") pollCmdProgress(true);   // 刷新页面后接上在跑的分批重启
   if (myRole === "admin") {   // 新版本提示：进来查一次，之后每 30 分钟(后端有 10 分钟缓存)
     checkUpdate(false);
     if (!_updTimer) _updTimer = setInterval(() => checkUpdate(false), 1800000);
