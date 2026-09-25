@@ -299,3 +299,25 @@ def test_watchdog_notices_a_stalled_scanner_within_15_minutes_by_default(svc):
     assert svc.is_stale(now)
     svc.progress.update(last_finished=now - 60)
     assert not svc.is_stale(now)
+
+
+def test_steady_zero_hashrate_machines_do_not_trip_the_reconfirm_breaker(svc, monkeypatch):
+    """限电休眠/密码不对的一批机器一直是 0 或读不到算力：以前每轮都算"疑似"，超过
+    reconfirm_max 就整体跳过二次确认，别的机器一次丢包就直接报掉线。"""
+    svc.cfg["scan"]["reconfirm_max"] = 3
+    zeros = [rec(f"10.9.0.{i}", hr=0.0) for i in (1, 2, 3, 4)]
+    flaky = "10.9.0.5"
+    rounds = iter([
+        zeros + [rec(flaky)],                 # 第一次：零算力的 4 台 + 正常的 1 台
+        zeros,                                # 第二次主扫：flaky 丢包没探到
+        [rec(flaky)],                         # 二次确认：其实在线
+    ])
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        by_ip = {r["ip"]: r for r in next(rounds)}
+        return [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    svc.scan_full("full")
+    svc.scan_full("full")
+    assert db.active_alert(svc.conn, flaky, "offline") is None

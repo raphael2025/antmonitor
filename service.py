@@ -249,13 +249,20 @@ class MonitorService:
         if not sc.get("reconfirm_enabled", True):
             return miners
         prev_online = set(db.online_ips(self.conn))
+        _m, prev_recs = self.latest()
+        prev_hr = {r["ip"]: r.get("hr_rt") for r in prev_recs}
+        # 零算力/读不到算力只在"上一轮还有算力"时才算疑似：限电休眠、密码不对的一批机器
+        # 一直是 0/None，每轮都算疑似会白白重探，数量一多还会顶破下面的熔断
         suspects = [r["ip"] for r in miners if r["ip"] in prev_online
-                    and (r["status"] == "offline" or r.get("hr_rt") in (None, 0))]
+                    and (r["status"] == "offline"
+                         or (r.get("hr_rt") in (None, 0) and (prev_hr.get(r["ip"]) or 0) > 0))]
         if not suspects:
             return miners
-        # 大面积掉线=真实事件(交换机/断电)，不重探：避免在网络最脆弱时无限速冲击三层 CoPP
-        if len(suspects) > sc.get("reconfirm_max", 800):
-            log.info("二次确认跳过: 疑似 %d 台超过上限，判定为真实的大面积事件", len(suspects))
+        # 大面积掉线=真实事件(交换机/断电)，不重探：避免在网络最脆弱时无限速冲击三层 CoPP。
+        # 只按"在线→离线"计数，零算力类不算进熔断
+        went_off = sum(1 for r in miners if r["ip"] in prev_online and r["status"] == "offline")
+        if went_off > sc.get("reconfirm_max", 800):
+            log.info("二次确认跳过: %d 台同时掉线超过上限，判定为真实的大面积事件", went_off)
             return miners
         cc = dict(sc)
         cc["online_timeout"] = max(sc.get("online_timeout", 0.6),

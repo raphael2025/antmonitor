@@ -400,12 +400,15 @@ def upsert_known_miners(conn, recs, ts):
     不覆盖已有 state(维修标记保留)；身份字段仅在本次非空时更新。"""
     if not recs:
         return
+    from miner_core import sn_valid   # 延迟导入：db 不该在模块级依赖扫描层
     rows = []
     for r in recs:
         if isinstance(r, str):
             rows.append((r, ts, "", "", "", "", ""))
         else:
-            rows.append((r["ip"], ts, r.get("model") or "", r.get("sn") or "",
+            # N/A/error/占位串不算 SN：不能覆盖名册里已知的真 SN(否则掉线后回填出 N/A，搜不到)
+            sn = r.get("sn") or ""
+            rows.append((r["ip"], ts, r.get("model") or "", sn if sn_valid(sn) else "",
                          r.get("mac") or "",
                          r.get("worker") or "", r.get("firmware") or ""))
     with _wlock, conn:

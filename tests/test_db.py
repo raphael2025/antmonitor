@@ -167,3 +167,12 @@ def test_report_window_does_not_bill_an_extra_hour(conn, monkeypatch):
     db.rollup_hours(conn, now=now)
     row = {r["worker"]: r for r in db.customer_report(conn, hours=1)}["W"]
     assert abs(row["delivered_th_h"] - 100.0) < 2.0, row
+
+
+def test_invalid_sn_does_not_overwrite_a_known_good_sn(conn):
+    """6060 偶尔回 error/空 → SN 记成 N/A。以前直接覆盖名册里的真 SN，紧接着掉线的话
+    回填出来是 N/A，按 SN 搜不到、IP 迁移识别也失效。"""
+    db.upsert_known_miners(conn, [rec("10.3.0.1", sn="SNGOOD12345")], 1000)
+    db.upsert_known_miners(conn, [rec("10.3.0.1", sn="N/A")], 2000)
+    db.upsert_known_miners(conn, [rec("10.3.0.1", sn="no miner sn stored on board")], 3000)
+    assert db.known_identity(conn)["10.3.0.1"]["sn"] == "SNGOOD12345"
