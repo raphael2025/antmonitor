@@ -237,3 +237,27 @@ def test_stale_mac_on_online_ip_does_not_quarantine_a_really_offline_machine(svc
     assert ident[ip1]["mac"] == ""                              # 换了机器(SN 变了)，旧 MAC 作废
     assert any(a["ip"] == ip2 and a["type"] == "offline"
                for a in db.list_alerts(svc.conn, True, 100))
+
+
+def test_reconfirm_keeps_the_best_result_across_passes(svc, monkeypatch):
+    """二次确认多轮时只升不降：任一轮确认在线就是在线。旧实现后一轮直接覆盖前一轮，
+    第 1 轮已探到在线(算力接口慢)、第 2 轮瞬时丢包 → 最终判离线并误报掉线。"""
+    A = "10.9.0.1"
+    svc.cfg["scan"]["reconfirm_passes"] = 2
+    rounds = iter([
+        [rec(A)],                                          # 第一次全扫：在线
+        [],                                                # 第二次主扫：没探到
+        [rec(A, hr=None, note="stats.cgi 超时")],          # 重探第 1 轮：在线，算力读不到
+        [],                                                # 重探第 2 轮：瞬时丢包
+    ])
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        by_ip = {r["ip"]: r for r in next(rounds)}
+        return [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    svc.scan_full("full")
+    svc.scan_full("full")
+    _m, records = svc.latest()
+    assert {r["ip"]: r["status"] for r in records}[A] == "online"
+    assert db.active_alert(svc.conn, A, "offline") is None

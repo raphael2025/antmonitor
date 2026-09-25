@@ -257,14 +257,24 @@ class MonitorService:
                                  sc.get("reconfirm_data_timeout", 5.0))
         cc["liveness_gate"] = False    # 不走判活闸门，给慢响应机器充分时间
         cc["max_pps"] = sc.get("max_pps", 100)   # 保留限速，护住三层 ARP/CoPP
-        fixed, remaining = {}, suspects
+        def rank(r):   # 在线且有算力 > 在线 > 未探测 > 离线
+            if r["status"] == "online":
+                return 3 if r.get("hr_rt") else 2
+            return 1 if r["status"] == "unknown" else 0
+
+        # 各轮结果只升不降：任一轮确认在线就算在线。直接覆盖会让后一轮的瞬时丢包
+        # 抹掉前一轮已探到的在线，恰恰把二次确认要保护的慢响应机器误报成掉线
+        fixed = {r["ip"]: r for r in miners if r["ip"] in set(suspects)}
+        remaining = suspects
         for _ in range(max(1, int(sc.get("reconfirm_passes", 1)))):
             if gen is not None and gen != self._scan_gen:
                 return miners
             self._beat(gen)
             again = miner_core.scan(remaining, cc, workers=min(100, len(remaining)))
             amap = {r["ip"]: r for r in again if r.get("device") != "container"}
-            fixed.update(amap)
+            for ip, r in amap.items():
+                if ip not in fixed or rank(r) > rank(fixed[ip]):
+                    fixed[ip] = r
             remaining = [ip for ip, r in amap.items()
                          if r["status"] == "offline" or r.get("hr_rt") in (None, 0)]
             if not remaining:
