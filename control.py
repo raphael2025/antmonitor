@@ -126,9 +126,14 @@ def normalize_ips(ips, max_batch, cfg=None):
 
 
 def _sent_then_dropped(e):
-    """请求已送达、矿机在回响应前断开或不再回应——原厂 reboot.cgi 的常见表现
-    (系统已开始重启，web 服务先没了)。连不上(拒绝连接/连接超时)不算。"""
+    """带认证的请求已送达、矿机在回响应前断开或不再回应——原厂 reboot.cgi 的常见表现
+    (系统已开始重启，web 服务先没了)。连不上(拒绝连接/连接超时)不算。
+    Digest 第一跳不带凭据，矿机不可能执行；web 卡死的机器正好会在这一跳超时，
+    必须算失败，否则"没重启"会被显示成成功还进了告警静默期。"""
     if isinstance(e, requests.ConnectTimeout):
+        return False
+    req = getattr(e, "request", None)
+    if req is None or "Authorization" not in (req.headers or {}):
         return False
     if isinstance(e, (requests.ReadTimeout, requests.exceptions.ChunkedEncodingError)):
         return True
@@ -272,10 +277,11 @@ def _run_group(group, action, params, cfg):
     return out
 
 
-def run_batch(targets, action, params, cfg, progress=None):
+def run_batch(targets, action, params, cfg, progress=None, before_group=None):
     """targets: [(ip, firmware), ...]；并发执行，返回结果列表。
     reboot 时按 control.reboot_* 打乱+分批+延迟，避免同变压器机器同时重启的浪涌跳闸。
-    progress(done, total) 可选回调(后台异步执行时上报进度)。"""
+    progress(done, total) 可选回调(后台异步执行时上报进度)。
+    before_group(ips) 可选回调：每组真正下发前调用(重启静默期按实际下发时间起算)。"""
     if action not in ACTIONS:
         return [], "不支持的命令"
     ctl = cfg.get("control", {})
@@ -289,12 +295,16 @@ def run_batch(targets, action, params, cfg, progress=None):
             random.shuffle(targets)   # 打乱：把同变压器的连号机器分散到不同批次/时间
         groups = [targets[i:i + batch] for i in range(0, len(targets), batch)]
         for gi, grp in enumerate(groups):
+            if before_group:
+                before_group([ip for ip, _fw in grp])
             out.extend(_run_group(grp, action, params, cfg))
             if progress:
                 progress(len(out), len(targets))
             if delay and gi < len(groups) - 1:
                 time.sleep(delay)
     else:
+        if before_group:
+            before_group([ip for ip, _fw in targets])
         out = _run_group(targets, action, params, cfg)
         if progress:
             progress(len(out), len(targets))

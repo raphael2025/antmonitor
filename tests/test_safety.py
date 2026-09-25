@@ -69,3 +69,37 @@ def test_updater_restart_mode_picks_guardian_or_self(monkeypatch):
         monkeypatch.delenv("INVOCATION_ID")
     monkeypatch.setenv("MINER_GUARDIAN", "1")
     assert updater.restart_mode() == "guardian"
+
+
+def test_updater_refuses_detached_head_and_branch_mismatch(monkeypatch):
+    def fake_git(head):
+        def g(*args, **kw):
+            if args[0] == "rev-parse" and args[1] == "--git-dir":
+                return ".git"
+            if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
+                return head
+            raise AssertionError(f"不该走到 fetch/merge: {args}")
+        return g
+
+    monkeypatch.setattr(updater, "_git", fake_git("HEAD"))
+    assert "detached" in updater.check()["error"]
+    monkeypatch.setattr(updater, "_git", fake_git("main"))
+    assert "release" in updater.check("release")["error"]
+
+
+def test_updater_git_never_prompts(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(kw)
+        return type("R", (), {"returncode": 0, "stdout": "ok", "stderr": ""})()
+
+    monkeypatch.setattr(updater.subprocess, "run", fake_run)
+    updater._git("status")
+    assert seen["stdin"] is updater.subprocess.DEVNULL
+    assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_updater_guardian_env_zero_forces_self(monkeypatch):
+    monkeypatch.setenv("MINER_GUARDIAN", "0")
+    assert updater.restart_mode() == "self"

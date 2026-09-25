@@ -11,6 +11,7 @@ import contextlib
 import hmac as _hmac
 import ipaddress
 import os
+import sys
 import threading
 import time
 
@@ -958,7 +959,8 @@ def _run_command_bg(targets, action, params, user):
         def prog(done, total):
             CMD_PROGRESS["done"] = done
             CMD_PROGRESS["total"] = total
-        results, _err = control.run_batch(targets, action, params, CFG, progress=prog)
+        results, _err = control.run_batch(targets, action, params, CFG, progress=prog,
+                                          before_group=SVC.mark_rebooting)
         SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
         db.log_commands(SVC.conn, user, action, results)
         ok_n = sum(1 for r in results if r["ok"])
@@ -1056,10 +1058,21 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
         return {"ok": True, "async": True, "action": action, "count": len(targets),
                 "batch": rb, "delay": ctl.get("reboot_delay_sec", 0)}
     if action == "reboot":
-        SVC.mark_rebooting(ips)
-    results, err = control.run_batch(targets, action, params, CFG)
-    if action == "reboot":
-        SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
+        # 小批量同步重启也要占锁：否则异步分批跑着时再提交几批 ≤reboot_concurrency 的，
+        # 会和当前批次同时上电，绕过防浪涌分批
+        if not _cmd_lock.acquire(blocking=False):
+            _audit_reject(user, action, "已有批量命令在执行")
+            return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
+                                status_code=409)
+        try:
+            SVC.mark_rebooting(ips)
+            results, err = control.run_batch(targets, action, params, CFG,
+                                             before_group=SVC.mark_rebooting)
+            SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
+        finally:
+            _cmd_lock.release()
+    else:
+        results, err = control.run_batch(targets, action, params, CFG)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
     db.log_commands(SVC.conn, user, action, results)
@@ -1175,6 +1188,8 @@ def _announce_and_open_browser(host, port):
     if not CFG["server"].get("open_browser", True) or os.environ.get("MINER_NO_BROWSER"):
         return
     if os.name != "nt":   # Linux 服务器多半无桌面，webbrowser 可能拉起终端文本浏览器占住控制台
+        return
+    if not (sys.stdin and sys.stdin.isatty()):   # NSSM 等服务(session 0)没有交互桌面，开了也看不见
         return
 
     def _wait_then_open():

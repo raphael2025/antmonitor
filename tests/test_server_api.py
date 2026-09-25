@@ -26,7 +26,9 @@ def test_server_auth_validation_and_read_endpoints(monkeypatch):
 
     called = []
 
-    def fake_run_batch(targets, action, params, cfg, progress=None):
+    def fake_run_batch(targets, action, params, cfg, progress=None, before_group=None):
+        if before_group:
+            before_group([ip for ip, _fw in targets])
         called.extend(targets)
         return ([{"ip": ip, "ok": True, "msg": "ok"} for ip, _fw in targets], "")
 
@@ -65,7 +67,7 @@ def test_server_auth_validation_and_read_endpoints(monkeypatch):
     rebooting = server.SVC._alert_state["rebooting"]
     assert "10.0.0.1" in rebooting
 
-    def half_fail(targets, action, params, cfg, progress=None):
+    def half_fail(targets, action, params, cfg, progress=None, before_group=None):
         # 下发时整批已标记(分批重启要跑几分钟，期间扫描不能报前几批掉线)
         assert all(ip in rebooting for ip, _fw in targets)
         return ([{"ip": "10.0.0.3", "ok": True, "msg": "ok"},

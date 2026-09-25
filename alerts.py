@@ -115,6 +115,10 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     rebooting = state.setdefault("rebooting", {})   # ip → 下发重启的时间(MonitorService.mark_rebooting 写入)
     rb_grace = cfg.get("control", {}).get("reboot_grace_sec", 600)
 
+    def rb_expired(ip):   # 有重启标记且静默期已过(按时间戳现判，见下方在线分支注释)
+        t = rebooting.get(ip)
+        return t is not None and now - t >= rb_grace
+
     cooldown = acfg.get("cooldown", 1800)
     seg_ratio = acfg.get("segment_down_ratio", 0.6)
     seg_min = acfg.get("segment_down_min", 5)
@@ -198,7 +202,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                 continue
             if ip in rb_quiet:             # 刚下发重启，还在静默期
                 continue
-            if ip in rebooting:            # 静默期已过仍不在线：重启没起来
+            if rb_expired(ip):   # 静默期已过仍不在线：重启没起来
                 rebooting.pop(ip, None)
                 b.fire(ip, "offline", "crit",
                        f"{ip} 重启后 {max(1, rb_grace // 60)} 分钟仍未上线")
@@ -207,7 +211,9 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                 b.fire(ip, "offline", "crit", f"{ip} 掉线")
             continue
         b.resolve(ip, "offline")
-        if ip in rebooting and ip not in rb_quiet:   # 静默期结束时在线 → 重启完成
+        # 静默期结束时在线 → 重启完成。按时间戳现判，不用 rb_quiet：评估途中请求线程
+        # 可能刚写入新标记，rb_quiet 里还没有它，会被误当成"已过期"清掉
+        if rb_expired(ip):
             rebooting.pop(ip, None)
 
         hr = r.get("hr_rt")
@@ -267,7 +273,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         if ip not in cur:
             streak.pop(ip, None)
     for ip in list(rebooting):  # 同理：静默期过了还没出现在样本里的(下架/换IP)
-        if ip not in cur and ip not in rb_quiet:
+        if ip not in cur and rb_expired(ip):
             rebooting.pop(ip, None)
 
     fired = b.commit()

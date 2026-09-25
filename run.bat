@@ -11,8 +11,6 @@ rem KEEP THIS FILE ASCII-ONLY AND CRLF. Non-ASCII text or LF-only line endings m
 rem mis-parse the set /a lines and the goto labels (verified: the loop then breaks apart).
 setlocal
 cd /d %~dp0
-rem tells updater.py a guardian is present: exit 42 and let this loop restart it
-set MINER_GUARDIAN=1
 
 set MAXFAILS=5
 set MINUP=30
@@ -22,11 +20,16 @@ set FAILS=0
 :loop
 set RUN=0
 set "T=%TIME: =0%"
-rem 1<hh>-100 keeps set /a from reading 08/09 as octal; %TIME: =0% pads a leading-space hour
+set MINER_GUARDIAN=1& rem guardian flag for updater.py; next: 1hh-100 avoids 08/09 octal    
 set /a T1=(1%T:~0,2%-100)*3600+(1%T:~3,2%-100)*60+(1%T:~6,2%-100)
 
 python server.py
 set EC=%ERRORLEVEL%
+rem ---- EVERYTHING ABOVE "python server.py" MUST KEEP ITS EXACT BYTE LENGTH (1050) ----
+rem updater.py replaces this file while the loop is running; cmd resumes reading the new
+rem file at the old byte offset. Only change lines below this point, or change a line above
+rem to one of exactly the same length. Line above python: MINER_GUARDIAN tells updater.py a
+rem guardian is present (it is inside the loop so an already-running old copy picks it up).
 rem only the first launch opens the browser; guardian restarts (incl. updates) stay quiet
 set MINER_NO_BROWSER=1
 
