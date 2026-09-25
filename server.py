@@ -1068,16 +1068,29 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
             "failed": len(results) - ok_n, "results": results}
 
 
+# 检查结果缓存：每个 admin 页面都会定时查，git fetch 要走外网，别每次都真去拉
+_UPDATE_CACHE = {"ts": 0, "data": None}
+_UPDATE_CACHE_SEC = 600
+
+
 @app.get("/api/update/check")
-def api_update_check(_: dict = Depends(require_admin)):
-    """对比 git 远端有没有新版本(git 部署时可用)。"""
-    return updater.check((CFG.get("update") or {}).get("branch") or None)
+def api_update_check(force: bool = False, _: dict = Depends(require_admin)):
+    """对比 git 远端有没有新版本(git 部署时可用)。force=true 跳过 10 分钟缓存。"""
+    now = time.time()
+    if force or not _UPDATE_CACHE["data"] or now - _UPDATE_CACHE["ts"] > _UPDATE_CACHE_SEC:
+        _UPDATE_CACHE["data"] = updater.check((CFG.get("update") or {}).get("branch") or None)
+        _UPDATE_CACHE["ts"] = now
+    return dict(_UPDATE_CACHE["data"], restart_mode=updater.restart_mode())
 
 
 @app.post("/api/update/apply")
-def api_update_apply(_: dict = Depends(require_admin)):
-    """拉取新代码(ff-only+编译自检+失败回滚)并重启(需 NSSM/run.bat 守护)。"""
-    return updater.apply((CFG.get("update") or {}).get("branch") or None)
+def api_update_apply(sess: dict = Depends(require_admin)):
+    """拉取新代码(ff-only+编译自检+失败回滚)并重启(有守护交给守护，没有就自己拉起)。"""
+    log.info("网页触发版本更新，操作人 %s", sess.get("user", "?"))
+    r = updater.apply((CFG.get("update") or {}).get("branch") or None)
+    _UPDATE_CACHE["data"] = None
+    log.info("版本更新结果: %s", r.get("msg") or f"{r.get('from')} → {r.get('to')}")
+    return r
 
 
 @app.get("/api/commands")
@@ -1182,8 +1195,24 @@ def _announce_and_open_browser(host, port):
     threading.Thread(target=_wait_then_open, daemon=True).start()
 
 
+def _wait_port_free(host, port, timeout=30):
+    """网页更新后自己拉起的新进程：等旧进程退出放开端口再监听，否则绑定失败直接退出。"""
+    import socket
+    target = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((target, port), timeout=0.5):
+                pass
+        except OSError:
+            return
+        time.sleep(0.5)
+
+
 if __name__ == "__main__":
     import uvicorn
+    if os.environ.pop("MINER_WAIT_PORT_FREE", None):
+        _wait_port_free(CFG["server"]["host"], CFG["server"]["port"])
     _announce_and_open_browser(CFG["server"]["host"], CFG["server"]["port"])
     uvicorn.run(app, host=CFG["server"]["host"], port=CFG["server"]["port"],
                 log_config=None)   # 日志统一交给 logs.py

@@ -11,6 +11,8 @@ rem KEEP THIS FILE ASCII-ONLY AND CRLF. Non-ASCII text or LF-only line endings m
 rem mis-parse the set /a lines and the goto labels (verified: the loop then breaks apart).
 setlocal
 cd /d %~dp0
+rem tells updater.py a guardian is present: exit 42 and let this loop restart it
+set MINER_GUARDIAN=1
 
 set MAXFAILS=5
 set MINUP=30

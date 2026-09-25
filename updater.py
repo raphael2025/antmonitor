@@ -4,7 +4,8 @@
 
 - check():  git fetch 后对比本地/远端，返回落后多少个提交 + 更新内容
 - apply():  仅快进合并(ff-only) → 自检(全部 *.py 编译 + 子进程 import server)，
-            失败自动回滚 → 退出进程，交给守护(systemd/NSSM/run.bat 循环)用新代码拉起
+            失败自动回滚 → 重启(见 restart_mode：有守护就退出码 42 交给守护拉起，
+            没有守护就自己拉起新进程，避免"点了更新，监控就再也不回来")
             全程持一把互斥锁，并发调用直接被拒绝(不排队)
 - start_auto(cfg): 后台线程按 check_interval 轮询，检测到新版本自动 apply
 - CLI: python updater.py check | apply   (CLI 的 apply 不重启进程，需手动重启服务)
@@ -39,6 +40,45 @@ _apply_lock = threading.Lock()
 # 自检子进程超时(秒)。冷启动 import fastapi 一套在忙碌的 Windows 机器上可能要十几秒，
 # 留足余量：超时会被判定为自检失败并回滚，宁可宽松也别误伤好版本。
 SELFCHECK_TIMEOUT = 60
+
+
+def restart_mode():
+    """更新后怎么重启。
+
+    "guardian": 以退出码 42 退出，由守护进程用新代码拉起——
+                run.bat(设置 MINER_GUARDIAN)、Windows 服务(NSSM 等，进程在 session 0)、
+                systemd(有 INVOCATION_ID)。这些情况下自己再拉一个进程会和守护拉起的抢端口。
+    "self":     直接 `python server.py` 手动启动、没有任何守护：退出就再也不回来了，
+                所以自己先拉起一个新进程(等旧进程放开端口再监听)，再退出。
+    """
+    if os.environ.get("MINER_GUARDIAN"):
+        return "guardian"
+    if os.name == "nt":
+        try:
+            import ctypes
+            sid = ctypes.c_ulong()
+            if ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid)) \
+                    and sid.value == 0:
+                return "guardian"
+        except Exception:  # noqa: BLE001
+            pass
+    elif os.environ.get("INVOCATION_ID"):
+        return "guardian"
+    return "self"
+
+
+def _restart():
+    if restart_mode() == "guardian":
+        os._exit(42)
+    try:
+        env = dict(os.environ, MINER_NO_BROWSER="1", MINER_WAIT_PORT_FREE="1")
+        subprocess.Popen([sys.executable, os.path.join(BASE, "server.py")],
+                         cwd=os.getcwd(), env=env)
+    except Exception as e:  # noqa: BLE001
+        # 拉不起新进程就别退出：新代码已在磁盘上，旧进程继续服务，人工重启即可生效
+        log.error("自动重启失败(新版本已就位，请手动重启服务生效): %s", e)
+        return
+    os._exit(0)
 
 
 def _git(*args, timeout=60):
@@ -166,9 +206,10 @@ def _apply(branch=None, restart=True):
         return {"ok": False, "msg": f"新代码自检失败，已回滚到 {prev[:10]}: {err}"[:300]}
     new = _git("rev-parse", "HEAD")
     if restart:
-        threading.Timer(1.5, lambda: os._exit(42)).start()   # 等响应发出去再退
+        threading.Timer(1.5, _restart).start()   # 等响应发出去再退
     return {"ok": True, "from": prev[:10], "to": new[:10],
-            "changes": st.get("changes"), "restarting": restart}
+            "changes": st.get("changes"), "restarting": restart,
+            "restart_mode": restart_mode() if restart else ""}
 
 
 def start_auto(ucfg, on_event=None):

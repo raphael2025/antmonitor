@@ -56,3 +56,16 @@ def test_updater_refuses_dirty_worktree_before_fetch_or_merge(monkeypatch):
     assert result["ok"] is False
     assert "未提交改动" in result["msg"]
     assert calls == [("status", "--porcelain", "--untracked-files=normal")]
+
+
+def test_updater_restart_mode_picks_guardian_or_self(monkeypatch):
+    """有守护(run.bat/systemd)→退出码42交给守护；没有守护→自己拉起，否则点了更新监控就不回来了。"""
+    monkeypatch.delenv("MINER_GUARDIAN", raising=False)
+    monkeypatch.delenv("INVOCATION_ID", raising=False)
+    if updater.os.name != "nt":
+        assert updater.restart_mode() == "self"
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        assert updater.restart_mode() == "guardian"
+        monkeypatch.delenv("INVOCATION_ID")
+    monkeypatch.setenv("MINER_GUARDIAN", "1")
+    assert updater.restart_mode() == "guardian"
