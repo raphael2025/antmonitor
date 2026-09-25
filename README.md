@@ -4,7 +4,7 @@
 已提供 **Agent 公共 API**（`/api/public/*`，Token 鉴权、只读）供 hermes 等 AI agent 取数。
 
 > 📚 **文档**：[开发文档](docs/DEVELOPMENT.md) ｜ [内部API-矿机接口](docs/INTERNAL_API.md) ｜
-> [外部API-Agent取数接口](docs/EXTERNAL_API.md)（详细）
+> [外部API-Agent取数接口](docs/EXTERNAL_API.md)（详细） ｜ **[运维安全手册](docs/SECURITY.md)（上线前必读）**
 
 > 算力按**千进制**显示：1000 TH = 1 PH，1000 PH = 1 EH（总算力/客户/趋势自动选单位；
 > 单机一般仍为 TH）。CSV/接口内部仍存原始 TH 数值。
@@ -70,7 +70,13 @@ python db.py vacuum       # 回收删除留下的空页（独占数据库，放�
 - **ops**：监控 + 远程命令 + 触发扫描
 - **admin**：全部（含命令审计日志）
 
-会话基于 Cookie 令牌（内存存储，重启需重新登录）。
+会话基于 Cookie 令牌（内存存储，重启需重新登录；12 小时不活动自动登出）。
+
+- **改密码**：右上「🔑 改密码」，或在监控电脑上 `python auth.py passwd 用户名`（自动写哈希进 config.yaml）。
+- **弱密码只能本机登录**：默认密码/少于 8 位的账号只能在监控电脑上打开 `http://127.0.0.1:8800` 登录，
+  登录后强制改密码，改完才能操作、才能从其它电脑登录。
+- 用域名（而不是 IP）访问面板时，需把域名加到 `server.allowed_hosts`（防 DNS 重绑定）。
+- 完整的安全配置（矿池白名单、交换机 ACL、防火墙、HTTPS）见 [运维安全手册](docs/SECURITY.md)。
 
 ## 远程命令与批量操作
 
@@ -81,6 +87,15 @@ python db.py vacuum       # 回收删除留下的空页（独占数据库，放�
 | 💡 定位灯 | `blink.cgi` | `find-miner`（免解锁） | 否 |
 | ⟳ 重启 | `reboot.cgi` | `system/reboot`（需解锁） | 是·二次确认 |
 | ⚙ 换矿池 | `set_miner_conf.cgi` | `settings`（需解锁） | 是·二次确认 |
+
+**原厂重启说明**：`GET /cgi-bin/reboot.cgi`（与原厂网页一致，个别固件回 405 时改用 POST）。
+矿机收到后常常不回响应就断开（已经在重启），这种情况按「已下发」算成功，不会补发。
+下发后进入 `control.reboot_grace_sec`（默认 600 秒）**静默期**：期间掉线不报警、不算进网段掉线比例；
+过了静默期仍不在线 → 报「重启后 N 分钟仍未上线」。刚开机的零算力/掉算力本来就有 `zero_grace_sec` 宽限。
+
+**换矿池白名单（防偷算力）**：必须在 `config.yaml` 配 `control.pool_allowlist`（如 `["f2pool.com"]`，
+子域名自动放行），网页只能换到白名单内的矿池，未配置则禁用换矿池。扫描时发现矿机上配了白名单外的矿池
+（含备用池）→ 严重告警「矿池不在白名单（疑似被篡改）」。重启/换池/被拒的换池尝试都推 Telegram。
 
 破坏性命令弹窗强制二次确认；所有命令写入 `command_log` 审计表（admin 可查 `/api/commands`）。
 第三方解锁密码配 `control.uniplus_password`，原厂密码复用 `scan.passwords`。
@@ -106,9 +121,12 @@ python db.py vacuum       # 回收删除留下的空页（独占数据库，放�
 
 ```bash
 pip install -r requirements.txt
-python server.py            # 启动面板 + 后台定时巡检
-# 浏览器打开 http://<本机IP>:8800
+python server.py            # 启动面板 + 后台定时巡检（Windows 推荐双击 run.bat，带崩溃自动拉起）
 ```
+
+- **Windows 下启动后自动打开本机浏览器**（`server.open_browser: false` 可关；run.bat 守护重启/自动更新后不会重复弹窗）。
+- **不知道本机 IP？** 看启动日志开头的「面板地址」几行：本机用 `http://127.0.0.1:8800`，
+  局域网其它电脑用日志里列出的 `http://<局域网IP>:8800`。
 
 启动后按 `config.yaml` 节奏运行：
 - **全网扫描** `schedule.scan_interval`（默认 300s=5分钟）：每 5 分钟扫一遍全部网段，
@@ -250,6 +268,12 @@ cloud:
 
 以 git clone 方式部署后，可检测远端新版本并更新（配置/数据被 .gitignore 保护，更新永不触碰）：
 
+- **网页一键更新**（admin）：右上「⬆ 版本」按钮，有新版本时变绿显示「有新版本(N)」（每 30 分钟自查，
+  服务端缓存 10 分钟）。点开看更新内容 → 「立即更新并重启」→ 拉取 + 自检（不通过自动回滚、不重启）→ 重启，
+  页面等服务回来后自动刷新（会话在内存里，需重新登录）。
+  重启方式自动判断：run.bat / NSSM 等 Windows 服务 / systemd 下退出码 42 交给守护拉起；
+  直接 `python server.py` 启动（没有守护）时程序自己拉起新进程，不会"点完更新监控就没了"。
+  注意：目录里有未提交的改动或多出的未跟踪文件时会拒绝更新（防止覆盖现场手改）。
 - 自动：`config.yaml > update.auto: true`，每小时自查，有新版本自动拉取+编译自检+重启
   （需 NSSM 守护或用 `run.bat` 启动——退出后 3 秒自动重新拉起）
 - 手动：机器上跑 `python updater.py check / apply`（apply 后重启服务），

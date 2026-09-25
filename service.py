@@ -56,7 +56,7 @@ class MonitorService:
         self._trigger_lock = threading.Lock()   # 手动扫描触发的判重(防两个请求都说"已启动")
         self._container_miss = {}     # 集装箱连续未采到次数(二次确认离线，防一次丢包误报)
         self._container_miss_n = 2
-        self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数)
+        self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数、刚重启的机器)
         self._last_full = 0.0         # 上次全网发现完成的 monotonic 时刻
         self._last_checkpoint = 0.0
         self._last_rollup = 0.0
@@ -85,6 +85,19 @@ class MonitorService:
         recs = db.scan_records(self.conn, ls["scan_id"])
         self._publish(ls["scan_id"], ls["ts"], ls.get("kind") or "", recs)
         return self.snapshot, recs
+
+    def mark_rebooting(self, ips):
+        """记下刚下发重启的机器：静默期内掉线不报警(见 alerts.evaluate)。
+        批量分批重启要跑几分钟，所以在下发前整批先标记，失败的再用 unmark_rebooting 撤掉。"""
+        rb = self._alert_state.setdefault("rebooting", {})
+        now = int(time.time())
+        for ip in ips:
+            rb[ip] = now
+
+    def unmark_rebooting(self, ips):
+        rb = self._alert_state.setdefault("rebooting", {})
+        for ip in ips:
+            rb.pop(ip, None)
 
     def drop_from_snapshot(self, ips):
         """下架移除后立刻从内存快照剔除，否则要等下一轮扫描列表才更新。"""
@@ -244,14 +257,24 @@ class MonitorService:
                                  sc.get("reconfirm_data_timeout", 5.0))
         cc["liveness_gate"] = False    # 不走判活闸门，给慢响应机器充分时间
         cc["max_pps"] = sc.get("max_pps", 100)   # 保留限速，护住三层 ARP/CoPP
-        fixed, remaining = {}, suspects
+        def rank(r):   # 在线且有算力 > 在线 > 未探测 > 离线
+            if r["status"] == "online":
+                return 3 if r.get("hr_rt") else 2
+            return 1 if r["status"] == "unknown" else 0
+
+        # 各轮结果只升不降：任一轮确认在线就算在线。直接覆盖会让后一轮的瞬时丢包
+        # 抹掉前一轮已探到的在线，恰恰把二次确认要保护的慢响应机器误报成掉线
+        fixed = {r["ip"]: r for r in miners if r["ip"] in set(suspects)}
+        remaining = suspects
         for _ in range(max(1, int(sc.get("reconfirm_passes", 1)))):
             if gen is not None and gen != self._scan_gen:
                 return miners
             self._beat(gen)
             again = miner_core.scan(remaining, cc, workers=min(100, len(remaining)))
             amap = {r["ip"]: r for r in again if r.get("device") != "container"}
-            fixed.update(amap)
+            for ip, r in amap.items():
+                if ip not in fixed or rank(r) > rank(fixed[ip]):
+                    fixed[ip] = r
             remaining = [ip for ip, r in amap.items()
                          if r["status"] == "offline" or r.get("hr_rt") in (None, 0)]
             if not remaining:
@@ -302,13 +325,15 @@ class MonitorService:
             ident = db.known_identity(self.conn)
             for r in miners:
                 info = ident.get(r["ip"])
-                if info:
+                # 只回填离线机：在线机的 MAC 必须是本轮实测值——有合法 SN 的原厂机不读 MAC，
+                # 若回填名册旧值(可能是之前在这个 IP 上的另一台机)，残影判定会把真掉线的
+                # 那台当成"已在别处上线"自动下架、告警静音
+                if info and r["status"] != "online":
                     r["mac"] = r.get("mac") or info.get("mac") or ""
-                    if r["status"] != "online":
-                        r["model"] = r.get("model") or info.get("model") or ""
-                        r["sn"] = r.get("sn") or info.get("sn") or ""
-                        r["worker"] = r.get("worker") or info.get("worker") or ""
-                        r["firmware"] = r.get("firmware") or info.get("firmware") or ""
+                    r["model"] = r.get("model") or info.get("model") or ""
+                    r["sn"] = r.get("sn") or info.get("sn") or ""
+                    r["worker"] = r.get("worker") or info.get("worker") or ""
+                    r["firmware"] = r.get("firmware") or info.get("firmware") or ""
 
             miners = self._drop_migrated_ghosts(miners)
 
@@ -320,6 +345,12 @@ class MonitorService:
             first_run = db.latest_scan(self.conn) is None
             sid, ts, kept = db.save_scan(self.conn, kind, miners,
                                          keep_ips=(None if first_run else roster))
+            # 矿池地址不落库(列表且只用于本轮防篡改检查)，但 kept 是按库列重建的干净记录，
+            # 要带回去，否则 alerts 永远看不到 pools、矿池篡改告警形同虚设
+            pools_by_ip = {r["ip"]: r["pools"] for r in miners if r.get("pools") is not None}
+            for r in kept:
+                if r["ip"] in pools_by_ip:
+                    r["pools"] = pools_by_ip[r["ip"]]
             self._publish(sid, ts, kind, kept)
             online_recs = [r for r in miners if r["status"] == "online"]
             online_ips = {r["ip"] for r in online_recs}

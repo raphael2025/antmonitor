@@ -11,6 +11,7 @@ import contextlib
 import hmac as _hmac
 import ipaddress
 import os
+import sys
 import threading
 import time
 
@@ -22,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 
+import alerts
 import appconfig
 import auth
 import cloud_alert_summary
@@ -88,7 +90,8 @@ def _startup_selfcheck():
         if weak:
             log.error("=" * 64)
             log.error("安全警告: 用户 %s 仍在使用默认弱口令(admin888 等)", weak)
-            log.error("该系统可远程重启/换矿池全场，请立即用 `python auth.py 新强口令` 改掉")
+            log.error("这些账号只能在本机 http://127.0.0.1:%d 登录，登录后网页会强制改密码；"
+                      "或运行 `python auth.py passwd 用户名` 设置", CFG["server"]["port"])
             log.error("=" * 64)
     else:
         log.warning("auth.enabled=false：任何人可匿名只读访问面板")
@@ -165,6 +168,8 @@ def require(min_role):
             raise HTTPException(status_code=401, detail="未登录")
         if not auth.has_role(sess, min_role):
             raise HTTPException(status_code=403, detail="权限不足")
+        if sess.get("must_change") and min_role != "viewer":   # 弱口令会话：只能看，改完密码才能操作
+            raise HTTPException(status_code=403, detail="当前密码太弱，请先修改密码(右上角 🔑)")
         return sess
     return dep
 
@@ -179,17 +184,42 @@ def api_login(request: Request, response: Response, body: dict = Body(...)):
     src = _client_ip(request)
     if auth.locked(src):
         return JSONResponse({"ok": False, "error": "失败次数过多，请稍后再试"}, status_code=429)
-    token = auth.login(CFG, body.get("username", ""), body.get("password", ""), src=src)
+    token, why = auth.login_ex(CFG, body.get("username", ""), body.get("password", ""), src=src,
+                               local=_is_console(request, src))
     if not token:
-        log.warning("登录失败: user=%r from=%s", str(body.get("username", ""))[:32], src)
-        return JSONResponse({"ok": False, "error": "用户名或密码错误"}, status_code=401)
+        log.warning("登录失败: user=%r from=%s (%s)", str(body.get("username", ""))[:32], src, why)
+        why = (why or "用户名或密码错误").replace("端口", str(CFG["server"]["port"]))
+        return JSONResponse({"ok": False, "error": why}, status_code=401)
     s = auth.session(token)
     # secure_cookie: 走 HTTPS 时设为 true；纯内网 HTTP 保持 false 否则 cookie 不发
     response.set_cookie(auth.COOKIE, token, httponly=True, samesite="lax",
-                        secure=bool(CFG.get("auth", {}).get("secure_cookie", False)),
+                        secure=bool(CFG.get("auth", {}).get("secure_cookie", False)
+                                    or _tls_files()),
                         max_age=auth.TTL)
-    log.info("登录成功: %s (%s) from %s", s["user"], s["role"], src)
-    return {"ok": True, "user": s["user"], "role": s["role"]}
+    log.info("登录成功: %s (%s) from %s%s", s["user"], s["role"], src,
+             " [弱口令，须改密码]" if s.get("must_change") else "")
+    return {"ok": True, "user": s["user"], "role": s["role"],
+            "must_change": bool(s.get("must_change"))}
+
+
+@app.post("/api/password")
+def api_password(request: Request, body: dict = Body(...), sess: dict = Depends(require_viewer)):
+    """改自己的密码 {old, new}：写哈希进 config.yaml(原地、保留注释)，立即生效，踢掉该账号其它会话。"""
+    if not auth.enabled(CFG):
+        return JSONResponse({"ok": False, "error": "未启用登录"}, status_code=400)
+    old, new = body.get("old"), body.get("new")
+    if not isinstance(old, str) or not isinstance(new, str):
+        return JSONResponse({"ok": False, "error": "参数错误"}, status_code=400)
+    err = auth.change_password(CFG, sess["user"], old, new,
+                               keep_token=request.cookies.get(auth.COOKIE, ""))
+    src = _client_ip(request)
+    db.log_commands(SVC.conn, f'{sess["user"]}@{src}', "passwd",
+                    [{"ip": "-", "ok": not err, "msg": err or "已修改密码"}])
+    if err:
+        log.warning("修改密码失败: %s from %s (%s)", sess["user"], src, err)
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    log.info("已修改密码: %s from %s", sess["user"], src)
+    return {"ok": True}
 
 
 @app.post("/api/logout")
@@ -206,7 +236,7 @@ def api_me(request: Request):
         return JSONResponse({"authenticated": False, "auth_enabled": auth.enabled(CFG)},
                             status_code=401)
     return {"authenticated": True, "user": s["user"], "role": s["role"],
-            "auth_enabled": auth.enabled(CFG)}
+            "auth_enabled": auth.enabled(CFG), "must_change": bool(s.get("must_change"))}
 
 
 def _broadcast_threadsafe(payload):
@@ -224,6 +254,11 @@ def _broadcast_threadsafe(payload):
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
+    host = websocket.headers.get("host", "")
+    origin = websocket.headers.get("origin")
+    if not _host_ok(host) or (origin and not _same_origin(origin, host)):   # 防跨站 WebSocket 劫持
+        await websocket.close(code=1008)
+        return
     sess = auth.current(CFG, websocket.cookies.get(auth.COOKIE, ""))
     if not sess:
         await websocket.close(code=1008)
@@ -665,8 +700,12 @@ def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(re
         days = round(eff / 24, 1)
         w.writerow([f"客户报表  数据覆盖近 {days} 天" + ("（已按可用数据截断）" if truncated else "")])
         w.writerow(["客户(矿工名)", "机器数", "可用率%", "交付算力(TH·h)", "耗电(kWh)"])
+        def cell(v):   # 矿工名来自矿机(可被篡改)：= + - @ 开头会被 Excel 当公式执行
+            s = str(v or "")
+            return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
         for r in rows:
-            w.writerow([r["worker"], r["machines"], r["uptime_pct"],
+            w.writerow([cell(r["worker"]), r["machines"], r["uptime_pct"],
                         r["delivered_th_h"], r["power_kwh"]])
         return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition":
@@ -841,6 +880,16 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
         if cl["url"] and not cl["url"].startswith(("http://", "https://")):
             return JSONResponse({"ok": False, "error": "云端地址须以 http:// 或 https:// 开头"},
                                 status_code=400)
+        if cl["url"].startswith("http://"):   # 明文上报会暴露 token 和场地数据；只放行内网调试地址
+            h = _host_name(cl["url"][7:].split("/", 1)[0])
+            try:
+                ip = ipaddress.ip_address(h)
+                private = ip.is_private or ip.is_loopback
+            except ValueError:
+                private = h == "localhost"
+            if not private:
+                return JSONResponse({"ok": False, "error": "公网云端地址必须用 https://"},
+                                    status_code=400)
         s["cloud"] = cl
     ranges = {"scan_interval": (30, 86400), "full_interval": (60, 604800),
               "container_interval": (5, 3600), "max_pps": (0, 2000),
@@ -870,17 +919,28 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
 
 @app.post("/api/segments")
 def api_segments_save(body: dict = Body(...), _: dict = Depends(require_admin)):
-    norm = []
+    norm, bad = [], []
     for s in (body.get("segments") or []):
         parts = str(s).strip().split(".")
         if len(parts) < 3:
             continue
-        base = ".".join(parts[:3])
-        try:
-            if all(0 <= int(x) <= 255 for x in base.split(".")) and base not in norm:
-                norm.append(base)
-        except ValueError:
-            pass
+        # 只收 ASCII 数字并规范化(172.016.005 → 172.16.5)：前导 0 会被系统当八进制解析，
+        # 扫的就不是你以为的网段；全角/其它数字字符 int() 也认，得挡掉
+        if not all(x.isascii() and x.isdigit() and int(x) <= 255 for x in parts[:3]):
+            bad.append(str(s)[:32])
+            continue
+        base = ".".join(str(int(x)) for x in parts[:3])
+        # 只允许内网网段：扫描/命令会带着矿机口令去连这些地址，加进公网段等于把口令送出去
+        net = ipaddress.ip_address(base + ".1")
+        if not (net.is_private or net in ipaddress.ip_network("100.64.0.0/10")) \
+                or net.is_loopback or net.is_link_local or net.is_multicast:
+            bad.append(str(s)[:32])
+            continue
+        if base not in norm:
+            norm.append(base)
+    if bad:
+        return JSONResponse({"ok": False, "error": "以下网段无效或不是内网地址: " + "、".join(bad[:5])},
+                            status_code=400)
     try:
         hs = max(1, min(254, int(body.get("host_start", 1))))
         he = max(hs, min(254, int(body.get("host_end", 254))))
@@ -953,13 +1013,40 @@ CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
 _cmd_lock = threading.Lock()
 
 
+def _pools_desc(params):
+    return "; ".join(f'{p.get("url")} {p.get("user")}' for p in
+                     (params or {}).get("pools") or [] if isinstance(p, dict))[:300]
+
+
+def _record_command(user, action, params, results):
+    """审计 + 推送。换矿池把完整矿池地址/矿工名写进每条审计(以前只记 "pools updated"，
+    事后查不出被换到了哪个池)；重启/换矿池都推一条 Telegram，值班群里有人知道谁干了什么。"""
+    if action == "set_pools":
+        desc = _pools_desc(params)
+        for r in results:
+            r["msg"] = f'{r["msg"]} | {desc}'[:500]
+    db.log_commands(SVC.conn, user, action, results)
+    if action in DESTRUCTIVE_ACTIONS and results:
+        ok_n = sum(1 for r in results if r["ok"])
+        name = {"reboot": "重启", "set_pools": "换矿池"}[action]
+        text = f"⚙ {user} {name} {len(results)} 台(成功 {ok_n})"
+        if action == "set_pools":
+            text += f"\n矿池: {_pools_desc(params)}"
+        try:
+            alerts.push_text(CFG, text)
+        except Exception:  # noqa: BLE001
+            log.exception("命令推送失败")
+
+
 def _run_command_bg(targets, action, params, user):
     try:
         def prog(done, total):
             CMD_PROGRESS["done"] = done
             CMD_PROGRESS["total"] = total
-        results, _err = control.run_batch(targets, action, params, CFG, progress=prog)
-        db.log_commands(SVC.conn, user, action, results)
+        results, _err = control.run_batch(targets, action, params, CFG, progress=prog,
+                                          before_group=SVC.mark_rebooting)
+        SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
+        _record_command(user, action, params, results)
         ok_n = sum(1 for r in results if r["ok"])
         CMD_PROGRESS["success"] = ok_n
         CMD_PROGRESS["failed"] = len(results) - ok_n
@@ -979,13 +1066,13 @@ def api_command_progress(_: dict = Depends(require_ops)):
 
 
 @app.post("/api/command")
-def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
+def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(require_ops)):
     """远程命令：{ips:[...], action:"reboot|locate|set_pools", params:{...}, confirm:true}
 
     reboot/set_pools 属破坏性操作，请求体必须显式带 confirm:true（前端"确认执行"弹窗
     负责补上），否则 400。locate 等只读/无害动作不需要。
     """
-    user = sess.get("user", "?")
+    user = f'{sess.get("user", "?")}@{_client_ip(request)}'   # 审计带来源 IP：共用账号时也能追到哪台电脑
     action = body.get("action")
     if not CFG.get("control", {}).get("enabled", False):
         _audit_reject(user, action, "控制功能未启用")
@@ -1033,6 +1120,27 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
                 _audit_reject(user, action, "矿池缺 user")
                 return JSONResponse({"ok": False, "error": "每个矿池需填矿工名(user)"},
                                     status_code=400)
+        # 矿池白名单：换池 = 把算力送走，账号被盗/内鬼一次就能偷全场。白名单只能在监控电脑的
+        # config.yaml 里改，网页(包括 admin)改不了
+        allow = CFG.get("control", {}).get("pool_allowlist") or []
+        if not allow:
+            _audit_reject(user, action, f"未配置矿池白名单: {_pools_desc(params)}")
+            return JSONResponse({"ok": False, "error":
+                                 "未配置矿池白名单，网页换矿池已禁用。请在监控电脑的 config.yaml 里"
+                                 "配置 control.pool_allowlist(如 [\"f2pool.com\"])后重启服务"},
+                                status_code=403)
+        bad = [p["url"] for p in pools if not control.pool_allowed(p["url"], allow)]
+        if bad:
+            _audit_reject(user, action, f"矿池不在白名单: {', '.join(bad)[:300]}")
+            log.warning("换矿池被拒(不在白名单): %s 发起人 %s", bad, user)
+            try:
+                alerts.push_text(CFG, f"🔴 {user} 试图把矿机换到白名单外的矿池，已拒绝: "
+                                      f"{', '.join(bad)[:300]}")
+            except Exception:  # noqa: BLE001
+                pass
+            return JSONResponse({"ok": False, "error":
+                                 f"矿池不在白名单，已拒绝: {', '.join(bad)[:200]}"},
+                                status_code=403)
     # 从最近快照取每台固件类型，避免重复探测
     _, recs = _latest_records()
     fw_map = {r["ip"]: r["firmware"] for r in recs}
@@ -1046,6 +1154,7 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
             _audit_reject(user, action, "已有批量命令在执行")
             return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
                                 status_code=409)
+        SVC.mark_rebooting(ips)
         CMD_PROGRESS.update({"running": True, "action": action, "done": 0,
                              "total": len(targets), "success": 0, "failed": 0,
                              "fail_ips": [], "user": user})
@@ -1053,25 +1162,53 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
                          daemon=True).start()
         return {"ok": True, "async": True, "action": action, "count": len(targets),
                 "batch": rb, "delay": ctl.get("reboot_delay_sec", 0)}
-    results, err = control.run_batch(targets, action, params, CFG)
+    if action == "reboot":
+        # 小批量同步重启也要占锁：否则异步分批跑着时再提交几批 ≤reboot_concurrency 的，
+        # 会和当前批次同时上电，绕过防浪涌分批
+        if not _cmd_lock.acquire(blocking=False):
+            _audit_reject(user, action, "已有批量命令在执行")
+            return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
+                                status_code=409)
+        try:
+            SVC.mark_rebooting(ips)
+            results, err = control.run_batch(targets, action, params, CFG,
+                                             before_group=SVC.mark_rebooting)
+            SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
+        finally:
+            _cmd_lock.release()
+    else:
+        results, err = control.run_batch(targets, action, params, CFG)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
-    db.log_commands(SVC.conn, user, action, results)
+    _record_command(user, action, params, results)
     ok_n = sum(1 for r in results if r["ok"])
     return {"ok": True, "action": action, "success": ok_n,
             "failed": len(results) - ok_n, "results": results}
 
 
+# 检查结果缓存：每个 admin 页面都会定时查，git fetch 要走外网，别每次都真去拉
+_UPDATE_CACHE = {"ts": 0, "data": None}
+_UPDATE_CACHE_SEC = 600
+
+
 @app.get("/api/update/check")
-def api_update_check(_: dict = Depends(require_admin)):
-    """对比 git 远端有没有新版本(git 部署时可用)。"""
-    return updater.check((CFG.get("update") or {}).get("branch") or None)
+def api_update_check(force: bool = False, _: dict = Depends(require_admin)):
+    """对比 git 远端有没有新版本(git 部署时可用)。force=true 跳过 10 分钟缓存。"""
+    now = time.time()
+    if force or not _UPDATE_CACHE["data"] or now - _UPDATE_CACHE["ts"] > _UPDATE_CACHE_SEC:
+        _UPDATE_CACHE["data"] = updater.check((CFG.get("update") or {}).get("branch") or None)
+        _UPDATE_CACHE["ts"] = now
+    return dict(_UPDATE_CACHE["data"], restart_mode=updater.restart_mode())
 
 
 @app.post("/api/update/apply")
-def api_update_apply(_: dict = Depends(require_admin)):
-    """拉取新代码(ff-only+编译自检+失败回滚)并重启(需 NSSM/run.bat 守护)。"""
-    return updater.apply((CFG.get("update") or {}).get("branch") or None)
+def api_update_apply(sess: dict = Depends(require_admin)):
+    """拉取新代码(ff-only+编译自检+失败回滚)并重启(有守护交给守护，没有就自己拉起)。"""
+    log.info("网页触发版本更新，操作人 %s", sess.get("user", "?"))
+    r = updater.apply((CFG.get("update") or {}).get("branch") or None)
+    _UPDATE_CACHE["data"] = None
+    log.info("版本更新结果: %s", r.get("msg") or f"{r.get('from')} → {r.get('to')}")
+    return r
 
 
 @app.get("/api/commands")
@@ -1105,6 +1242,104 @@ def index():
     return FileResponse(os.path.join(WEB_DIR, "index.html"))
 
 
+def _host_name(host_header):
+    h = str(host_header or "").strip().lower()
+    if h.startswith("["):
+        return h[1:h.find("]")] if "]" in h else h
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+_MY_NAMES = None
+
+
+def _my_names():
+    """本机名只取一次：getfqdn() 在 Windows 上可能做反向 DNS，每个请求都查会卡几秒。"""
+    global _MY_NAMES
+    if _MY_NAMES is None:
+        import socket
+        names = {"localhost"}
+        for f in (socket.gethostname, socket.getfqdn):
+            try:
+                names.add(f().lower().rstrip("."))
+            except OSError:
+                pass
+        _MY_NAMES = names
+    return _MY_NAMES
+
+
+def _via_trusted_proxy(request):
+    peer = request.client.host if request.client else ""
+    if not (_TRUSTED and peer):
+        return False
+    try:
+        return any(ipaddress.ip_address(peer) in n for n in _TRUSTED)
+    except ValueError:
+        return False
+
+
+_PROXY_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host")
+
+
+def _is_console(request, src):
+    """是不是坐在监控电脑前的人：来源是回环地址 + 没有代理头 + 用 127.0.0.1/localhost 打开。
+    同机跑着 nginx/frp(http) 转发时，外部请求也来自 127.0.0.1，但会带代理头/外部 Host，
+    不能当本机(否则"弱口令只准本机登录"和"本机不锁"都能被远程绕过)。"""
+    if not auth.is_local(src) or any(h in request.headers for h in _PROXY_HEADERS):
+        return False
+    name = _host_name(request.headers.get("host", ""))
+    return name in ("localhost", "::1") or name.startswith("127.")
+
+
+def _host_ok(host_header):
+    """防 DNS 重绑定：恶意网页把自己的域名解析到 127.0.0.1/本机 IP 后就成了"同源"，
+    能在运维浏览器里调接口。只放行 IP 字面量、localhost、本机名和 server.allowed_hosts。"""
+    name = _host_name(host_header).rstrip(".")
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    allowed = set(_my_names())
+    allowed |= {str(x).strip().lower().rstrip(".")
+                for x in CFG["server"].get("allowed_hosts") or []}
+    return "*" in allowed or name in allowed
+
+
+def _same_origin(origin, host_header):
+    o = str(origin or "").strip().lower()
+    if "://" not in o:
+        return False
+    return o.split("://", 1)[1].split("/", 1)[0] == str(host_header or "").strip().lower()
+
+
+@app.middleware("http")
+async def _request_guard(request: Request, call_next):
+    """所有请求先过这道：Host 白名单(防 DNS 重绑定) + 写请求防跨站(CSRF)。
+    正常用 IP/本机名打开面板的运维完全无感。"""
+    host = request.headers.get("host", "")
+    proxied = _via_trusted_proxy(request)   # 经 trusted_proxies 里的 nginx/frp 进来：Host 是对外域名
+    if not proxied and not _host_ok(host):
+        return JSONResponse({"ok": False, "error":
+                             f"不允许用 {_host_name(host)[:64]} 访问：请用 IP 打开面板，或把该域名加到 "
+                             "config.yaml 的 server.allowed_hosts"}, status_code=400)
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin")
+        if origin and not proxied and not _same_origin(origin, host):   # 别的网站页面发来的写请求
+            log.warning("拒绝跨站写请求: %s %s Origin=%s", request.method, request.url.path,
+                        origin[:100])
+            return JSONResponse({"ok": False, "error": "跨站请求已拒绝"}, status_code=403)
+        # 带请求体的写请求必须是 JSON：表单/text/plain/无类型的 Blob 是跨站伪造请求的
+        # 常用手法(不触发预检)，而面板前端只发 application/json
+        has_body = request.headers.get("content-length", "0") not in ("", "0") \
+            or "transfer-encoding" in request.headers
+        ctype = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if has_body and ctype != "application/json":
+            return JSONResponse({"ok": False, "error": "请求体必须是 JSON"}, status_code=415)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _no_cache_static(request: Request, call_next):
     """前端文件禁强缓存(每次向服务器复核, 未变返回304)——否则更新版本后浏览器
@@ -1119,7 +1354,96 @@ if os.path.isdir(WEB_DIR):
     app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
 
 
+def _tls_files():
+    """(cert, key)：两个都配了且文件存在才启用 HTTPS，否则 None。"""
+    c, k = CFG["server"].get("tls_cert") or "", CFG["server"].get("tls_key") or ""
+    if c and k and os.path.isfile(c) and os.path.isfile(k):
+        return c, k
+    return None
+
+
+def _local_ipv4s():
+    """本机可用的局域网 IPv4(去掉回环/自动私有地址)，默认路由那张网卡排最前。"""
+    import socket
+    ips = []
+    try:   # UDP connect 不发包，只让系统选出走默认路由的网卡地址
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            ips.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        ips += [i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)]
+    except OSError:
+        pass
+    out = []
+    for ip in ips:
+        if ip not in out and not ip.startswith(("127.", "169.254.", "0.")):
+            out.append(ip)
+    return out
+
+
+def _announce_and_open_browser(host, port):
+    """启动时打印面板访问地址；Windows 下等端口就绪后自动打开本机浏览器。
+    run.bat 守护重启(含自动更新)时会带 MINER_NO_BROWSER=1，不会每次重启都弹一个新窗口。"""
+    import socket
+    import webbrowser
+    scheme = "https" if _tls_files() else "http"
+    local_url = f"{scheme}://127.0.0.1:{port}" if host in ("0.0.0.0", "", "127.0.0.1") \
+        else f"{scheme}://{host}:{port}"
+    lan = _local_ipv4s() if host in ("0.0.0.0", "") else []
+    log.info("=" * 64)
+    log.info("面板地址(本机): %s", local_url)
+    for ip in lan:
+        log.info("面板地址(局域网其它电脑): %s://%s:%d", scheme, ip, port)
+    log.info("=" * 64)
+    if not CFG["server"].get("open_browser", True) or os.environ.get("MINER_NO_BROWSER"):
+        return
+    if os.name != "nt":   # Linux 服务器多半无桌面，webbrowser 可能拉起终端文本浏览器占住控制台
+        return
+    if not (sys.stdin and sys.stdin.isatty()):   # NSSM 等服务(session 0)没有交互桌面，开了也看不见
+        return
+
+    def _wait_then_open():
+        target = "127.0.0.1" if "://127." in local_url else host
+        for _ in range(120):   # 大库首次 checkpoint 可能让启动慢一些，最多等 60 秒
+            try:
+                with socket.create_connection((target, port), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.5)
+        else:
+            return
+        try:
+            webbrowser.open(local_url)
+        except Exception:  # noqa: BLE001 - 打不开浏览器不影响服务
+            log.warning("自动打开浏览器失败，请手动访问 %s", local_url)
+
+    threading.Thread(target=_wait_then_open, daemon=True).start()
+
+
+def _wait_port_free(host, port, timeout=30):
+    """网页更新后自己拉起的新进程：等旧进程退出放开端口再监听，否则绑定失败直接退出。"""
+    import socket
+    target = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((target, port), timeout=0.5):
+                pass
+        except OSError:
+            return
+        time.sleep(0.5)
+
+
 if __name__ == "__main__":
     import uvicorn
+    if os.environ.pop("MINER_WAIT_PORT_FREE", None):
+        _wait_port_free(CFG["server"]["host"], CFG["server"]["port"])
+    _announce_and_open_browser(CFG["server"]["host"], CFG["server"]["port"])
+    tls = _tls_files()
+    if (CFG["server"].get("tls_cert") or CFG["server"].get("tls_key")) and not tls:
+        log.error("server.tls_cert/tls_key 配了但文件不存在，仍以 HTTP 启动")
     uvicorn.run(app, host=CFG["server"]["host"], port=CFG["server"]["port"],
+                ssl_certfile=tls[0] if tls else None, ssl_keyfile=tls[1] if tls else None,
                 log_config=None)   # 日志统一交给 logs.py

@@ -216,3 +216,59 @@ def test_maintenance_tick_runs_rollup_prune_and_checkpoint(svc):
     assert int(db.meta_get(svc.conn, "rollup_hour")) > h    # 那一小时已归档
     assert db.checkpoint(svc.conn) is not None
     assert {r["worker"] for r in db.customer_report(svc.conn, 6)} == {"X"}
+
+
+def test_stale_mac_on_online_ip_does_not_quarantine_a_really_offline_machine(svc, monkeypatch):
+    """在线机不能用名册里的旧 MAC 冒充本轮实测值参与残影判定。
+
+    无 SN 的 A(MAC=MA) 原在 ip1，搬到 ip2；ip1 换上有合法 SN 的 B(有 SN 就不读 MAC)。
+    旧实现给在线的 ip1 回填了 A 的 MA，A 在 ip2 真掉线时被当成"已在 ip1 上线的残影"
+    自动下架，掉线告警被静音。"""
+    ip1, ip2, MA = "10.9.0.1", "10.9.0.2", "AA:BB:CC:DD:EE:01"
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec(ip1, sn="N/A", mac=MA)]))
+    svc.scan_full("full")
+    monkeypatch.setattr(miner_core, "scan", fake_scan([
+        rec(ip1, sn="SNB1234567", mac=""), rec(ip2, sn="N/A", mac=MA)]))
+    svc.scan_full("full")
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec(ip1, sn="SNB1234567", mac="")]))
+    svc.scan_full("full")                                       # A 在 ip2 真掉线
+    ident = db.known_identity(svc.conn)
+    assert ident[ip2]["state"] == "active"                      # 不能被当残影下架
+    assert ident[ip1]["mac"] == ""                              # 换了机器(SN 变了)，旧 MAC 作废
+    assert any(a["ip"] == ip2 and a["type"] == "offline"
+               for a in db.list_alerts(svc.conn, True, 100))
+
+
+def test_reconfirm_keeps_the_best_result_across_passes(svc, monkeypatch):
+    """二次确认多轮时只升不降：任一轮确认在线就是在线。旧实现后一轮直接覆盖前一轮，
+    第 1 轮已探到在线(算力接口慢)、第 2 轮瞬时丢包 → 最终判离线并误报掉线。"""
+    A = "10.9.0.1"
+    svc.cfg["scan"]["reconfirm_passes"] = 2
+    rounds = iter([
+        [rec(A)],                                          # 第一次全扫：在线
+        [],                                                # 第二次主扫：没探到
+        [rec(A, hr=None, note="stats.cgi 超时")],          # 重探第 1 轮：在线，算力读不到
+        [],                                                # 重探第 2 轮：瞬时丢包
+    ])
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        by_ip = {r["ip"]: r for r in next(rounds)}
+        return [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    svc.scan_full("full")
+    svc.scan_full("full")
+    _m, records = svc.latest()
+    assert {r["ip"]: r["status"] for r in records}[A] == "online"
+    assert db.active_alert(svc.conn, A, "offline") is None
+
+
+def test_pool_hijack_alert_through_real_scan_pipeline(svc, monkeypatch):
+    """pools 不落库，但必须一路带到告警评估(save_scan 返回的是按库列重建的记录)。"""
+    svc.cfg["control"]["pool_allowlist"] = ["f2pool.com"]
+    monkeypatch.setattr(miner_core, "scan", fake_scan([
+        rec("10.9.0.1", pools=["stratum+tcp://btc.f2pool.com:3333"]),
+        rec("10.9.0.2", pools=["stratum+tcp://evil.example:3333"])]))
+    svc.scan_full("full")
+    hijacked = {a["ip"] for a in db.active_alerts_by_type(svc.conn, "pool_hijack")}
+    assert hijacked == {"10.9.0.2"}

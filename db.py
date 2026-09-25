@@ -417,7 +417,10 @@ def upsert_known_miners(conn, recs, ts):
             "ELSE known_miners.state END, "
             "model=CASE WHEN excluded.model!='' THEN excluded.model ELSE known_miners.model END, "
             "sn=CASE WHEN excluded.sn!='' THEN excluded.sn ELSE known_miners.sn END, "
-            "mac=CASE WHEN excluded.mac!='' THEN excluded.mac ELSE known_miners.mac END, "
+            # 同一 IP 换了一台机(SN 变了)：旧 MAC 属于上一台，作废，否则残影判定会张冠李戴
+            "mac=CASE WHEN excluded.mac!='' THEN excluded.mac "
+            "WHEN excluded.sn!='' AND excluded.sn!=known_miners.sn THEN '' "
+            "ELSE known_miners.mac END, "
             "worker=CASE WHEN excluded.worker!='' THEN excluded.worker ELSE known_miners.worker END, "
             "firmware=CASE WHEN excluded.firmware!='' THEN excluded.firmware "
             "ELSE known_miners.firmware END",
@@ -437,6 +440,19 @@ def roster_ips(conn, max_age_days=7):
     return [r["ip"] for r in _r(conn).execute(
         "SELECT ip FROM known_miners WHERE (state='active' AND last_online>=?) "
         "OR state='repair'", (cutoff,)).fetchall()]
+
+
+def last_online_map(conn):
+    """{ip: 最后一次在线的扫描时间}，掉线告警按"这次掉线报过没有"判断用。"""
+    return {r["ip"]: r["last_online"] or 0 for r in
+            _r(conn).execute("SELECT ip,last_online FROM known_miners").fetchall()}
+
+
+def last_alert_ts(conn, type_, since=0):
+    """{ip: 该类告警最近一次发出时间}(含已恢复的)。"""
+    return {r["ip"]: r["ts"] for r in _r(conn).execute(
+        "SELECT ip, MAX(ts) ts FROM alerts WHERE type=? AND ts>=? GROUP BY ip",
+        (type_, since)).fetchall()}
 
 
 def repair_ips(conn):
@@ -853,8 +869,12 @@ def prune(conn, retention_days, roster_days=7, rollup_days=400):
         conn.execute("DELETE FROM known_miners WHERE last_online<? AND state='active'",
                      (roster_cut,))
         conn.execute("DELETE FROM worker_hourly WHERE hour<?", (rollup_cut,))
-        conn.execute("DELETE FROM command_log WHERE id NOT IN "
-                     "(SELECT id FROM command_log ORDER BY id DESC LIMIT 5000)")
+        # 审计：定位灯/维修标记这类高频低价值记录按条数只留最近 5000；重启/换矿池/下架/
+        # 被拒绝的命令按时间长期保留——否则批量点几次"维修中"就能把换矿池记录冲掉
+        low = "action IN ('locate','state:repair','state:active')"
+        conn.execute(f"DELETE FROM command_log WHERE {low} AND id NOT IN "
+                     f"(SELECT id FROM command_log WHERE {low} ORDER BY id DESC LIMIT 5000)")
+        conn.execute(f"DELETE FROM command_log WHERE NOT ({low}) AND ts<?", (rollup_cut,))
     return len(old)
 
 

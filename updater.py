@@ -4,7 +4,8 @@
 
 - check():  git fetch 后对比本地/远端，返回落后多少个提交 + 更新内容
 - apply():  仅快进合并(ff-only) → 自检(全部 *.py 编译 + 子进程 import server)，
-            失败自动回滚 → 退出进程，交给守护(systemd/NSSM/run.bat 循环)用新代码拉起
+            失败自动回滚 → 重启(见 restart_mode：有守护就退出码 42 交给守护拉起，
+            没有守护就自己拉起新进程，避免"点了更新，监控就再也不回来")
             全程持一把互斥锁，并发调用直接被拒绝(不排队)
 - start_auto(cfg): 后台线程按 check_interval 轮询，检测到新版本自动 apply
 - CLI: python updater.py check | apply   (CLI 的 apply 不重启进程，需手动重启服务)
@@ -41,8 +42,66 @@ _apply_lock = threading.Lock()
 SELFCHECK_TIMEOUT = 60
 
 
+def restart_mode():
+    """更新后怎么重启。
+
+    "guardian": 以退出码 42 退出，由守护进程用新代码拉起——
+                run.bat(设置 MINER_GUARDIAN)、Windows 服务(NSSM 等，进程在 session 0)、
+                systemd(有 INVOCATION_ID)。这些情况下自己再拉一个进程会和守护拉起的抢端口。
+    "self":     直接 `python server.py` 手动启动、没有任何守护：退出就再也不回来了，
+                所以自己先拉起一个新进程(等旧进程放开端口再监听)，再退出。
+
+    环境变量 MINER_GUARDIAN 显式指定时以它为准：1=有守护，0=没有(例如用任务计划程序以
+    SYSTEM 身份直接跑 python server.py——也在 session 0，但任务计划不会因退出码 42 重启)。
+    """
+    g = os.environ.get("MINER_GUARDIAN")
+    if g == "0":
+        return "self"
+    if g:
+        return "guardian"
+    if os.name == "nt":
+        try:
+            import ctypes
+            sid = ctypes.c_ulong()
+            if ctypes.windll.kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(sid)) \
+                    and sid.value == 0:
+                return "guardian"
+        except Exception:  # noqa: BLE001
+            pass
+    elif os.environ.get("INVOCATION_ID"):
+        return "guardian"
+    return "self"
+
+
+def _restart():
+    mode = restart_mode()
+    log.warning("更新完成，重启方式: %s(%s)", mode,
+                "退出码42交给守护拉起" if mode == "guardian" else "自己拉起新进程")
+    if mode == "guardian":
+        os._exit(42)
+    try:
+        env = dict(os.environ, MINER_NO_BROWSER="1", MINER_WAIT_PORT_FREE="1")
+        subprocess.Popen([sys.executable, os.path.join(BASE, "server.py")],
+                         cwd=os.getcwd(), env=env)
+    except Exception as e:  # noqa: BLE001
+        # 拉不起新进程就别退出：新代码已在磁盘上，旧进程继续服务，人工重启即可生效
+        log.error("自动重启失败(新版本已就位，请手动重启服务生效): %s", e)
+        return
+    os._exit(0)
+
+
+# 绝不让 git 等人输入：凭据过期时 git 会在控制台问用户名/弹凭据窗口，服务进程里没人答，
+# 卡住的 git-remote-https 孙进程还会让 subprocess 的 timeout 失效(Windows 上只杀得掉 git.exe)，
+# 更新锁永久不释放。低速阈值让半断的网络 30 秒内失败而不是挂死。
+_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never",
+            "GIT_HTTP_LOW_SPEED_LIMIT": "1000", "GIT_HTTP_LOW_SPEED_TIME": "30",
+            "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=15"}
+
+
 def _git(*args, timeout=60):
-    r = subprocess.run(["git", *args], cwd=BASE, capture_output=True, text=True,
+    r = subprocess.run(["git", "-c", "i18n.logOutputEncoding=utf-8", *args], cwd=BASE,
+                       capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                       env=dict(os.environ, **_GIT_ENV),
                        timeout=timeout, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout).strip()[:300])
@@ -53,10 +112,21 @@ def check(branch=None):
     """返回 {git, branch, local, remote, behind, changes[], checked_ts} 或 {git:False/error}。"""
     try:
         _git("rev-parse", "--git-dir", timeout=15)
-    except Exception:
-        return {"git": False, "error": "本目录不是 git 仓库(未用 git 部署)"}
+    except FileNotFoundError:
+        return {"git": False, "error": "找不到 git 命令：请安装 Git 并确认它在系统 PATH 里"
+                                      "(以服务方式运行时要装成所有用户可用)"}
+    except Exception as e:  # noqa: BLE001
+        # 不一定是"不是仓库"：服务账号与 clone 账号不同会报 dubious ownership 等
+        return {"git": False, "error": f"git 无法读取本目录: {str(e)[:200]}"}
     try:
-        branch = branch or _git("rev-parse", "--abbrev-ref", "HEAD")
+        cur = _git("rev-parse", "--abbrev-ref", "HEAD")
+        if branch and cur != "HEAD" and cur != branch:
+            return {"git": True, "error": f"配置跟踪分支 {branch}，但本地当前在 {cur} 分支；"
+                                          f"请先 git checkout {branch} 或改 update.branch"}
+        branch = branch or cur
+        if branch == "HEAD":   # detached HEAD(按 tag/提交部署)：别悄悄跟到远端默认分支
+            return {"git": True, "error": "当前不在任何分支上(detached HEAD)，"
+                                          "请在 config.yaml 配置 update.branch 或先 git checkout 分支"}
         _git("fetch", "--quiet", "origin", timeout=120)
         local = _git("rev-parse", "HEAD")
         remote = _git("rev-parse", f"origin/{branch}")
@@ -166,9 +236,10 @@ def _apply(branch=None, restart=True):
         return {"ok": False, "msg": f"新代码自检失败，已回滚到 {prev[:10]}: {err}"[:300]}
     new = _git("rev-parse", "HEAD")
     if restart:
-        threading.Timer(1.5, lambda: os._exit(42)).start()   # 等响应发出去再退
+        threading.Timer(1.5, _restart).start()   # 等响应发出去再退
     return {"ok": True, "from": prev[:10], "to": new[:10],
-            "changes": st.get("changes"), "restarting": restart}
+            "changes": st.get("changes"), "restarting": restart,
+            "restart_mode": restart_mode() if restart else ""}
 
 
 def start_auto(ucfg, on_event=None):
@@ -193,7 +264,9 @@ def start_auto(ucfg, on_event=None):
             time.sleep(interval)
             try:
                 st = check(branch)
-                if st.get("behind"):
+                if st.get("error"):
+                    log.warning("自动更新检查失败: %s", st["error"])
+                elif st.get("behind"):
                     _say(f"🔄 检测到新版本({st['behind']}个提交)，自动更新并重启…")
                     r = apply(branch)
                     if not r.get("ok"):

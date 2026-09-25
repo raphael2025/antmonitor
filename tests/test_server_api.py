@@ -26,7 +26,9 @@ def test_server_auth_validation_and_read_endpoints(monkeypatch):
 
     called = []
 
-    def fake_run_batch(targets, action, params, cfg, progress=None):
+    def fake_run_batch(targets, action, params, cfg, progress=None, before_group=None):
+        if before_group:
+            before_group([ip for ip, _fw in targets])
         called.extend(targets)
         return ([{"ip": ip, "ok": True, "msg": "ok"} for ip, _fw in targets], "")
 
@@ -61,6 +63,21 @@ def test_server_auth_validation_and_read_endpoints(monkeypatch):
         "ips": ["10.0.0.1"], "action": "reboot", "confirm": True})
     assert confirmed.status_code == 200
     assert [ip for ip, _fw in called] == ["10.0.0.1"]
+    # 重启成功的机器进入告警静默期；失败的不进(否则真掉线会被静默)
+    rebooting = server.SVC._alert_state["rebooting"]
+    assert "10.0.0.1" in rebooting
+
+    def half_fail(targets, action, params, cfg, progress=None, before_group=None):
+        # 下发时整批已标记(分批重启要跑几分钟，期间扫描不能报前几批掉线)
+        assert all(ip in rebooting for ip, _fw in targets)
+        return ([{"ip": "10.0.0.3", "ok": True, "msg": "ok"},
+                 {"ip": "10.0.0.4", "ok": False, "msg": "连不上矿机"}], "")
+
+    monkeypatch.setattr(server.control, "run_batch", half_fail)
+    assert client.post("/api/command", json={
+        "ips": ["10.0.0.3", "10.0.0.4"], "action": "reboot", "confirm": True}).status_code == 200
+    assert "10.0.0.3" in rebooting and "10.0.0.4" not in rebooting
+    monkeypatch.setattr(server.control, "run_batch", fake_run_batch)
 
     # action 非字符串不应冒泡成 500
     assert client.post("/api/command", json={

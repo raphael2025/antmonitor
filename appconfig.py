@@ -9,6 +9,7 @@
 import copy
 import json
 import os
+import re
 import threading
 
 import yaml
@@ -78,6 +79,10 @@ DEFAULTS = {
     "control": {
         "enabled": False, "uniplus_password": "", "timeout": 8, "max_batch": 1000,
         "reboot_concurrency": 30, "reboot_delay_sec": 8, "reboot_shuffle": True,
+        "reboot_grace_sec": 600,
+        # 允许换到的矿池主机名(含子域名)。只能在 config.yaml 配置，网页改不了。
+        # 为空 = 禁止网页换矿池、也不做矿池篡改告警
+        "pool_allowlist": [],   # 下发重启后这么久内掉线不报警；过了仍不在线报"重启后未上线"
     },
     "auth": {"enabled": True, "secure_cookie": False, "users": []},
     "update": {"auto": False, "branch": "", "check_interval": 3600},
@@ -91,9 +96,14 @@ DEFAULTS = {
     },
     "server": {
         "host": "0.0.0.0", "port": 8800,
+        "open_browser": True,   # Windows 下启动后自动打开本机浏览器
         # 前置 nginx/frp 时填代理的IP(或CIDR)，才会信任 X-Forwarded-For 取真实客户端IP。
         # 留空=不信任任何代理(直连部署的正确选择，防伪造头绕过登录限流)
         "trusted_proxies": [],
+        # 除 IP/localhost/本机名外，允许用来访问面板的域名(防 DNS 重绑定)。用内网域名访问时填
+        "allowed_hosts": [],
+        # 填上证书/私钥路径即启用 HTTPS(局域网防嗅探口令和会话)，登录 Cookie 自动加 Secure
+        "tls_cert": "", "tls_key": "",
     },
     "public_api": {"token": ""},
     "logging": {"level": "INFO", "file": "", "max_mb": 20, "backups": 5},
@@ -159,6 +169,7 @@ def _validate(cfg):
     # 会把整批重启中断在半路(前一半重启了后一半没有)。0 秒=不等待，合法。
     clamp("control", "reboot_concurrency", 1, 1000, int)
     clamp("control", "reboot_delay_sec", 0, 3600)
+    clamp("control", "reboot_grace_sec", 0, 86400, int)
     # 告警阈值：0 在这几项里是"关闭该告警"的约定语义，故下限取 0 而非正数；
     # 比例类限制在 0~1，百分比类限制在 0~100，温度取物理上可能的范围。
     clamp("alerts", "overheat_c", 0, 200)
@@ -205,6 +216,97 @@ def load_config(path=None):
     else:
         log.warning("配置文件 %s 不存在，使用全部默认值", path)
     return _validate(_merge(DEFAULTS, raw))
+
+
+def _users_of(doc):
+    return (((doc or {}).get("auth") or {}).get("users") or [])
+
+
+def set_user_password(username, pw_hash, path=None):
+    """把 config.yaml 里 auth.users 中 username 的 password 原地改成 pw_hash(保留注释/格式)。
+
+    网页改密码和 `python auth.py passwd` 共用。支持流式 `- {username: a, password: "x"}`
+    和块式写法。改完重新解析并逐项比对：只有该用户的 password 变了才落盘(先备份 .bak，
+    再原子替换)，否则一个字节都不写——宁可让人手改，也不能把配置文件改坏。
+    返回 "" 成功，否则为原因。
+    """
+    path = _anchor(path) if path else CONFIG_FILE
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        before = yaml.safe_load(text) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return f"读取配置文件失败: {e}"
+    lines = text.splitlines(keepends=True)
+    q = '"' + pw_hash + '"'
+    uname = re.compile(r'(?:^|[\s{,-])username:\s*(["\']?)' + re.escape(username) + r'\1\s*(?:,|}|$)')
+    pw_val = r'password:\s*(?:"[^"]*"|\'[^\']*\'|[^,}\r\n#]*)'
+    done = False
+    for i, ln in enumerate(lines):
+        body = ln.rstrip("\r\n")
+        m = uname.search(body)
+        if not m:
+            continue
+        if "{" in body and "password:" in body:          # 流式：同一行
+            lines[i] = re.sub(pw_val, "password: " + q, ln, count=1)
+            done = True
+            break
+        # 块式：先按列定出这个列表项的行范围，再在项内找与 username 同列的 password:
+        col = body.index("username:")
+
+        def in_item(t):   # 与 username 同列的键(前面只有空格，或是 "- " 项起点)
+            return t[:col].strip() in ("", "-") and t[col:col + 1].strip() != ""
+
+        def skip(t):
+            return not t.strip() or t.lstrip().startswith("#")
+
+        start = i
+        while body[:col].strip() != "-" and start > 0:
+            prev = lines[start - 1].rstrip("\r\n")
+            if skip(prev) or in_item(prev):
+                start -= 1
+                if prev[:col].strip() == "-":
+                    break
+                continue
+            break
+        end = i
+        while end + 1 < len(lines):
+            nxt = lines[end + 1].rstrip("\r\n")
+            if skip(nxt) or (nxt[:col].strip() == "" and in_item(nxt)):
+                end += 1
+                continue
+            break
+        for k in range(start, end + 1):
+            t = lines[k].rstrip("\r\n")
+            if in_item(t) and t[col:].startswith("password:"):
+                lines[k] = t[:col] + "password: " + q + lines[k][len(t):]
+                done = True
+                break
+        break
+    if not done:
+        return f"在配置文件里没找到用户 {username} 的 password 行，请手动修改 config.yaml"
+    new_text = "".join(lines)
+    try:
+        after = yaml.safe_load(new_text) or {}
+    except yaml.YAMLError as e:
+        return f"改写后配置无法解析，已放弃写入: {e}"
+    expect = copy.deepcopy(before)
+    hits = [u for u in _users_of(expect) if isinstance(u, dict) and u.get("username") == username]
+    if len(hits) != 1:
+        return f"配置里用户 {username} 不存在或重复，请手动修改 config.yaml"
+    hits[0]["password"] = pw_hash
+    if after != expect:
+        return "改写结果校验不一致，已放弃写入，请手动修改 config.yaml"
+    tmp = path + ".tmp"
+    try:
+        with open(path + ".bak", "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(new_text)
+        os.replace(tmp, path)
+    except OSError as e:
+        return f"写入配置文件失败(权限?): {e}"
+    return ""
 
 
 # ---- 网段(网页可编辑，存 segments.json) ----

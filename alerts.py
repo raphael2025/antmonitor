@@ -18,12 +18,13 @@ import requests
 import db
 import logs
 import miner_core
+from control import pool_allowed as control_pool_allowed, pool_host as control_pool_host
 
 log = logs.get(__name__)
 
 # 本模块产生的全部告警类型（启动清理旧类型时作为白名单）
 MINER_TYPES = ("offline", "zero", "reject", "low_hashrate", "overheat",
-               "segment_down", "stalled")
+               "segment_down", "stalled", "pool_hijack")
 
 # ---- 推送队列：发送失败/慢不影响扫描 ----
 _push_q = queue.Queue(maxsize=200)
@@ -77,12 +78,12 @@ class _Batch:
         self.to_fire = []      # [(ip, type, sev, detail)]
         self.to_resolve = []   # [(ip, type)]
 
-    def fire(self, ip, type_, sev, detail):
+    def fire(self, ip, type_, sev, detail, force=False):
         key = (ip, type_)
         if key in self.active:          # 已有未恢复的同类告警
             return
         rt = self.cooled.get(key)       # 刚恢复不久的抖动不再报，防刷屏
-        if rt and (self.now - rt) < self.cooldown:
+        if rt and (self.now - rt) < self.cooldown and not force:
             return
         self.active.add(key)            # 同一轮内不重复
         self.to_fire.append((ip, type_, sev, detail))
@@ -112,6 +113,12 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         return []
     state = state if state is not None else {}
     streak = state.setdefault("low_hr_streak", {})
+    rebooting = state.setdefault("rebooting", {})   # ip → 下发重启的时间(MonitorService.mark_rebooting 写入)
+    rb_grace = cfg.get("control", {}).get("reboot_grace_sec", 600)
+
+    def rb_expired(ip):   # 有重启标记且静默期已过(按时间戳现判，见下方在线分支注释)
+        t = rebooting.get(ip)
+        return t is not None and now - t >= rb_grace
 
     cooldown = acfg.get("cooldown", 1800)
     seg_ratio = acfg.get("segment_down_ratio", 0.6)
@@ -123,16 +130,23 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     lo_peers = max(1, int(acfg.get("low_hashrate_min_peers", 5)))
     hot_c = acfg.get("overheat_c", 95)
     hot_clear = acfg.get("overheat_clear_c", 90)
+    pool_allow = [a for a in (cfg.get("control", {}).get("pool_allowlist") or []) if str(a).strip()]
     roster_age = cfg.get("scan", {}).get("roster_retention_days", 7)
     now = int(time.time())
 
     cur = {r["ip"]: r for r in records}
-    prev_id = db.prev_scan_id(conn, scan_id, kind)   # 同类扫描的上一次
-    prev = {r["ip"]: r for r in db.scan_records(conn, prev_id)} if prev_id else {}
     repair = db.repair_ips(conn)          # 维修中的机器：不报警
     roster = set(db.roster_ips(conn, roster_age))   # 已知真机(算网段比例的分母)
+    # 掉线告警按状态判，不按"上一轮 online → 本轮 offline"的跳变判：跳变那一轮只要没报出来
+    # (冷却期/上一轮是 unknown/被网段事件或维修静音)，之后上一轮已是 offline 就永远不再报。
+    # 现在：名册内、当前离线、且自最后一次在线以来还没报过掉线 → 报(冷却只会推迟，不会吞掉)。
+    last_online = db.last_online_map(conn)
+    last_off_alert = db.last_alert_ts(conn, "offline", now - roster_age * 86400)
 
     b = _Batch(conn, cooldown, now)
+    # 静默期内的刚重启机器：掉线是预期内的，不报单机掉线，也不计入网段掉线比例
+    # (整段批量重启不能被当成交换机/断电事件)
+    rb_quiet = {ip for ip, t in list(rebooting.items()) if now - t < rb_grace}
 
     # —— 网段级故障(基于当前绝对离线率)：交换机持续挂着会一直维持事件 ——
     # unknown(本轮未探测)不计入分子/分母——理由跟单机判断一致：拥堵时"没问过"
@@ -140,7 +154,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     # 但同时要记 seg_unknown：用于下面"回落判定"时识别"这轮数据不完整、不可信"。
     seg_total, seg_off, seg_unknown = {}, {}, {}
     for ip, r in cur.items():
-        if ip not in roster:
+        if ip not in roster or ip in rb_quiet:
             continue
         seg = ".".join(ip.split(".")[:3])
         if r["status"] == "unknown":
@@ -154,8 +168,10 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         tot = seg_total.get(seg, 0)
         if off >= seg_min and tot > 0 and off / tot >= seg_ratio:
             down_segments.add(seg)
+            # force：整段事件不受冷却限制。下面会用 down_segments 静音段内单机告警，
+            # 若这条被冷却拦下，同一栋冷却期内第二次断电就既无网段告警也无单机告警
             b.fire(f"{seg}.x", "segment_down", "crit",
-                   f"网段 {seg}.x 大面积掉线 {off}/{tot}（疑似交换机/断电）")
+                   f"网段 {seg}.x 大面积掉线 {off}/{tot}（疑似交换机/断电）", force=True)
     for a in db.active_alerts_by_type(conn, "segment_down"):   # 离线率回落 → 恢复
         seg = a["ip"][:-2] if a["ip"].endswith(".x") else a["ip"]
         tot = seg_total.get(seg, 0)
@@ -189,11 +205,24 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             streak.pop(ip, None)
             if ip in repair or seg in down_segments:
                 b.resolve(ip, "offline")   # 维修中/被网段事件覆盖 → 清掉历史单条
+                rebooting.pop(ip, None)
                 continue
-            if prev.get(ip, {}).get("status") == "online":
+            if ip in rb_quiet:             # 刚下发重启，还在静默期
+                continue
+            if rb_expired(ip):   # 静默期已过仍不在线：重启没起来
+                rebooting.pop(ip, None)
+                b.fire(ip, "offline", "crit",
+                       f"{ip} 重启后 {max(1, rb_grace // 60)} 分钟仍未上线")
+                continue
+            lo = last_online.get(ip)
+            if ip in roster and lo is not None and last_off_alert.get(ip, -1) <= lo:
                 b.fire(ip, "offline", "crit", f"{ip} 掉线")
             continue
         b.resolve(ip, "offline")
+        # 静默期结束时在线 → 重启完成。按时间戳现判，不用 rb_quiet：评估途中请求线程
+        # 可能刚写入新标记，rb_quiet 里还没有它，会被误当成"已过期"清掉
+        if rb_expired(ip):
+            rebooting.pop(ip, None)
 
         hr = r.get("hr_rt")
         up = r.get("uptime")
@@ -239,6 +268,18 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                 # 维修中/整段掉线静音：无条件消掉已有高温告警，与 zero/reject 一致
                 b.resolve(ip, "overheat")
 
+        # 矿池防篡改：矿机上配置了白名单外的矿池(含备用池) → 严重告警，不受维修/网段静音。
+        # 覆盖"绕过面板直接用 root/root 登矿机改池"这条面板管不到的路径
+        pools = r.get("pools")
+        if pool_allow and pools is not None:
+            bad = sorted({control_pool_host(u) or u for u in pools
+                          if not control_pool_allowed(u, pool_allow)})
+            if bad:
+                b.fire(ip, "pool_hijack", "crit",
+                       f"{ip} 矿池不在白名单(疑似被篡改偷算力): {', '.join(bad)[:200]}")
+            else:
+                b.resolve(ip, "pool_hijack")
+
         # 拒绝率（矿池健康）
         if rej_thresh and rej_thresh > 0 and (r.get("accepted") is not None
                                               or r.get("rejected") is not None):
@@ -251,6 +292,9 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     for ip in list(streak):     # 已不在本轮样本内的机器(下架/换IP)：别让计数无限增长
         if ip not in cur:
             streak.pop(ip, None)
+    for ip in list(rebooting):  # 同理：静默期过了还没出现在样本里的(下架/换IP)
+        if ip not in cur and rb_expired(ip):
+            rebooting.pop(ip, None)
 
     fired = b.commit()
     if fired:

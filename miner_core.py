@@ -12,6 +12,9 @@ import threading
 import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor, as_completed
+# Python 3.8~3.10 上 concurrent.futures.TimeoutError 不是内置 TimeoutError(3.11 起才合并)，
+# 只写 except TimeoutError 会让整体超时逃出 scan()，整轮结果全部丢弃
+from concurrent.futures import TimeoutError as FutTimeout
 
 import requests
 from requests.auth import HTTPDigestAuth
@@ -354,7 +357,10 @@ def fetch_pool(ip, timeout):
             acc += int(p.get("Accepted") or p.get("accepted") or 0)
             rej += int(p.get("Rejected") or p.get("rejected") or 0)
             stl += int(p.get("Stale") or p.get("stale") or 0)
-        return {"worker": worker, "accepted": acc, "rejected": rej, "stale": stl}
+        # 全部配置的矿池地址(含备用/失活池)：换池防篡改检查用。攻击者常把自己的池塞在备用位
+        urls = [str(p.get("URL") or p.get("url") or "").strip() for p in sorted(pools, key=_prio)]
+        return {"worker": worker, "accepted": acc, "rejected": rej, "stale": stl,
+                "pools": [u for u in urls if u]}
     except Exception:
         return None
     finally:
@@ -501,6 +507,7 @@ def probe(ip, cfg, limiter=None):
             rec["accepted"] = pi.get("accepted")
             rec["rejected"] = pi.get("rejected")
             rec["stale"] = pi.get("stale")
+            rec["pools"] = pi.get("pools") or []   # 只在内存/本轮使用，不落库
     return rec
 
 
@@ -544,7 +551,7 @@ def scan(ips, cfg, progress_cb=None, workers=None):
             done += 1
             if progress_cb and done % 200 == 0:
                 progress_cb(done, total)
-    except TimeoutError:
+    except (FutTimeout, TimeoutError):
         log.warning("scan: 整体超时 %ds，已完成 %d/%d", int(overall_to), len(seen), total)
     finally:
         # 整轮扫描拥堵/超时时，"排不上号、压根没问过"的机器绝不能当成"问了确认离线"——
@@ -615,7 +622,7 @@ def scan_containers(ips, cfg, progress_cb=None):
             done += 1
             if progress_cb and done % 20 == 0:
                 progress_cb(done, len(ips))
-    except TimeoutError:
+    except (FutTimeout, TimeoutError):
         log.warning("scan_containers: 整体超时 %ds，已完成 %d/%d",
                     int(overall_to), len(seen), len(ips))
     finally:

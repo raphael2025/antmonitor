@@ -1,0 +1,131 @@
+# -*- coding: utf-8 -*-
+"""掉线告警不能永久漏报。
+
+旧实现只在"上一轮同类扫描 online → 本轮 offline"那一刻判一次；那一刻因任何原因没报出来
+(冷却期、上一轮是 unknown、被网段事件/维修静音)，之后上一轮已是 offline，就再也不会报。
+现在按状态判：名册内的机器当前离线、且自它最后一次在线以来还没报过掉线 → 报。
+冷却只让告警晚一点出来，不会让它消失。
+"""
+import time
+
+import pytest
+
+import alerts
+import db
+from conftest import rec
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1_800_000_000.0
+
+    def __call__(self):
+        return self.t
+
+    def tick(self, sec=300):
+        self.t += sec
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = Clock()
+    monkeypatch.setattr(time, "time", c)
+    monkeypatch.setattr(alerts, "_enqueue", lambda *a, **k: None)
+    return c
+
+
+def _round(conn, cfg, clock, records, state, kind="quick"):
+    """与 service._do_scan 同序：落库 → 在线机写名册(last_online) → 评估告警。"""
+    clock.tick()
+    sid, ts, kept = db.save_scan(conn, kind, records)
+    db.upsert_known_miners(conn, [r for r in records if r["status"] == "online"], ts)
+    return [(f[0], f[1]) for f in alerts.evaluate(conn, sid, kept, cfg, kind=kind, state=state)]
+
+
+def _active(conn, type_="offline"):
+    return sorted(a["ip"] for a in db.active_alerts_by_type(conn, type_))
+
+
+IP = "10.0.0.1"
+
+
+def test_offline_again_within_cooldown_is_delayed_not_lost(conn, cfg, clock):
+    cfg["alerts"]["cooldown"] = 1800
+    st = {}
+    _round(conn, cfg, clock, [rec(IP)], st)
+    assert _round(conn, cfg, clock, [rec(IP, status="offline")], st) == [(IP, "offline")]
+    _round(conn, cfg, clock, [rec(IP)], st)                        # 恢复 → 消警
+    assert _round(conn, cfg, clock, [rec(IP, status="offline")], st) == []   # 冷却中，先不报
+    clock.tick(1800)                                                # 冷却过去，仍离线
+    assert _round(conn, cfg, clock, [rec(IP, status="offline")], st) == [(IP, "offline")]
+
+
+def test_offline_after_an_unknown_round_still_alerts(conn, cfg, clock):
+    st = {}
+    _round(conn, cfg, clock, [rec(IP)], st)
+    _round(conn, cfg, clock, [rec(IP, status="unknown")], st)      # 拥堵超时那一轮
+    assert _round(conn, cfg, clock, [rec(IP, status="offline")], st) == [(IP, "offline")]
+
+
+def test_machines_still_down_when_segment_event_clears_get_their_own_alert(conn, cfg, clock):
+    ips = [f"10.0.1.{i}" for i in range(1, 11)]
+    st = {}
+    _round(conn, cfg, clock, [rec(ip) for ip in ips], st)
+    fired = _round(conn, cfg, clock, [rec(ip, status="offline") for ip in ips], st)
+    assert fired == [("10.0.1.x", "segment_down")]                  # 整段只报一条
+    half = [rec(ip) for ip in ips[:5]] + [rec(ip, status="offline") for ip in ips[5:]]
+    _round(conn, cfg, clock, half, st)                              # 5/10 < 0.6 → 网段事件消除
+    assert _active(conn, "segment_down") == []
+    assert set(_active(conn)) == set(ips[5:])                       # 剩下 5 台必须单独报
+
+
+def test_segment_down_again_within_cooldown_is_not_silent(conn, cfg, clock):
+    cfg["alerts"]["cooldown"] = 1800
+    ips = [f"10.0.1.{i}" for i in range(1, 11)]
+    st = {}
+    _round(conn, cfg, clock, [rec(ip) for ip in ips], st)
+    _round(conn, cfg, clock, [rec(ip, status="offline") for ip in ips], st)
+    _round(conn, cfg, clock, [rec(ip) for ip in ips], st)           # 来电，全部恢复
+    _round(conn, cfg, clock, [rec(ip, status="offline") for ip in ips], st)  # 冷却期内又整段掉电
+    assert _active(conn, "segment_down") == ["10.0.1.x"]           # 整段事件必须在
+
+
+def test_repair_cancelled_while_still_offline_alerts(conn, cfg, clock):
+    st = {}
+    _round(conn, cfg, clock, [rec(IP)], st)
+    db.set_machine_state(conn, [IP], "repair")
+    assert _round(conn, cfg, clock, [rec(IP, status="offline")], st) == []
+    db.set_machine_state(conn, [IP], "active")
+    assert _round(conn, cfg, clock, [rec(IP, status="offline")], st) == [(IP, "offline")]
+
+
+def test_long_offline_machine_is_not_re_alerted_every_round(conn, cfg, clock):
+    """报过一次就够了：一直离线的机器不能每轮都新增一条。"""
+    st = {}
+    _round(conn, cfg, clock, [rec(IP)], st)
+    assert _round(conn, cfg, clock, [rec(IP, status="offline")], st) == [(IP, "offline")]
+    for _ in range(5):
+        assert _round(conn, cfg, clock, [rec(IP, status="offline")], st) == []
+    assert len(db.list_alerts(conn, True, 100)) == 1
+
+
+def test_never_seen_online_address_does_not_alert(conn, cfg, clock):
+    """名册外(从没在线过)的地址离线不报——约1.5万个死 IP 不能刷屏。"""
+    st = {}
+    assert _round(conn, cfg, clock, [rec("10.0.9.9", status="offline")], st) == []
+
+
+def test_reboot_that_never_comes_back_after_a_recent_flap_is_not_lost(conn, cfg, clock):
+    """刚抖过(掉线告警冷却中)的机器被重启且没起来：告警可以晚，但不能丢。"""
+    cfg["alerts"]["cooldown"] = 1800
+    cfg["control"]["reboot_grace_sec"] = 600
+    st = {}
+    _round(conn, cfg, clock, [rec(IP)], st)
+    _round(conn, cfg, clock, [rec(IP, status="offline")], st)
+    _round(conn, cfg, clock, [rec(IP)], st)                         # 恢复 → 消警，进入冷却
+    st.setdefault("rebooting", {})[IP] = int(time.time())
+    for _ in range(3):                                              # 静默期 + 冷却期内
+        _round(conn, cfg, clock, [rec(IP, status="offline")], st)
+    clock.tick(1800)
+    _round(conn, cfg, clock, [rec(IP, status="offline")], st)
+    assert _active(conn) == [IP]

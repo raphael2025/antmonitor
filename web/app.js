@@ -32,9 +32,14 @@ async function jpost(u, body) {
     body: JSON.stringify(body || {}),
   });
   if (r.status === 401) { showLogin(); throw new Error("401"); }
-  if (r.status === 403) { toast("权限不足：该操作需要 ops 或 admin 角色"); throw new Error("403"); }
   let j = {};
   try { j = await r.json(); } catch (e) { j = { ok: false, error: "HTTP " + r.status }; }
+  if (r.status === 403) {   // 显示后端给的原因(矿池不在白名单/须先改密码…)，不一律说"权限不足"
+    const why = j.error || j.detail || "权限不足：该操作需要 ops 或 admin 角色";
+    toast(why);
+    if (String(why).includes("修改密码")) openPwd(true);
+    throw new Error("403");
+  }
   lastOkMs = Date.now();
   return j;
 }
@@ -214,6 +219,7 @@ function announceCounts(counts) {
   const n = (t) => counts[t] || 0;
   const cooler = Object.keys(counts).filter(t => t.startsWith("cooler")).reduce((s, t) => s + counts[t], 0);
   const parts = [];
+  if (n("pool_hijack")) parts.push(`矿池被篡改 ${n("pool_hijack")} 台，请立即核查`);
   if (n("stalled")) parts.push("监控停滞");
   if (n("segment_down")) parts.push(`${n("segment_down")} 个网段掉线`);
   if (n("offline")) parts.push(`掉线 ${n("offline")} 台`);
@@ -895,16 +901,146 @@ document.querySelectorAll("#minerTable th[data-k]").forEach(th => th.onclick = (
 
 /* ---------------- 登录 / 权限 ---------------- */
 let myRole = "admin";
+let myUser = "";
 let _timer = null;
 
 function showLogin() { stopDashboard(); $("loginOverlay").classList.remove("hidden"); }
+
+// ---- 改密码：弱口令会话登录后强制弹出，改完才能操作 ----
+let _pwdForced = false;
+function openPwd(force) {
+  _pwdForced = !!force;
+  $("pwdForce").classList.toggle("hidden", !force);
+  $("pwdClose").style.display = force ? "none" : "";
+  ["pwdOld", "pwdNew", "pwdNew2"].forEach(id => $(id).value = "");
+  $("pwdErr").textContent = "";
+  $("pwdModal").classList.remove("hidden");
+  $("pwdOld").focus();
+}
+async function savePwd() {
+  const old = $("pwdOld").value, nw = $("pwdNew").value;
+  if (nw !== $("pwdNew2").value) { $("pwdErr").textContent = "两次输入的新密码不一致"; return; }
+  let d;
+  try { d = await jpost("/api/password", { old, new: nw }); } catch (e) { return; }
+  if (!d.ok) { $("pwdErr").textContent = d.error || "修改失败"; return; }
+  $("pwdModal").classList.add("hidden");
+  _pwdForced = false;
+  toast("密码已修改", "ok");
+}
+$("btnPwd").onclick = () => openPwd(false);
+$("pwdClose").onclick = () => { if (!_pwdForced) $("pwdModal").classList.add("hidden"); };
+$("pwdSave").onclick = savePwd;
+$("pwdNew2").addEventListener("keydown", e => { if (e.key === "Enter") savePwd(); });
 
 function applyRole() {
   const canCtl = myRole === "ops" || myRole === "admin";
   document.body.classList.toggle("viewer", !canCtl);
   $("btnSeg").style.display = myRole === "admin" ? "" : "none";  // 网段设置仅 admin
+  $("btnUpdate").style.display = myRole === "admin" ? "" : "none";  // 版本更新仅 admin
+  $("btnPwd").style.display = myUser && myUser !== "anonymous" ? "" : "none";
   $("userBadge").textContent = myRole;
 }
+
+// ---- 版本更新（仅 admin）：后台定时查有没有新版本，按钮变绿提示；点开看更新内容，一键更新 ----
+let _updTimer = null;
+let _updInfo = null;
+let _updating = false;
+
+function markUpdateBtn(d) {
+  const n = (d && !d.error && d.behind) || 0;
+  $("btnUpdate").textContent = n ? `⬆ 有新版本(${n})` : "⬆ 版本";
+  $("btnUpdate").classList.toggle("has-update", !!n);
+}
+
+async function checkUpdate(force) {
+  if (myRole !== "admin") return null;
+  try {
+    const d = await jget("/api/update/check" + (force ? "?force=true" : ""));
+    _updInfo = d; markUpdateBtn(d);
+    return d;
+  } catch (e) { return null; }
+}
+
+function renderUpdate(d) {
+  const b = $("updBody");
+  $("updApply").disabled = true;
+  if (!d) { b.innerHTML = `<div class="upd-err">检查失败：连不上服务器</div>`; return; }
+  if (d.git === false) {
+    b.innerHTML = `<div class="upd-err">${esc(d.error || "本目录不是 git 仓库")}</div>
+      <div class="upd-note">网页更新需要用 git clone 方式部署。</div>`;
+    return;
+  }
+  if (d.error) {
+    b.innerHTML = `<div class="upd-err">检查失败：${esc(d.error)}</div>
+      <div class="upd-note">常见原因：服务器连不上 GitHub（外网/代理）、git 没装或不在 PATH。</div>`;
+    return;
+  }
+  const when = d.checked_ts ? new Date(d.checked_ts * 1000).toLocaleString() : "-";
+  let h = `<div>分支 <code>${esc(d.branch)}</code> · 当前版本 <code>${esc(d.local)}</code> · 最新 <code>${esc(d.remote)}</code></div>
+    <div class="muted">检查时间 ${esc(when)}</div>`;
+  if (!d.behind) {
+    h += `<div class="upd-ok">✓ 已是最新版本</div>`;
+  } else {
+    h += `<div>有 <b>${d.behind}</b> 个新提交${d.behind > 10 ? "（下面只列最近 10 个）" : ""}：</div>
+      <ul>${(d.changes || []).map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
+    h += `<div class="upd-note">更新流程：拉取新代码 → 自检（不通过自动回滚，不会重启）→ 重启服务。
+      重启约需十几秒，期间扫描暂停；重启后需要重新登录。配置和数据库不受影响。
+      ${d.restart_mode === "self" ? "<br>当前没有守护进程（run.bat / NSSM），会由程序自己重新拉起。" : ""}</div>`;
+    $("updApply").disabled = false;
+  }
+  b.innerHTML = h;
+}
+
+async function openUpdate() {
+  $("updModal").classList.remove("hidden");
+  if (_updating) return;
+  $("updBody").textContent = "检查中…（需要连 GitHub，可能要几秒）";
+  $("updApply").disabled = true;
+  renderUpdate(await checkUpdate(true));
+}
+
+// 等服务重启：先等它下线(或最多 20 秒)，再等它回来，回来就刷新页面
+async function waitRestart() {
+  const alive = async () => {
+    try { await fetch("/api/me", { cache: "no-store" }); return true; } catch (e) { return false; }
+  };
+  const t0 = Date.now();
+  let wentDown = false;
+  while (Date.now() - t0 < 180000) {
+    await new Promise(r => setTimeout(r, 2000));
+    const up = await alive();
+    if (!up) { wentDown = true; continue; }
+    if (wentDown || Date.now() - t0 > 20000) { location.reload(); return; }
+  }
+  $("updBody").innerHTML = `<div class="upd-err">3 分钟了服务还没回来，请到服务器上检查程序窗口 / logs\\miner.log。</div>`;
+  _updating = false;
+}
+
+async function applyUpdate() {
+  if (!_updInfo || !_updInfo.behind) return;
+  if (!confirm(`确认更新到最新版本（${_updInfo.behind} 个新提交）并重启服务？\n重启期间约十几秒不扫描，所有人需要重新登录。`)) return;
+  _updating = true;
+  $("updApply").disabled = true; $("updRecheck").disabled = true;
+  $("updBody").textContent = "正在拉取新代码并自检，可能需要 1～2 分钟，请勿关闭页面…";
+  let r;
+  try { r = await jpost("/api/update/apply", {}); } catch (e) { r = null; }
+  $("updRecheck").disabled = false;
+  if (!r || !r.ok) {
+    _updating = false;
+    $("updBody").innerHTML = `<div class="upd-err">更新失败：${esc((r && (r.msg || r.error)) || "请求出错")}</div>
+      <div class="upd-note">自检不通过会自动回滚，服务仍在旧版本上正常运行。</div>`;
+    return;
+  }
+  $("updBody").innerHTML = `<div class="upd-ok">✓ 已更新 ${esc(r.from)} → ${esc(r.to)}，正在重启服务…</div>
+    <div class="muted">服务回来后页面会自动刷新。</div>`;
+  stopDashboard();   // 重启期间别弹"监控失联"红条/重连风暴
+  waitRestart();
+}
+
+$("btnUpdate").onclick = openUpdate;
+$("updClose").onclick = () => $("updModal").classList.add("hidden");
+$("updRecheck").onclick = openUpdate;
+$("updApply").onclick = applyUpdate;
 
 let _ws = null;
 let _wsStop = false;   // 登出/会话失效后置真，停止重连风暴
@@ -946,6 +1082,10 @@ function startDashboard() {
   connectWS();
   if (!_timer) _timer = setInterval(refreshAll, 30000);  // WS 推送为主，轮询兜底
   if (!_staleTimer) _staleTimer = setInterval(checkStale, 10000);  // 失联自检，每10秒
+  if (myRole === "admin") {   // 新版本提示：进来查一次，之后每 30 分钟(后端有 10 分钟缓存)
+    checkUpdate(false);
+    if (!_updTimer) _updTimer = setInterval(() => checkUpdate(false), 1800000);
+  }
 }
 
 async function doLogin() {
@@ -956,7 +1096,8 @@ async function doLogin() {
   const d = await r.json();
   if (!d.ok) { $("loginErr").textContent = d.error || "登录失败"; return; }
   $("loginOverlay").classList.add("hidden");
-  myRole = d.role; applyRole(); startDashboard();
+  myRole = d.role; myUser = d.user; applyRole(); startDashboard();
+  if (d.must_change) openPwd(true);
 }
 
 async function doLogout() { await fetch("/api/logout", { method: "POST" }); location.reload(); }
@@ -984,6 +1125,7 @@ async function init() {
   const r = await fetch("/api/me");
   if (r.status === 401) { showLogin(); return; }
   const me = await r.json();
-  myRole = me.role; applyRole(); startDashboard();
+  myRole = me.role; myUser = me.user; applyRole(); startDashboard();
+  if (me.must_change) openPwd(true);
 }
 init();

@@ -14,11 +14,36 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.auth import HTTPDigestAuth
+from urllib3.exceptions import ProtocolError
 
 import appconfig
 import miner_core
 
 ACTIONS = {"reboot", "locate", "set_pools"}
+
+
+def pool_host(url):
+    """stratum+tcp://Host:3333/xx → host(小写)；解析不出返回 ""。"""
+    s = str(url or "").strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0].split("@")[-1]
+    if s.startswith("["):                      # [ipv6]:port
+        return s[1:s.find("]")].lower() if "]" in s else ""
+    return s.rsplit(":", 1)[0].lower() if ":" in s else s.lower()
+
+
+def pool_allowed(url, allowlist):
+    """矿池地址是否在白名单内。白名单项 "f2pool.com" 同时放行其子域名(btc.f2pool.com)，
+    但不放行 evilf2pool.com / f2pool.com.evil.io。白名单为空 → 一律不放行。"""
+    host = pool_host(url)
+    if not host:
+        return False
+    for a in allowlist or []:
+        a = str(a).strip().lower().lstrip("*.").rstrip(".")
+        if a and (host == a or host.endswith("." + a)):
+            return True
+    return False
 
 
 def _seg_prefix(seg):
@@ -124,6 +149,51 @@ def normalize_ips(ips, max_batch, cfg=None):
     return out, ""
 
 
+def _sent_then_dropped(e):
+    """带认证的请求已送达、矿机在回响应前断开或不再回应——原厂 reboot.cgi 的常见表现
+    (系统已开始重启，web 服务先没了)。连不上(拒绝连接/连接超时)不算。
+    Digest 第一跳不带凭据，矿机不可能执行；web 卡死的机器正好会在这一跳超时，
+    必须算失败，否则"没重启"会被显示成成功还进了告警静默期。"""
+    if isinstance(e, requests.ConnectTimeout):
+        return False
+    req = getattr(e, "request", None)
+    if req is None or "Authorization" not in (req.headers or {}):
+        return False
+    if isinstance(e, (requests.ReadTimeout, requests.exceptions.ChunkedEncodingError)):
+        return True
+    return isinstance(e, requests.ConnectionError) and bool(e.args) \
+        and isinstance(e.args[0], ProtocolError)
+
+
+def _stock_reboot(s, ip, passwords, timeout):
+    """原厂重启：GET /cgi-bin/reboot.cgi(与原厂网页一致)，个别固件回 405 再用 POST。
+
+    矿机收到后常常不回响应就断开(已经在重启)——以前这被当成"失败"，值班员看到失败
+    会再点一次，等于对正在重启的机器补发命令。现在按"已下发"处理；真没起来由
+    告警侧的"重启后 N 分钟仍未上线"兜底。只有 401(换下一组密码)/405(换 POST)才会
+    再发请求，这两种矿机都没执行，不存在重复重启。
+    """
+    url = f"http://{ip}/cgi-bin/reboot.cgi"
+    r = None
+    for u, p in passwords:
+        auth = HTTPDigestAuth(u, p)
+        for method in ("GET", "POST"):
+            try:
+                r = s.request(method, url, auth=auth, timeout=timeout)
+            except requests.RequestException as e:
+                if _sent_then_dropped(e):
+                    return True, "已下发(矿机未回响应即断开，通常表示已开始重启)"
+                return False, f"连不上矿机: {e}"
+            if r.status_code != 405:
+                break
+        if r.status_code == 401:
+            continue
+        if r.status_code == 200:
+            return True, "reboot ok"
+        return False, f"矿机拒绝重启: HTTP {r.status_code}"
+    return False, "密码无效(401)"
+
+
 def _stock(ip, action, params, passwords, timeout):
     s = requests.Session(); s.trust_env = False
 
@@ -152,8 +222,7 @@ def _stock(ip, action, params, passwords, timeout):
         return None
 
     if action == "reboot":
-        r, msg = post("reboot.cgi")
-        return (r is not None and r.status_code == 200), msg or "reboot ok"
+        return _stock_reboot(s, ip, passwords, timeout)
     if action == "locate":
         on = bool(params.get("on"))
         r, msg = post("blink.cgi", json={"blink": "true" if on else "false"})
@@ -198,6 +267,11 @@ def run_one(ip, firmware, action, params, cfg):
     ctl = cfg.get("control", {})
     if not ctl.get("enabled", False):
         return {"ip": ip, "ok": False, "msg": "控制功能未启用"}
+    if action == "set_pools":   # 纵深防御：无论谁调到这里，白名单外的矿池一律不下发
+        pools = (params or {}).get("pools") or []
+        if not pools or not all(pool_allowed(p.get("url"), ctl.get("pool_allowlist"))
+                                for p in pools if isinstance(p, dict)):
+            return {"ip": ip, "ok": False, "msg": "矿池不在白名单，拒绝下发"}
     timeout = ctl.get("timeout", 8)
     passwords = [tuple(p) for p in cfg["scan"].get("passwords", [["root", "root"]])]
     uni_pw = ctl.get("uniplus_password", "")
@@ -232,10 +306,11 @@ def _run_group(group, action, params, cfg):
     return out
 
 
-def run_batch(targets, action, params, cfg, progress=None):
+def run_batch(targets, action, params, cfg, progress=None, before_group=None):
     """targets: [(ip, firmware), ...]；并发执行，返回结果列表。
     reboot 时按 control.reboot_* 打乱+分批+延迟，避免同变压器机器同时重启的浪涌跳闸。
-    progress(done, total) 可选回调(后台异步执行时上报进度)。"""
+    progress(done, total) 可选回调(后台异步执行时上报进度)。
+    before_group(ips) 可选回调：每组真正下发前调用(重启静默期按实际下发时间起算)。"""
     if action not in ACTIONS:
         return [], "不支持的命令"
     ctl = cfg.get("control", {})
@@ -249,12 +324,16 @@ def run_batch(targets, action, params, cfg, progress=None):
             random.shuffle(targets)   # 打乱：把同变压器的连号机器分散到不同批次/时间
         groups = [targets[i:i + batch] for i in range(0, len(targets), batch)]
         for gi, grp in enumerate(groups):
+            if before_group:
+                before_group([ip for ip, _fw in grp])
             out.extend(_run_group(grp, action, params, cfg))
             if progress:
                 progress(len(out), len(targets))
             if delay and gi < len(groups) - 1:
                 time.sleep(delay)
     else:
+        if before_group:
+            before_group([ip for ip, _fw in targets])
         out = _run_group(targets, action, params, cfg)
         if progress:
             progress(len(out), len(targets))
