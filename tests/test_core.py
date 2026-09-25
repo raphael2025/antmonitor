@@ -163,3 +163,26 @@ def test_apply_settings_revalidates_hand_edited_values(cfg):
     assert cfg["schedule"]["full_interval"] == 60
     assert cfg["schedule"]["container_interval"] == 5
     assert cfg["scan"]["discovery_workers"] == 1
+
+
+def test_scan_overall_timeout_returns_unknown_instead_of_raising(monkeypatch):
+    """整体超时必须走 unknown 兜底返回已探到的结果。Python 3.8~3.10 上
+    concurrent.futures.TimeoutError 不是内置 TimeoutError，只写 except TimeoutError
+    会让异常逃出去，整轮几千台的结果全部丢弃。"""
+    import time as _t
+    import miner_core
+    monkeypatch.setattr(miner_core, "probe",
+                        lambda ip, cfg, limiter=None: (_t.sleep(2), miner_core._blank(ip, "online"))[1])
+    orig = miner_core.as_completed
+    monkeypatch.setattr(miner_core, "as_completed", lambda fs, timeout=None: orig(fs, timeout=0.3))
+    out = miner_core.scan(["10.0.0.1", "10.0.0.2"], {"workers": 2})
+    assert sorted(r["status"] for r in out) == ["unknown", "unknown"]
+
+
+def test_scan_containers_overall_timeout_does_not_raise(monkeypatch):
+    import time as _t
+    import miner_core
+    monkeypatch.setattr(miner_core, "probe_antbox", lambda ip, a, b: _t.sleep(2))
+    orig = miner_core.as_completed
+    monkeypatch.setattr(miner_core, "as_completed", lambda fs, timeout=None: orig(fs, timeout=0.3))
+    assert miner_core.scan_containers(["10.0.0.9"], {}) == []
