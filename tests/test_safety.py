@@ -128,3 +128,61 @@ def test_saved_zero_pps_from_old_version_is_ignored_not_clamped_to_one():
     appconfig.apply_settings(cfg, {"max_pps": 0, "discovery_workers": 0})
     assert cfg["scan"]["max_pps"] == 120
     assert cfg["scan"]["discovery_workers"] == appconfig.DEFAULTS["scan"]["discovery_workers"]
+
+
+def test_backup_finds_db_when_started_from_another_directory(tmp_path, monkeypatch):
+    """计划任务没设"起始于"时 CWD 是 System32：以前按 CWD 找 config.yaml/库文件，
+    找不到就退出码 2，计划任务没人看输出 → 长期没有备份也没人知道。"""
+    base = tmp_path / "app"
+    base.mkdir()
+    (base / "config.yaml").write_text('db:\n  path: "data.db"\n', encoding="utf-8")
+    c = sqlite3.connect(base / "data.db")
+    c.execute("CREATE TABLE t (id INTEGER)")
+    c.commit()
+    c.close()
+    monkeypatch.setattr(backup_db, "BASE", str(base))
+    monkeypatch.delenv("MINER_CONFIG", raising=False)
+    elsewhere = tmp_path / "System32"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    src = backup_db._db_path()
+    assert src == str(base / "data.db")
+    out = backup_db._anchor("backups")
+    assert backup_db.backup(src, out, 3, "20260101_000000") == 0
+    assert (base / "backups" / "miner_monitor_20260101_000000.db").exists()
+
+
+def test_backup_that_fails_integrity_check_is_deleted(tmp_path, monkeypatch):
+    """校验失败的备份要删掉：留着会占一个保留名额，把一份好的旧备份挤出去。"""
+    src = tmp_path / "s.db"
+    c = sqlite3.connect(src)
+    c.execute("CREATE TABLE t (id INTEGER)")
+    c.commit()
+    c.close()
+    real = sqlite3.connect
+
+    class Bad:
+        def __init__(self, conn):
+            self.c = conn
+
+        def execute(self, sql):
+            if "integrity_check" in sql:
+                return type("R", (), {"fetchone": lambda s: ("*** corrupt ***",)})()
+            return self.c.execute(sql)
+
+        def close(self):
+            self.c.close()
+
+    seen = []
+
+    def fake_connect(p):   # 同一备份文件第 2 次连接 = 完整性校验那次
+        if str(p).endswith("_bad.db"):
+            seen.append(p)
+            if len(seen) == 2:
+                return Bad(real(p))
+        return real(p)
+
+    monkeypatch.setattr(backup_db.sqlite3, "connect", fake_connect)
+    out = tmp_path / "b"
+    assert backup_db.backup(str(src), str(out), 3, "x_bad") == 3
+    assert not (out / "miner_monitor_x_bad.db").exists()

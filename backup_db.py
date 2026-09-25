@@ -23,6 +23,14 @@ import yaml
 
 
 DEFAULT_DB = "miner_monitor.db"
+# 相对路径一律按本脚本所在目录(即程序目录)解析，不跟随 CWD：Windows 计划任务没填"起始于"
+# 时 CWD 是 C:\Windows\System32，按 CWD 找会读不到配置/库文件，备份静默失败且没人看输出。
+# 与 run.bat(先 cd 到程序目录再启动服务)下服务实际使用的库文件位置一致
+BASE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _anchor(path):
+    return path if os.path.isabs(path) else os.path.join(BASE, path)
 
 
 def _db_path():
@@ -30,16 +38,16 @@ def _db_path():
 
     以前这里硬编码 "config.yaml" 且吞掉所有异常，部署环境用 MINER_CONFIG 指向
     别处时会静默备份错误/过期的库文件——出问题时完全无感知。"""
-    cfg_path = os.environ.get("MINER_CONFIG", "config.yaml")
+    cfg_path = _anchor(os.environ.get("MINER_CONFIG", "config.yaml"))
     try:
         with open(cfg_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-        return (cfg.get("db") or {}).get("path", DEFAULT_DB)
+        return _anchor((cfg.get("db") or {}).get("path", DEFAULT_DB))
     except (OSError, yaml.YAMLError, AttributeError) as e:
         print(f"[WARN] 读取配置失败 {cfg_path}: {e}")
-        print(f"[WARN] 回退到默认数据库路径 {DEFAULT_DB}；"
+        print(f"[WARN] 回退到默认数据库路径 {_anchor(DEFAULT_DB)}；"
               f"若实际库不在此处请用 --src 指定或检查 MINER_CONFIG")
-        return DEFAULT_DB
+        return _anchor(DEFAULT_DB)
 
 
 def _rm_partial(path):
@@ -87,16 +95,20 @@ def backup(src, out_dir, keep, stamp):
         _rm_partial(dst)
         return 3
 
-    # 2) 完整性校验
-    chk = sqlite3.connect(dst)
+    # 2) 完整性校验：不通过/校验本身出错都删掉这份——留着会占一个保留名额，把好的旧备份挤出去
     try:
-        res = chk.execute("PRAGMA integrity_check").fetchone()[0]
-    finally:
-        chk.close()
-    size_mb = os.path.getsize(dst) / 1e6
+        chk = sqlite3.connect(dst)
+        try:
+            res = chk.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            chk.close()
+    except sqlite3.Error as e:
+        res = f"校验出错: {e}"
     if res != "ok":
         print(f"[ERR] 备份完整性校验失败: {dst} -> {res}")
+        _rm_partial(dst)
         return 3
+    size_mb = os.path.getsize(dst) / 1e6
     print(f"[OK] 备份成功 {dst}  ({size_mb:.1f} MB, integrity_check=ok)")
 
     # 3) 滚动保留：只留最近 keep 份
@@ -119,6 +131,7 @@ def main():
     ap.add_argument("--keep", type=int, default=14, help="保留份数")
     args = ap.parse_args()
     src = args.src or _db_path()
+    args.dir = _anchor(args.dir)
     # 时间戳由系统提供(脚本是一次性运行，非长驻，可安全用 time)
     stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
     sys.exit(backup(src, args.dir, args.keep, stamp))
