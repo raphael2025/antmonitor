@@ -345,6 +345,12 @@ class MonitorService:
             first_run = db.latest_scan(self.conn) is None
             sid, ts, kept = db.save_scan(self.conn, kind, miners,
                                          keep_ips=(None if first_run else roster))
+            # 矿池地址不落库(列表且只用于本轮防篡改检查)，但 kept 是按库列重建的干净记录，
+            # 要带回去，否则 alerts 永远看不到 pools、矿池篡改告警形同虚设
+            pools_by_ip = {r["ip"]: r["pools"] for r in miners if r.get("pools") is not None}
+            for r in kept:
+                if r["ip"] in pools_by_ip:
+                    r["pools"] = pools_by_ip[r["ip"]]
             self._publish(sid, ts, kind, kept)
             online_recs = [r for r in miners if r["status"] == "online"]
             online_ips = {r["ip"] for r in online_recs}

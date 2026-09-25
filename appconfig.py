@@ -78,7 +78,10 @@ DEFAULTS = {
     "control": {
         "enabled": False, "uniplus_password": "", "timeout": 8, "max_batch": 1000,
         "reboot_concurrency": 30, "reboot_delay_sec": 8, "reboot_shuffle": True,
-        "reboot_grace_sec": 600,   # 下发重启后这么久内掉线不报警；过了仍不在线报"重启后未上线"
+        "reboot_grace_sec": 600,
+        # 允许换到的矿池主机名(含子域名)。只能在 config.yaml 配置，网页改不了。
+        # 为空 = 禁止网页换矿池、也不做矿池篡改告警
+        "pool_allowlist": [],   # 下发重启后这么久内掉线不报警；过了仍不在线报"重启后未上线"
     },
     "auth": {"enabled": True, "secure_cookie": False, "users": []},
     "update": {"auto": False, "branch": "", "check_interval": 3600},

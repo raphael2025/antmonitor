@@ -214,6 +214,7 @@ function announceCounts(counts) {
   const n = (t) => counts[t] || 0;
   const cooler = Object.keys(counts).filter(t => t.startsWith("cooler")).reduce((s, t) => s + counts[t], 0);
   const parts = [];
+  if (n("pool_hijack")) parts.push(`矿池被篡改 ${n("pool_hijack")} 台，请立即核查`);
   if (n("stalled")) parts.push("监控停滞");
   if (n("segment_down")) parts.push(`${n("segment_down")} 个网段掉线`);
   if (n("offline")) parts.push(`掉线 ${n("offline")} 台`);

@@ -261,3 +261,14 @@ def test_reconfirm_keeps_the_best_result_across_passes(svc, monkeypatch):
     _m, records = svc.latest()
     assert {r["ip"]: r["status"] for r in records}[A] == "online"
     assert db.active_alert(svc.conn, A, "offline") is None
+
+
+def test_pool_hijack_alert_through_real_scan_pipeline(svc, monkeypatch):
+    """pools 不落库，但必须一路带到告警评估(save_scan 返回的是按库列重建的记录)。"""
+    svc.cfg["control"]["pool_allowlist"] = ["f2pool.com"]
+    monkeypatch.setattr(miner_core, "scan", fake_scan([
+        rec("10.9.0.1", pools=["stratum+tcp://btc.f2pool.com:3333"]),
+        rec("10.9.0.2", pools=["stratum+tcp://evil.example:3333"])]))
+    svc.scan_full("full")
+    hijacked = {a["ip"] for a in db.active_alerts_by_type(svc.conn, "pool_hijack")}
+    assert hijacked == {"10.9.0.2"}

@@ -357,7 +357,10 @@ def fetch_pool(ip, timeout):
             acc += int(p.get("Accepted") or p.get("accepted") or 0)
             rej += int(p.get("Rejected") or p.get("rejected") or 0)
             stl += int(p.get("Stale") or p.get("stale") or 0)
-        return {"worker": worker, "accepted": acc, "rejected": rej, "stale": stl}
+        # 全部配置的矿池地址(含备用/失活池)：换池防篡改检查用。攻击者常把自己的池塞在备用位
+        urls = [str(p.get("URL") or p.get("url") or "").strip() for p in sorted(pools, key=_prio)]
+        return {"worker": worker, "accepted": acc, "rejected": rej, "stale": stl,
+                "pools": [u for u in urls if u]}
     except Exception:
         return None
     finally:
@@ -504,6 +507,7 @@ def probe(ip, cfg, limiter=None):
             rec["accepted"] = pi.get("accepted")
             rec["rejected"] = pi.get("rejected")
             rec["stale"] = pi.get("stale")
+            rec["pools"] = pi.get("pools") or []   # 只在内存/本轮使用，不落库
     return rec
 
 

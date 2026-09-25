@@ -18,12 +18,13 @@ import requests
 import db
 import logs
 import miner_core
+from control import pool_allowed as control_pool_allowed, pool_host as control_pool_host
 
 log = logs.get(__name__)
 
 # 本模块产生的全部告警类型（启动清理旧类型时作为白名单）
 MINER_TYPES = ("offline", "zero", "reject", "low_hashrate", "overheat",
-               "segment_down", "stalled")
+               "segment_down", "stalled", "pool_hijack")
 
 # ---- 推送队列：发送失败/慢不影响扫描 ----
 _push_q = queue.Queue(maxsize=200)
@@ -129,6 +130,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     lo_peers = max(1, int(acfg.get("low_hashrate_min_peers", 5)))
     hot_c = acfg.get("overheat_c", 95)
     hot_clear = acfg.get("overheat_clear_c", 90)
+    pool_allow = [a for a in (cfg.get("control", {}).get("pool_allowlist") or []) if str(a).strip()]
     roster_age = cfg.get("scan", {}).get("roster_retention_days", 7)
     now = int(time.time())
 
@@ -265,6 +267,18 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                 # 未静音：滞回消警(中间区间 [hot_clear, hot_c) 维持原状态)
                 # 维修中/整段掉线静音：无条件消掉已有高温告警，与 zero/reject 一致
                 b.resolve(ip, "overheat")
+
+        # 矿池防篡改：矿机上配置了白名单外的矿池(含备用池) → 严重告警，不受维修/网段静音。
+        # 覆盖"绕过面板直接用 root/root 登矿机改池"这条面板管不到的路径
+        pools = r.get("pools")
+        if pool_allow and pools is not None:
+            bad = sorted({control_pool_host(u) or u for u in pools
+                          if not control_pool_allowed(u, pool_allow)})
+            if bad:
+                b.fire(ip, "pool_hijack", "crit",
+                       f"{ip} 矿池不在白名单(疑似被篡改偷算力): {', '.join(bad)[:200]}")
+            else:
+                b.resolve(ip, "pool_hijack")
 
         # 拒绝率（矿池健康）
         if rej_thresh and rej_thresh > 0 and (r.get("accepted") is not None

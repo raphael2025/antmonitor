@@ -869,8 +869,12 @@ def prune(conn, retention_days, roster_days=7, rollup_days=400):
         conn.execute("DELETE FROM known_miners WHERE last_online<? AND state='active'",
                      (roster_cut,))
         conn.execute("DELETE FROM worker_hourly WHERE hour<?", (rollup_cut,))
-        conn.execute("DELETE FROM command_log WHERE id NOT IN "
-                     "(SELECT id FROM command_log ORDER BY id DESC LIMIT 5000)")
+        # 审计：定位灯/维修标记这类高频低价值记录按条数只留最近 5000；重启/换矿池/下架/
+        # 被拒绝的命令按时间长期保留——否则批量点几次"维修中"就能把换矿池记录冲掉
+        low = "action IN ('locate','state:repair','state:active')"
+        conn.execute(f"DELETE FROM command_log WHERE {low} AND id NOT IN "
+                     f"(SELECT id FROM command_log WHERE {low} ORDER BY id DESC LIMIT 5000)")
+        conn.execute(f"DELETE FROM command_log WHERE NOT ({low}) AND ts<?", (rollup_cut,))
     return len(old)
 
 

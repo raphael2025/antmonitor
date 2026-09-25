@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.gzip import GZipMiddleware
 
+import alerts
 import appconfig
 import auth
 import cloud_alert_summary
@@ -954,6 +955,31 @@ CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
 _cmd_lock = threading.Lock()
 
 
+def _pools_desc(params):
+    return "; ".join(f'{p.get("url")} {p.get("user")}' for p in
+                     (params or {}).get("pools") or [] if isinstance(p, dict))[:300]
+
+
+def _record_command(user, action, params, results):
+    """审计 + 推送。换矿池把完整矿池地址/矿工名写进每条审计(以前只记 "pools updated"，
+    事后查不出被换到了哪个池)；重启/换矿池都推一条 Telegram，值班群里有人知道谁干了什么。"""
+    if action == "set_pools":
+        desc = _pools_desc(params)
+        for r in results:
+            r["msg"] = f'{r["msg"]} | {desc}'[:500]
+    db.log_commands(SVC.conn, user, action, results)
+    if action in DESTRUCTIVE_ACTIONS and results:
+        ok_n = sum(1 for r in results if r["ok"])
+        name = {"reboot": "重启", "set_pools": "换矿池"}[action]
+        text = f"⚙ {user} {name} {len(results)} 台(成功 {ok_n})"
+        if action == "set_pools":
+            text += f"\n矿池: {_pools_desc(params)}"
+        try:
+            alerts.push_text(CFG, text)
+        except Exception:  # noqa: BLE001
+            log.exception("命令推送失败")
+
+
 def _run_command_bg(targets, action, params, user):
     try:
         def prog(done, total):
@@ -962,7 +988,7 @@ def _run_command_bg(targets, action, params, user):
         results, _err = control.run_batch(targets, action, params, CFG, progress=prog,
                                           before_group=SVC.mark_rebooting)
         SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
-        db.log_commands(SVC.conn, user, action, results)
+        _record_command(user, action, params, results)
         ok_n = sum(1 for r in results if r["ok"])
         CMD_PROGRESS["success"] = ok_n
         CMD_PROGRESS["failed"] = len(results) - ok_n
@@ -982,13 +1008,13 @@ def api_command_progress(_: dict = Depends(require_ops)):
 
 
 @app.post("/api/command")
-def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
+def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(require_ops)):
     """远程命令：{ips:[...], action:"reboot|locate|set_pools", params:{...}, confirm:true}
 
     reboot/set_pools 属破坏性操作，请求体必须显式带 confirm:true（前端"确认执行"弹窗
     负责补上），否则 400。locate 等只读/无害动作不需要。
     """
-    user = sess.get("user", "?")
+    user = f'{sess.get("user", "?")}@{_client_ip(request)}'   # 审计带来源 IP：共用账号时也能追到哪台电脑
     action = body.get("action")
     if not CFG.get("control", {}).get("enabled", False):
         _audit_reject(user, action, "控制功能未启用")
@@ -1036,6 +1062,27 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
                 _audit_reject(user, action, "矿池缺 user")
                 return JSONResponse({"ok": False, "error": "每个矿池需填矿工名(user)"},
                                     status_code=400)
+        # 矿池白名单：换池 = 把算力送走，账号被盗/内鬼一次就能偷全场。白名单只能在监控电脑的
+        # config.yaml 里改，网页(包括 admin)改不了
+        allow = CFG.get("control", {}).get("pool_allowlist") or []
+        if not allow:
+            _audit_reject(user, action, f"未配置矿池白名单: {_pools_desc(params)}")
+            return JSONResponse({"ok": False, "error":
+                                 "未配置矿池白名单，网页换矿池已禁用。请在监控电脑的 config.yaml 里"
+                                 "配置 control.pool_allowlist(如 [\"f2pool.com\"])后重启服务"},
+                                status_code=403)
+        bad = [p["url"] for p in pools if not control.pool_allowed(p["url"], allow)]
+        if bad:
+            _audit_reject(user, action, f"矿池不在白名单: {', '.join(bad)[:300]}")
+            log.warning("换矿池被拒(不在白名单): %s 发起人 %s", bad, user)
+            try:
+                alerts.push_text(CFG, f"🔴 {user} 试图把矿机换到白名单外的矿池，已拒绝: "
+                                      f"{', '.join(bad)[:300]}")
+            except Exception:  # noqa: BLE001
+                pass
+            return JSONResponse({"ok": False, "error":
+                                 f"矿池不在白名单，已拒绝: {', '.join(bad)[:200]}"},
+                                status_code=403)
     # 从最近快照取每台固件类型，避免重复探测
     _, recs = _latest_records()
     fw_map = {r["ip"]: r["firmware"] for r in recs}
@@ -1075,7 +1122,7 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
         results, err = control.run_batch(targets, action, params, CFG)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
-    db.log_commands(SVC.conn, user, action, results)
+    _record_command(user, action, params, results)
     ok_n = sum(1 for r in results if r["ok"])
     return {"ok": True, "action": action, "success": ok_n,
             "failed": len(results) - ok_n, "results": results}

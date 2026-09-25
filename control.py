@@ -22,6 +22,30 @@ import miner_core
 ACTIONS = {"reboot", "locate", "set_pools"}
 
 
+def pool_host(url):
+    """stratum+tcp://Host:3333/xx → host(小写)；解析不出返回 ""。"""
+    s = str(url or "").strip()
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    s = s.split("/", 1)[0].split("@")[-1]
+    if s.startswith("["):                      # [ipv6]:port
+        return s[1:s.find("]")].lower() if "]" in s else ""
+    return s.rsplit(":", 1)[0].lower() if ":" in s else s.lower()
+
+
+def pool_allowed(url, allowlist):
+    """矿池地址是否在白名单内。白名单项 "f2pool.com" 同时放行其子域名(btc.f2pool.com)，
+    但不放行 evilf2pool.com / f2pool.com.evil.io。白名单为空 → 一律不放行。"""
+    host = pool_host(url)
+    if not host:
+        return False
+    for a in allowlist or []:
+        a = str(a).strip().lower().lstrip("*.").rstrip(".")
+        if a and (host == a or host.endswith("." + a)):
+            return True
+    return False
+
+
 def _seg_prefix(seg):
     """把一条网段配置(如 "172.16.5" / "172.16.5.x")归一成 "172.16.5"；非法返回 None。
 
@@ -243,6 +267,11 @@ def run_one(ip, firmware, action, params, cfg):
     ctl = cfg.get("control", {})
     if not ctl.get("enabled", False):
         return {"ip": ip, "ok": False, "msg": "控制功能未启用"}
+    if action == "set_pools":   # 纵深防御：无论谁调到这里，白名单外的矿池一律不下发
+        pools = (params or {}).get("pools") or []
+        if not pools or not all(pool_allowed(p.get("url"), ctl.get("pool_allowlist"))
+                                for p in pools if isinstance(p, dict)):
+            return {"ip": ip, "ok": False, "msg": "矿池不在白名单，拒绝下发"}
     timeout = ctl.get("timeout", 8)
     passwords = [tuple(p) for p in cfg["scan"].get("passwords", [["root", "root"]])]
     uni_pw = ctl.get("uniplus_password", "")
