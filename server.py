@@ -184,7 +184,8 @@ def api_login(request: Request, response: Response, body: dict = Body(...)):
     src = _client_ip(request)
     if auth.locked(src):
         return JSONResponse({"ok": False, "error": "失败次数过多，请稍后再试"}, status_code=429)
-    token, why = auth.login_ex(CFG, body.get("username", ""), body.get("password", ""), src=src)
+    token, why = auth.login_ex(CFG, body.get("username", ""), body.get("password", ""), src=src,
+                               local=_is_console(request, src))
     if not token:
         log.warning("登录失败: user=%r from=%s (%s)", str(body.get("username", ""))[:32], src, why)
         why = (why or "用户名或密码错误").replace("端口", str(CFG["server"]["port"]))
@@ -1248,10 +1249,50 @@ def _host_name(host_header):
     return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
 
 
+_MY_NAMES = None
+
+
+def _my_names():
+    """本机名只取一次：getfqdn() 在 Windows 上可能做反向 DNS，每个请求都查会卡几秒。"""
+    global _MY_NAMES
+    if _MY_NAMES is None:
+        import socket
+        names = {"localhost"}
+        for f in (socket.gethostname, socket.getfqdn):
+            try:
+                names.add(f().lower().rstrip("."))
+            except OSError:
+                pass
+        _MY_NAMES = names
+    return _MY_NAMES
+
+
+def _via_trusted_proxy(request):
+    peer = request.client.host if request.client else ""
+    if not (_TRUSTED and peer):
+        return False
+    try:
+        return any(ipaddress.ip_address(peer) in n for n in _TRUSTED)
+    except ValueError:
+        return False
+
+
+_PROXY_HEADERS = ("x-forwarded-for", "x-real-ip", "forwarded", "x-forwarded-host")
+
+
+def _is_console(request, src):
+    """是不是坐在监控电脑前的人：来源是回环地址 + 没有代理头 + 用 127.0.0.1/localhost 打开。
+    同机跑着 nginx/frp(http) 转发时，外部请求也来自 127.0.0.1，但会带代理头/外部 Host，
+    不能当本机(否则"弱口令只准本机登录"和"本机不锁"都能被远程绕过)。"""
+    if not auth.is_local(src) or any(h in request.headers for h in _PROXY_HEADERS):
+        return False
+    name = _host_name(request.headers.get("host", ""))
+    return name in ("localhost", "::1") or name.startswith("127.")
+
+
 def _host_ok(host_header):
     """防 DNS 重绑定：恶意网页把自己的域名解析到 127.0.0.1/本机 IP 后就成了"同源"，
     能在运维浏览器里调接口。只放行 IP 字面量、localhost、本机名和 server.allowed_hosts。"""
-    import socket
     name = _host_name(host_header).rstrip(".")
     if not name:
         return False
@@ -1260,7 +1301,7 @@ def _host_ok(host_header):
         return True
     except ValueError:
         pass
-    allowed = {"localhost", socket.gethostname().lower(), socket.getfqdn().lower()}
+    allowed = set(_my_names())
     allowed |= {str(x).strip().lower().rstrip(".")
                 for x in CFG["server"].get("allowed_hosts") or []}
     return "*" in allowed or name in allowed
@@ -1278,13 +1319,14 @@ async def _request_guard(request: Request, call_next):
     """所有请求先过这道：Host 白名单(防 DNS 重绑定) + 写请求防跨站(CSRF)。
     正常用 IP/本机名打开面板的运维完全无感。"""
     host = request.headers.get("host", "")
-    if not _host_ok(host):
+    proxied = _via_trusted_proxy(request)   # 经 trusted_proxies 里的 nginx/frp 进来：Host 是对外域名
+    if not proxied and not _host_ok(host):
         return JSONResponse({"ok": False, "error":
                              f"不允许用 {_host_name(host)[:64]} 访问：请用 IP 打开面板，或把该域名加到 "
                              "config.yaml 的 server.allowed_hosts"}, status_code=400)
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         origin = request.headers.get("origin")
-        if origin and not _same_origin(origin, host):   # 别的网站页面发来的写请求
+        if origin and not proxied and not _same_origin(origin, host):   # 别的网站页面发来的写请求
             log.warning("拒绝跨站写请求: %s %s Origin=%s", request.method, request.url.path,
                         origin[:100])
             return JSONResponse({"ok": False, "error": "跨站请求已拒绝"}, status_code=403)

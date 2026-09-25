@@ -141,11 +141,13 @@ def locked(src):
         return bool(rec and rec[1] > time.time())
 
 
-def login_ex(cfg, username, password, src=None):
-    """返回 (token, "") 或 (None, 给用户看的原因)。src: 客户端 IP。"""
+def login_ex(cfg, username, password, src=None, local=None):
+    """返回 (token, "") 或 (None, 给用户看的原因)。src: 客户端 IP。
+    local: 是否坐在监控电脑前(服务端结合代理头/Host 判断后传入)；不传则只按 src 判。"""
     now = time.time()
-    local = is_local(src)
+    local = is_local(src) if local is None else bool(local)
     uname = username if isinstance(username, str) else None
+    known = uname in _users(cfg) if uname else False
     with _slock:
         rec = _fails.get(src) if src else None
         if rec and rec[1] > now:
@@ -160,7 +162,7 @@ def login_ex(cfg, username, password, src=None):
             rec[0] += 1
             if rec[0] >= _MAX_FAILS:
                 rec[1], rec[0] = now + _LOCK_SEC, 0
-        if uname and not local:
+        if known and not local:   # 只给真实存在的账号计数：随机用户名不能把这张表撑爆
             urec = _ufails.setdefault(uname, [0, 0, now])
             if now - urec[2] > _USER_LOCK_SEC:           # 计数窗口过期，重新计
                 urec[0], urec[2] = 0, now

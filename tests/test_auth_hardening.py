@@ -112,3 +112,30 @@ def test_web_password_change_forces_weak_session_through_and_writes_config(monke
     tok2, _ = auth.login_ex(server.CFG, "weakops", "N3w-Strong-Pw", src="10.0.0.5")
     assert tok2                                                          # 改完就能远程登录
     c.close()
+
+
+def test_random_usernames_do_not_grow_the_user_lock_table(monkeypatch):
+    monkeypatch.setattr(auth, "_verify_password", lambda stored, pw: False)   # 只测计数表，不跑真哈希
+    cfg = _cfg(STRONG)
+    for i in range(500):
+        auth.login_ex(cfg, f"nobody{i}", "x", src=f"10.2.{i // 250}.{i % 250 + 1}")
+    assert len(auth._ufails) == 0
+
+
+def test_loopback_behind_local_reverse_proxy_is_not_the_console(monkeypatch):
+    """同机 nginx/frp 转发：外部请求也来自 127.0.0.1，但不能享受"本机"待遇。"""
+    import importlib
+    from pathlib import Path
+    monkeypatch.setenv("MINER_CONFIG", str(Path(__file__).with_name("server_config.yaml")))
+    server = importlib.import_module("server")
+
+    class Req:
+        def __init__(self, headers):
+            self.headers = headers
+
+    assert server._is_console(Req({"host": "127.0.0.1:8800"}), "127.0.0.1")
+    assert server._is_console(Req({"host": "localhost:8800"}), "127.0.0.1")
+    assert not server._is_console(Req({"host": "127.0.0.1:8800", "x-forwarded-for": "8.8.8.8"}),
+                                  "127.0.0.1")
+    assert not server._is_console(Req({"host": "miners.example.com"}), "127.0.0.1")
+    assert not server._is_console(Req({"host": "127.0.0.1:8800"}), "192.168.1.9")

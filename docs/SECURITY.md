@@ -93,6 +93,15 @@ icacls C:\miner-monitor /inheritance:r /grant:r "Administrators:(OI)(CI)F" "SYST
 - 如果监控电脑开了远程桌面（RDP），务必用强密码。
 - 3389 端口同样只放行运维电脑。
 
+### 别把面板直接暴露到公网
+
+- 要远程看，优先走 VPN。
+- 如果非要用 nginx 或 frp 从外网访问：
+  - 把代理的地址加到 `server.trusted_proxies`。
+  - 用 http 方式转发，让代理带上 `X-Forwarded-For` 头。
+- **不要用 frp 的 tcp 方式直接转发到本机 8800**。那样外网来的请求在程序看来和"坐在监控电脑前"一模一样，
+  "弱密码只能本机登录"这道保护就失效了。
+
 ---
 
 ## 四、HTTPS（可选：防局域网里有人抓包偷密码）
