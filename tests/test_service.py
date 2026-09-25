@@ -287,3 +287,15 @@ def test_container_refresh_is_not_blocked_by_a_running_miner_scan(svc, monkeypat
     finally:
         svc._scan_lock.release()
     assert called == [["10.9.0.200"]]
+
+
+def test_watchdog_notices_a_stalled_scanner_within_15_minutes_by_default(svc):
+    """以前阈值取 full_interval×1.5 = 90 分钟：巡检卡死一个半小时才告警/自愈。
+    空闲时 last_finished 每个巡检间隔就会刷新，扫描中另有进度心跳，全扫间隔不是耗时。"""
+    import time as _t
+    now = _t.time()
+    assert svc._stale_threshold() <= 15 * 60
+    svc.progress.update(running=False, last_finished=now - 16 * 60, loop_beat=now)
+    assert svc.is_stale(now)
+    svc.progress.update(last_finished=now - 60)
+    assert not svc.is_stale(now)
