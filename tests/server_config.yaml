@@ -1,3 +1,5 @@
+server:
+  allowed_hosts: ["testserver"]
 schedule:
   enabled: false
 db:

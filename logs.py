@@ -19,6 +19,7 @@ import 顺序决定了惰性 setup(None) 往往先于入口拿到 config.yaml，
 """
 import logging
 import os
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 
@@ -86,6 +87,20 @@ def setup(cfg=None):
         lg = logging.getLogger(name)
         lg.handlers = []
         lg.propagate = True
+    acc = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, _MaskSecrets) for f in acc.filters):
+        acc.addFilter(_MaskSecrets())
+
+
+class _MaskSecrets(logging.Filter):
+    """访问日志里的 ?token=... 打码：能读日志文件的人不该顺手拿到公共 API token。"""
+    _re = re.compile(r"((?:token|password|pw)=)[^&\s]+", re.I)
+
+    def filter(self, record):
+        if isinstance(record.args, tuple):
+            record.args = tuple(self._re.sub(r"\1***", a) if isinstance(a, str) else a
+                                for a in record.args)
+        return True
 
 
 def get(name):

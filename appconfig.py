@@ -100,6 +100,10 @@ DEFAULTS = {
         # 前置 nginx/frp 时填代理的IP(或CIDR)，才会信任 X-Forwarded-For 取真实客户端IP。
         # 留空=不信任任何代理(直连部署的正确选择，防伪造头绕过登录限流)
         "trusted_proxies": [],
+        # 除 IP/localhost/本机名外，允许用来访问面板的域名(防 DNS 重绑定)。用内网域名访问时填
+        "allowed_hosts": [],
+        # 填上证书/私钥路径即启用 HTTPS(局域网防嗅探口令和会话)，登录 Cookie 自动加 Secure
+        "tls_cert": "", "tls_key": "",
     },
     "public_api": {"token": ""},
     "logging": {"level": "INFO", "file": "", "max_mb": 20, "backups": 5},

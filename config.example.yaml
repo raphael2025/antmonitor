@@ -134,6 +134,12 @@ server:
   # 留空=不信任任何代理(直连部署的正确选择)。不填而前面有代理 → 登录限流会按代理IP
   # 算成一个人，一人爆破锁死所有人；乱填 → 任何人加个伪造头就能绕过限流。
   trusted_proxies: []        # 如 ["10.0.0.5", "192.168.1.0/24"]
+  # 用 IP / localhost / 本机计算机名访问面板不用配；用内网域名(如 miner.farm.lan)访问时填上，
+  # 否则会被拒(防恶意网页用 DNS 重绑定冒充本机)
+  allowed_hosts: []
+  # 启用 HTTPS(防局域网嗅探口令/会话)：填证书和私钥路径，见 docs/SECURITY.md 生成自签证书
+  tls_cert: ""
+  tls_key: ""
 
 public_api:
   # 外部 Agent 取数用的共享 Token。留空 = 整组 /api/public/* 返回 404(fail-closed)

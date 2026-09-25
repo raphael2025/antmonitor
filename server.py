@@ -192,7 +192,8 @@ def api_login(request: Request, response: Response, body: dict = Body(...)):
     s = auth.session(token)
     # secure_cookie: 走 HTTPS 时设为 true；纯内网 HTTP 保持 false 否则 cookie 不发
     response.set_cookie(auth.COOKIE, token, httponly=True, samesite="lax",
-                        secure=bool(CFG.get("auth", {}).get("secure_cookie", False)),
+                        secure=bool(CFG.get("auth", {}).get("secure_cookie", False)
+                                    or _tls_files()),
                         max_age=auth.TTL)
     log.info("登录成功: %s (%s) from %s%s", s["user"], s["role"], src,
              " [弱口令，须改密码]" if s.get("must_change") else "")
@@ -252,6 +253,11 @@ def _broadcast_threadsafe(payload):
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
+    host = websocket.headers.get("host", "")
+    origin = websocket.headers.get("origin")
+    if not _host_ok(host) or (origin and not _same_origin(origin, host)):   # 防跨站 WebSocket 劫持
+        await websocket.close(code=1008)
+        return
     sess = auth.current(CFG, websocket.cookies.get(auth.COOKIE, ""))
     if not sess:
         await websocket.close(code=1008)
@@ -693,8 +699,12 @@ def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(re
         days = round(eff / 24, 1)
         w.writerow([f"客户报表  数据覆盖近 {days} 天" + ("（已按可用数据截断）" if truncated else "")])
         w.writerow(["客户(矿工名)", "机器数", "可用率%", "交付算力(TH·h)", "耗电(kWh)"])
+        def cell(v):   # 矿工名来自矿机(可被篡改)：= + - @ 开头会被 Excel 当公式执行
+            s = str(v or "")
+            return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
+
         for r in rows:
-            w.writerow([r["worker"], r["machines"], r["uptime_pct"],
+            w.writerow([cell(r["worker"]), r["machines"], r["uptime_pct"],
                         r["delivered_th_h"], r["power_kwh"]])
         return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition":
@@ -869,6 +879,16 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
         if cl["url"] and not cl["url"].startswith(("http://", "https://")):
             return JSONResponse({"ok": False, "error": "云端地址须以 http:// 或 https:// 开头"},
                                 status_code=400)
+        if cl["url"].startswith("http://"):   # 明文上报会暴露 token 和场地数据；只放行内网调试地址
+            h = _host_name(cl["url"][7:].split("/", 1)[0])
+            try:
+                ip = ipaddress.ip_address(h)
+                private = ip.is_private or ip.is_loopback
+            except ValueError:
+                private = h == "localhost"
+            if not private:
+                return JSONResponse({"ok": False, "error": "公网云端地址必须用 https://"},
+                                    status_code=400)
         s["cloud"] = cl
     ranges = {"scan_interval": (30, 86400), "full_interval": (60, 604800),
               "container_interval": (5, 3600), "max_pps": (0, 2000),
@@ -898,17 +918,28 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
 
 @app.post("/api/segments")
 def api_segments_save(body: dict = Body(...), _: dict = Depends(require_admin)):
-    norm = []
+    norm, bad = [], []
     for s in (body.get("segments") or []):
         parts = str(s).strip().split(".")
         if len(parts) < 3:
             continue
-        base = ".".join(parts[:3])
-        try:
-            if all(0 <= int(x) <= 255 for x in base.split(".")) and base not in norm:
-                norm.append(base)
-        except ValueError:
-            pass
+        # 只收 ASCII 数字并规范化(172.016.005 → 172.16.5)：前导 0 会被系统当八进制解析，
+        # 扫的就不是你以为的网段；全角/其它数字字符 int() 也认，得挡掉
+        if not all(x.isascii() and x.isdigit() and int(x) <= 255 for x in parts[:3]):
+            bad.append(str(s)[:32])
+            continue
+        base = ".".join(str(int(x)) for x in parts[:3])
+        # 只允许内网网段：扫描/命令会带着矿机口令去连这些地址，加进公网段等于把口令送出去
+        net = ipaddress.ip_address(base + ".1")
+        if not (net.is_private or net in ipaddress.ip_network("100.64.0.0/10")) \
+                or net.is_loopback or net.is_link_local or net.is_multicast:
+            bad.append(str(s)[:32])
+            continue
+        if base not in norm:
+            norm.append(base)
+    if bad:
+        return JSONResponse({"ok": False, "error": "以下网段无效或不是内网地址: " + "、".join(bad[:5])},
+                            status_code=400)
     try:
         hs = max(1, min(254, int(body.get("host_start", 1))))
         he = max(hs, min(254, int(body.get("host_end", 254))))
@@ -1210,6 +1241,63 @@ def index():
     return FileResponse(os.path.join(WEB_DIR, "index.html"))
 
 
+def _host_name(host_header):
+    h = str(host_header or "").strip().lower()
+    if h.startswith("["):
+        return h[1:h.find("]")] if "]" in h else h
+    return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _host_ok(host_header):
+    """防 DNS 重绑定：恶意网页把自己的域名解析到 127.0.0.1/本机 IP 后就成了"同源"，
+    能在运维浏览器里调接口。只放行 IP 字面量、localhost、本机名和 server.allowed_hosts。"""
+    import socket
+    name = _host_name(host_header).rstrip(".")
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    allowed = {"localhost", socket.gethostname().lower(), socket.getfqdn().lower()}
+    allowed |= {str(x).strip().lower().rstrip(".")
+                for x in CFG["server"].get("allowed_hosts") or []}
+    return "*" in allowed or name in allowed
+
+
+def _same_origin(origin, host_header):
+    o = str(origin or "").strip().lower()
+    if "://" not in o:
+        return False
+    return o.split("://", 1)[1].split("/", 1)[0] == str(host_header or "").strip().lower()
+
+
+@app.middleware("http")
+async def _request_guard(request: Request, call_next):
+    """所有请求先过这道：Host 白名单(防 DNS 重绑定) + 写请求防跨站(CSRF)。
+    正常用 IP/本机名打开面板的运维完全无感。"""
+    host = request.headers.get("host", "")
+    if not _host_ok(host):
+        return JSONResponse({"ok": False, "error":
+                             f"不允许用 {_host_name(host)[:64]} 访问：请用 IP 打开面板，或把该域名加到 "
+                             "config.yaml 的 server.allowed_hosts"}, status_code=400)
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("origin")
+        if origin and not _same_origin(origin, host):   # 别的网站页面发来的写请求
+            log.warning("拒绝跨站写请求: %s %s Origin=%s", request.method, request.url.path,
+                        origin[:100])
+            return JSONResponse({"ok": False, "error": "跨站请求已拒绝"}, status_code=403)
+        # 带请求体的写请求必须是 JSON：表单/text/plain/无类型的 Blob 是跨站伪造请求的
+        # 常用手法(不触发预检)，而面板前端只发 application/json
+        has_body = request.headers.get("content-length", "0") not in ("", "0") \
+            or "transfer-encoding" in request.headers
+        ctype = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if has_body and ctype != "application/json":
+            return JSONResponse({"ok": False, "error": "请求体必须是 JSON"}, status_code=415)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _no_cache_static(request: Request, call_next):
     """前端文件禁强缓存(每次向服务器复核, 未变返回304)——否则更新版本后浏览器
@@ -1222,6 +1310,14 @@ async def _no_cache_static(request: Request, call_next):
 
 if os.path.isdir(WEB_DIR):
     app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
+
+
+def _tls_files():
+    """(cert, key)：两个都配了且文件存在才启用 HTTPS，否则 None。"""
+    c, k = CFG["server"].get("tls_cert") or "", CFG["server"].get("tls_key") or ""
+    if c and k and os.path.isfile(c) and os.path.isfile(k):
+        return c, k
+    return None
 
 
 def _local_ipv4s():
@@ -1250,13 +1346,14 @@ def _announce_and_open_browser(host, port):
     run.bat 守护重启(含自动更新)时会带 MINER_NO_BROWSER=1，不会每次重启都弹一个新窗口。"""
     import socket
     import webbrowser
-    local_url = f"http://127.0.0.1:{port}" if host in ("0.0.0.0", "", "127.0.0.1") \
-        else f"http://{host}:{port}"
+    scheme = "https" if _tls_files() else "http"
+    local_url = f"{scheme}://127.0.0.1:{port}" if host in ("0.0.0.0", "", "127.0.0.1") \
+        else f"{scheme}://{host}:{port}"
     lan = _local_ipv4s() if host in ("0.0.0.0", "") else []
     log.info("=" * 64)
     log.info("面板地址(本机): %s", local_url)
     for ip in lan:
-        log.info("面板地址(局域网其它电脑): http://%s:%d", ip, port)
+        log.info("面板地址(局域网其它电脑): %s://%s:%d", scheme, ip, port)
     log.info("=" * 64)
     if not CFG["server"].get("open_browser", True) or os.environ.get("MINER_NO_BROWSER"):
         return
@@ -1266,7 +1363,7 @@ def _announce_and_open_browser(host, port):
         return
 
     def _wait_then_open():
-        target = "127.0.0.1" if local_url.startswith("http://127.") else host
+        target = "127.0.0.1" if "://127." in local_url else host
         for _ in range(120):   # 大库首次 checkpoint 可能让启动慢一些，最多等 60 秒
             try:
                 with socket.create_connection((target, port), timeout=0.5):
@@ -1302,5 +1399,9 @@ if __name__ == "__main__":
     if os.environ.pop("MINER_WAIT_PORT_FREE", None):
         _wait_port_free(CFG["server"]["host"], CFG["server"]["port"])
     _announce_and_open_browser(CFG["server"]["host"], CFG["server"]["port"])
+    tls = _tls_files()
+    if (CFG["server"].get("tls_cert") or CFG["server"].get("tls_key")) and not tls:
+        log.error("server.tls_cert/tls_key 配了但文件不存在，仍以 HTTP 启动")
     uvicorn.run(app, host=CFG["server"]["host"], port=CFG["server"]["port"],
+                ssl_certfile=tls[0] if tls else None, ssl_keyfile=tls[1] if tls else None,
                 log_config=None)   # 日志统一交给 logs.py
