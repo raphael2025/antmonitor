@@ -91,6 +91,7 @@ DEFAULTS = {
     },
     "server": {
         "host": "0.0.0.0", "port": 8800,
+        "open_browser": True,   # Windows 下启动后自动打开本机浏览器
         # 前置 nginx/frp 时填代理的IP(或CIDR)，才会信任 X-Forwarded-For 取真实客户端IP。
         # 留空=不信任任何代理(直连部署的正确选择，防伪造头绕过登录限流)
         "trusted_proxies": [],

@@ -25,6 +25,8 @@ set /a T1=(1%T:~0,2%-100)*3600+(1%T:~3,2%-100)*60+(1%T:~6,2%-100)
 
 python server.py
 set EC=%ERRORLEVEL%
+rem only the first launch opens the browser; guardian restarts (incl. updates) stay quiet
+set MINER_NO_BROWSER=1
 
 set "T=%TIME: =0%"
 set /a T2=(1%T:~0,2%-100)*3600+(1%T:~3,2%-100)*60+(1%T:~6,2%-100)

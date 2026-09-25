@@ -1119,7 +1119,65 @@ if os.path.isdir(WEB_DIR):
     app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
 
 
+def _local_ipv4s():
+    """本机可用的局域网 IPv4(去掉回环/自动私有地址)，默认路由那张网卡排最前。"""
+    import socket
+    ips = []
+    try:   # UDP connect 不发包，只让系统选出走默认路由的网卡地址
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("10.255.255.255", 1))
+            ips.append(s.getsockname()[0])
+    except OSError:
+        pass
+    try:
+        ips += [i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)]
+    except OSError:
+        pass
+    out = []
+    for ip in ips:
+        if ip not in out and not ip.startswith(("127.", "169.254.", "0.")):
+            out.append(ip)
+    return out
+
+
+def _announce_and_open_browser(host, port):
+    """启动时打印面板访问地址；Windows 下等端口就绪后自动打开本机浏览器。
+    run.bat 守护重启(含自动更新)时会带 MINER_NO_BROWSER=1，不会每次重启都弹一个新窗口。"""
+    import socket
+    import webbrowser
+    local_url = f"http://127.0.0.1:{port}" if host in ("0.0.0.0", "", "127.0.0.1") \
+        else f"http://{host}:{port}"
+    lan = _local_ipv4s() if host in ("0.0.0.0", "") else []
+    log.info("=" * 64)
+    log.info("面板地址(本机): %s", local_url)
+    for ip in lan:
+        log.info("面板地址(局域网其它电脑): http://%s:%d", ip, port)
+    log.info("=" * 64)
+    if not CFG["server"].get("open_browser", True) or os.environ.get("MINER_NO_BROWSER"):
+        return
+    if os.name != "nt":   # Linux 服务器多半无桌面，webbrowser 可能拉起终端文本浏览器占住控制台
+        return
+
+    def _wait_then_open():
+        target = "127.0.0.1" if local_url.startswith("http://127.") else host
+        for _ in range(120):   # 大库首次 checkpoint 可能让启动慢一些，最多等 60 秒
+            try:
+                with socket.create_connection((target, port), timeout=0.5):
+                    break
+            except OSError:
+                time.sleep(0.5)
+        else:
+            return
+        try:
+            webbrowser.open(local_url)
+        except Exception:  # noqa: BLE001 - 打不开浏览器不影响服务
+            log.warning("自动打开浏览器失败，请手动访问 %s", local_url)
+
+    threading.Thread(target=_wait_then_open, daemon=True).start()
+
+
 if __name__ == "__main__":
     import uvicorn
+    _announce_and_open_browser(CFG["server"]["host"], CFG["server"]["port"])
     uvicorn.run(app, host=CFG["server"]["host"], port=CFG["server"]["port"],
                 log_config=None)   # 日志统一交给 logs.py

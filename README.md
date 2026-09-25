@@ -106,9 +106,12 @@ python db.py vacuum       # 回收删除留下的空页（独占数据库，放�
 
 ```bash
 pip install -r requirements.txt
-python server.py            # 启动面板 + 后台定时巡检
-# 浏览器打开 http://<本机IP>:8800
+python server.py            # 启动面板 + 后台定时巡检（Windows 推荐双击 run.bat，带崩溃自动拉起）
 ```
+
+- **Windows 下启动后自动打开本机浏览器**（`server.open_browser: false` 可关；run.bat 守护重启/自动更新后不会重复弹窗）。
+- **不知道本机 IP？** 看启动日志开头的「面板地址」几行：本机用 `http://127.0.0.1:8800`，
+  局域网其它电脑用日志里列出的 `http://<局域网IP>:8800`。
 
 启动后按 `config.yaml` 节奏运行：
 - **全网扫描** `schedule.scan_interval`（默认 300s=5分钟）：每 5 分钟扫一遍全部网段，
