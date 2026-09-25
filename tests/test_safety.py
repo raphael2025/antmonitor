@@ -103,3 +103,20 @@ def test_updater_git_never_prompts(monkeypatch):
 def test_updater_guardian_env_zero_forces_self(monkeypatch):
     monkeypatch.setenv("MINER_GUARDIAN", "0")
     assert updater.restart_mode() == "self"
+
+
+def test_empty_or_placeholder_password_can_never_log_in():
+    """照抄 config.example.yaml 忘了改密码 / password 留空：以前空口令或公开的占位符
+    就能以 admin 登录，进而重启全场。这两种绝不是真口令，必须拒绝。"""
+    import auth
+    cfg = {"auth": {"enabled": True, "users": [
+        {"username": "admin", "password": "改成 python auth.py 生成的哈希", "role": "admin"},
+        {"username": "ops", "password": "", "role": "ops"},
+        {"username": "viewer", "role": "viewer"},
+        {"username": "legacy", "password": "Plain-But-Real-1", "role": "viewer"},
+    ]}}
+    assert auth.login(cfg, "admin", "改成 python auth.py 生成的哈希") is None
+    assert auth.login(cfg, "ops", "") is None
+    assert auth.login(cfg, "viewer", "") is None
+    assert auth.login(cfg, "legacy", "Plain-But-Real-1")      # 已在用的明文口令不锁死现场
+    assert auth.login(cfg, ["admin"], "x") is None            # 非字符串用户名不能冒泡成 500

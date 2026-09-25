@@ -39,9 +39,22 @@ def hash_password(password, salt=None):
     return f"pbkdf2${_PBKDF2_ITER}${salt}${dk.hex()}"
 
 
+# config.example.yaml 里的占位文字：公开可查，照抄后忘了改就等于公开口令
+_PLACEHOLDER = "改成 python auth.py 生成的哈希"
+
+
+def _unusable(stored):
+    """空口令 / 示例占位符：绝不是真口令，一律不让登录(不止启动时打日志)。"""
+    s = stored.strip()
+    return not s or s == _PLACEHOLDER or s.startswith("改成")
+
+
 def _verify_password(stored, password):
-    """兼容: stored 是 pbkdf2$... 则按哈希校验，否则按明文比较(向后兼容，建议改用哈希)。"""
+    """兼容: stored 是 pbkdf2$... 则按哈希校验，否则按明文比较(向后兼容，建议改用哈希)。
+    空口令和示例占位符直接判失败。"""
     stored = str(stored or "")
+    if _unusable(stored):
+        return False
     if stored.startswith("pbkdf2$"):
         try:
             _, iters, salt, hexd = stored.split("$", 3)
@@ -103,7 +116,7 @@ def login(cfg, username, password, src=None):
             rec = _fails.get(src)
             if rec and rec[1] > now:
                 return None
-    u = _users(cfg).get(username)
+    u = _users(cfg).get(username) if isinstance(username, str) else None
     try:
         if not u:   # 用户名不存在也跑一遍等量哈希，避免"无此用户"秒回暴露有效用户名(时序侧信道)
             _verify_password(_DUMMY_STORED, password)
