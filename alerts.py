@@ -302,12 +302,20 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     return fired
 
 
-def evaluate_containers(conn, containers, known_before, cfg):
-    """集装箱冷却告警：故障位 → 告警；箱体掉线 → 告警；恢复自动消警。
-    known_before: 本轮扫描前已记住的箱体 IP 集合（用于判定掉线）。"""
+# 集装箱故障连续这么多轮读到"正常"才消警(10 秒刷新 ≈ 30 秒)。一次抖动就消警的话，
+# 下一轮故障还在却被冷却拦下，漏液最长 30 分钟没有活跃告警
+COOLER_CLEAR_ROUNDS = 3
+_COOLER_STATE = {}
+
+
+def evaluate_containers(conn, containers, known_before, cfg, state=None):
+    """集装箱冷却告警：故障位 → 告警；箱体掉线 → 告警；连续 COOLER_CLEAR_ROUNDS 轮正常才消警。
+    known_before: 本轮扫描前已记住的箱体 IP 集合（用于判定掉线）。
+    state: 跨轮次状态(由 MonitorService 持有)；省略时用模块级默认。"""
     acfg = cfg.get("alerts", {})
     if not acfg.get("enabled", True):
         return []
+    clean = (state if state is not None else _COOLER_STATE).setdefault("cooler_clean", {})
     now = int(time.time())
     cur = {c["ip"]: c for c in containers}
     b = _Batch(conn, acfg.get("cooldown", 1800), now)
@@ -329,9 +337,20 @@ def evaluate_containers(conn, containers, known_before, cfg):
             active["cooler:return_pressure_low_th"] = {"label": f"回液压力低 {rp}<{rp_min}MPa",
                                                        "sev": "crit"}
         for type_, f in active.items():
-            b.fire(ip, type_, f["sev"], f"集装箱 {ip} {f['label']}")
+            clean.pop((ip, type_), None)
+            # crit(漏液/断流/冻结…)不受冷却限制：真恢复后又复发必须立刻再报
+            b.fire(ip, type_, f["sev"], f"集装箱 {ip} {f['label']}", force=f["sev"] == "crit")
         for a in existing:      # 消除已恢复的该箱冷却告警
-            if a["ip"] == ip and a["type"].startswith("cooler:") and a["type"] not in active:
+            if a["ip"] != ip or not a["type"].startswith("cooler:") or a["type"] in active:
+                continue
+            # 压力阈值开着但这轮读不到压力：不是"恢复"的证据，保持原状
+            if (a["type"] == "cooler:supply_pressure_low" and sp_min and sp is None) or \
+                    (a["type"] == "cooler:return_pressure_low_th" and rp_min and rp is None):
+                continue
+            k = (ip, a["type"])
+            clean[k] = clean.get(k, 0) + 1
+            if clean[k] >= COOLER_CLEAR_ROUNDS:
+                clean.pop(k, None)
                 b.resolve(ip, a["type"])
         b.resolve(ip, "cooler_offline")   # 箱体恢复在线
 

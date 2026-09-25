@@ -383,7 +383,8 @@ class MonitorService:
                 db.upsert_containers(self.conn, containers, ts)
                 # 全网扫描对集装箱"未采到"不可靠(判活闸门会误杀查 PLC 慢的控制器)，
                 # 离线判定统一交给 _container_loop(给足超时、每10s 一次)。
-                cfired = alerts.evaluate_containers(self.conn, containers, detected_ips, self.cfg)
+                cfired = alerts.evaluate_containers(self.conn, containers, detected_ips, self.cfg,
+                                                    state=self._alert_state)
                 db.kick_offline_containers(
                     self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
             except Exception as e:  # noqa: BLE001
@@ -509,7 +510,7 @@ class MonitorService:
             db.mark_containers_offline(self.conn, confirmed_off)
             # known_before 只传 已采到 + 已确认离线 → 未确认(刚漏1轮)的不报 cooler_offline
             cfired = alerts.evaluate_containers(self.conn, cs, detected | set(confirmed_off),
-                                                self.cfg)
+                                                self.cfg, state=self._alert_state)
             db.kick_offline_containers(
                 self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
             if cfired and self.notify:
