@@ -77,12 +77,12 @@ class _Batch:
         self.to_fire = []      # [(ip, type, sev, detail)]
         self.to_resolve = []   # [(ip, type)]
 
-    def fire(self, ip, type_, sev, detail):
+    def fire(self, ip, type_, sev, detail, force=False):
         key = (ip, type_)
         if key in self.active:          # 已有未恢复的同类告警
             return
         rt = self.cooled.get(key)       # 刚恢复不久的抖动不再报，防刷屏
-        if rt and (self.now - rt) < self.cooldown:
+        if rt and (self.now - rt) < self.cooldown and not force:
             return
         self.active.add(key)            # 同一轮内不重复
         self.to_fire.append((ip, type_, sev, detail))
@@ -133,10 +133,13 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     now = int(time.time())
 
     cur = {r["ip"]: r for r in records}
-    prev_id = db.prev_scan_id(conn, scan_id, kind)   # 同类扫描的上一次
-    prev = {r["ip"]: r for r in db.scan_records(conn, prev_id)} if prev_id else {}
     repair = db.repair_ips(conn)          # 维修中的机器：不报警
     roster = set(db.roster_ips(conn, roster_age))   # 已知真机(算网段比例的分母)
+    # 掉线告警按状态判，不按"上一轮 online → 本轮 offline"的跳变判：跳变那一轮只要没报出来
+    # (冷却期/上一轮是 unknown/被网段事件或维修静音)，之后上一轮已是 offline 就永远不再报。
+    # 现在：名册内、当前离线、且自最后一次在线以来还没报过掉线 → 报(冷却只会推迟，不会吞掉)。
+    last_online = db.last_online_map(conn)
+    last_off_alert = db.last_alert_ts(conn, "offline", now - roster_age * 86400)
 
     b = _Batch(conn, cooldown, now)
     # 静默期内的刚重启机器：掉线是预期内的，不报单机掉线，也不计入网段掉线比例
@@ -163,8 +166,10 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         tot = seg_total.get(seg, 0)
         if off >= seg_min and tot > 0 and off / tot >= seg_ratio:
             down_segments.add(seg)
+            # force：整段事件不受冷却限制。下面会用 down_segments 静音段内单机告警，
+            # 若这条被冷却拦下，同一栋冷却期内第二次断电就既无网段告警也无单机告警
             b.fire(f"{seg}.x", "segment_down", "crit",
-                   f"网段 {seg}.x 大面积掉线 {off}/{tot}（疑似交换机/断电）")
+                   f"网段 {seg}.x 大面积掉线 {off}/{tot}（疑似交换机/断电）", force=True)
     for a in db.active_alerts_by_type(conn, "segment_down"):   # 离线率回落 → 恢复
         seg = a["ip"][:-2] if a["ip"].endswith(".x") else a["ip"]
         tot = seg_total.get(seg, 0)
@@ -207,7 +212,8 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                 b.fire(ip, "offline", "crit",
                        f"{ip} 重启后 {max(1, rb_grace // 60)} 分钟仍未上线")
                 continue
-            if prev.get(ip, {}).get("status") == "online":
+            lo = last_online.get(ip)
+            if ip in roster and lo is not None and last_off_alert.get(ip, -1) <= lo:
                 b.fire(ip, "offline", "crit", f"{ip} 掉线")
             continue
         b.resolve(ip, "offline")
