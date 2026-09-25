@@ -315,13 +315,15 @@ class MonitorService:
             ident = db.known_identity(self.conn)
             for r in miners:
                 info = ident.get(r["ip"])
-                if info:
+                # 只回填离线机：在线机的 MAC 必须是本轮实测值——有合法 SN 的原厂机不读 MAC，
+                # 若回填名册旧值(可能是之前在这个 IP 上的另一台机)，残影判定会把真掉线的
+                # 那台当成"已在别处上线"自动下架、告警静音
+                if info and r["status"] != "online":
                     r["mac"] = r.get("mac") or info.get("mac") or ""
-                    if r["status"] != "online":
-                        r["model"] = r.get("model") or info.get("model") or ""
-                        r["sn"] = r.get("sn") or info.get("sn") or ""
-                        r["worker"] = r.get("worker") or info.get("worker") or ""
-                        r["firmware"] = r.get("firmware") or info.get("firmware") or ""
+                    r["model"] = r.get("model") or info.get("model") or ""
+                    r["sn"] = r.get("sn") or info.get("sn") or ""
+                    r["worker"] = r.get("worker") or info.get("worker") or ""
+                    r["firmware"] = r.get("firmware") or info.get("firmware") or ""
 
             miners = self._drop_migrated_ghosts(miners)
 

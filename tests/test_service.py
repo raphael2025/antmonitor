@@ -216,3 +216,24 @@ def test_maintenance_tick_runs_rollup_prune_and_checkpoint(svc):
     assert int(db.meta_get(svc.conn, "rollup_hour")) > h    # 那一小时已归档
     assert db.checkpoint(svc.conn) is not None
     assert {r["worker"] for r in db.customer_report(svc.conn, 6)} == {"X"}
+
+
+def test_stale_mac_on_online_ip_does_not_quarantine_a_really_offline_machine(svc, monkeypatch):
+    """在线机不能用名册里的旧 MAC 冒充本轮实测值参与残影判定。
+
+    无 SN 的 A(MAC=MA) 原在 ip1，搬到 ip2；ip1 换上有合法 SN 的 B(有 SN 就不读 MAC)。
+    旧实现给在线的 ip1 回填了 A 的 MA，A 在 ip2 真掉线时被当成"已在 ip1 上线的残影"
+    自动下架，掉线告警被静音。"""
+    ip1, ip2, MA = "10.9.0.1", "10.9.0.2", "AA:BB:CC:DD:EE:01"
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec(ip1, sn="N/A", mac=MA)]))
+    svc.scan_full("full")
+    monkeypatch.setattr(miner_core, "scan", fake_scan([
+        rec(ip1, sn="SNB1234567", mac=""), rec(ip2, sn="N/A", mac=MA)]))
+    svc.scan_full("full")
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec(ip1, sn="SNB1234567", mac="")]))
+    svc.scan_full("full")                                       # A 在 ip2 真掉线
+    ident = db.known_identity(svc.conn)
+    assert ident[ip2]["state"] == "active"                      # 不能被当残影下架
+    assert ident[ip1]["mac"] == ""                              # 换了机器(SN 变了)，旧 MAC 作废
+    assert any(a["ip"] == ip2 and a["type"] == "offline"
+               for a in db.list_alerts(svc.conn, True, 100))

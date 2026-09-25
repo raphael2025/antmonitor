@@ -417,7 +417,10 @@ def upsert_known_miners(conn, recs, ts):
             "ELSE known_miners.state END, "
             "model=CASE WHEN excluded.model!='' THEN excluded.model ELSE known_miners.model END, "
             "sn=CASE WHEN excluded.sn!='' THEN excluded.sn ELSE known_miners.sn END, "
-            "mac=CASE WHEN excluded.mac!='' THEN excluded.mac ELSE known_miners.mac END, "
+            # 同一 IP 换了一台机(SN 变了)：旧 MAC 属于上一台，作废，否则残影判定会张冠李戴
+            "mac=CASE WHEN excluded.mac!='' THEN excluded.mac "
+            "WHEN excluded.sn!='' AND excluded.sn!=known_miners.sn THEN '' "
+            "ELSE known_miners.mac END, "
             "worker=CASE WHEN excluded.worker!='' THEN excluded.worker ELSE known_miners.worker END, "
             "firmware=CASE WHEN excluded.firmware!='' THEN excluded.firmware "
             "ELSE known_miners.firmware END",
