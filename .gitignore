@@ -23,6 +23,12 @@ logs/
 config.yaml
 segments.json
 cloud_site_id.txt
+# 网页/命令行改密码时的备份与临时文件(未忽略会让更新器以"工作区有改动"拒绝更新)
+config.yaml.bak
+config.yaml.tmp
+# HTTPS 证书与私钥
+certs/
+*.pem
 
 # 扫描/运维过程数据
 allmac.txt
