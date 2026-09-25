@@ -55,7 +55,7 @@ DEFAULTS = {
         "enabled": True,
         "scan_interval": 300,      # 名册巡检间隔(秒)
         "full_interval": 3600,     # 全网发现间隔(秒)；发现新机/新网段
-        "watchdog_minutes": 0,     # 0=自动取 max(10分钟, 巡检间隔×3)，默认 15 分钟
+        "watchdog_minutes": 0,     # 0=自动取 max(15分钟, 巡检间隔×3)
         "container_interval": 10,
     },
     "alerts": {
