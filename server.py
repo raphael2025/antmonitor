@@ -6,6 +6,12 @@
 (SVC.latest())，不再每个请求回查 SQLite。一个浏览器每 30 秒刷新会打 3~4 个接口，
 每个都拉 5000 行是纯粹的浪费，而且会和扫描落库抢数据库。历史/报表类查询才走 DB。
 """
+if __name__ == "__main__":
+    # 刚网页/自动更新过：先于其它业务模块 import 记一次启动尝试。新版本若在模块级就崩，
+    # 连续几次后在这里自动回滚到上一版(见 updater.boot_guard)
+    import updater as _updater
+    _updater.boot_guard()
+
 import asyncio
 import contextlib
 import hmac as _hmac
@@ -65,6 +71,10 @@ async def lifespan(app_):
         log.info("云端上报已启动 → %s (场地: %s, ID: %s)", CFG["cloud"]["url"],
                  CFG["cloud"]["site_name"], cloud_report.site_id(CFG))
     updater.start_auto(CFG.get("update") or {})
+    # 新版本稳定运行 60 秒 → 确认更新成功(清掉回滚标记)
+    _h = threading.Timer(updater.HEALTHY_AFTER_SEC, updater.mark_healthy)
+    _h.daemon = True
+    _h.start()
     _startup_selfcheck()
     try:
         yield

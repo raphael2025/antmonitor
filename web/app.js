@@ -950,7 +950,7 @@ let _updInfo = null;
 let _updating = false;
 
 function markUpdateBtn(d) {
-  const n = (d && !d.error && d.behind) || 0;
+  const n = (d && !d.error && !d.known_bad && d.behind) || 0;
   $("btnUpdate").textContent = n ? `⬆ 有新版本(${n})` : "⬆ 版本";
   $("btnUpdate").classList.toggle("has-update", !!n);
 }
@@ -983,6 +983,9 @@ function renderUpdate(d) {
     <div class="muted">检查时间 ${esc(when)}</div>`;
   if (!d.behind) {
     h += `<div class="upd-ok">✓ 已是最新版本</div>`;
+  } else if (d.known_bad) {
+    h += `<div class="upd-err">远端最新版本 <code>${esc(d.remote)}</code> 之前自检未通过（或启动失败）已自动回滚，
+      不会再拉取它；等开发者推送修复后的新提交再更新。</div>`;
   } else {
     h += `<div>有 <b>${d.behind}</b> 个新提交${d.behind > 10 ? "（下面只列最近 10 个）" : ""}：</div>
       <ul>${(d.changes || []).map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
