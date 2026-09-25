@@ -186,3 +186,32 @@ def test_backup_that_fails_integrity_check_is_deleted(tmp_path, monkeypatch):
     out = tmp_path / "b"
     assert backup_db.backup(str(src), str(out), 3, "x_bad") == 3
     assert not (out / "miner_monitor_x_bad.db").exists()
+
+
+def test_log_rotation_blocked_by_locked_file_does_not_lose_records(tmp_path, monkeypatch):
+    """Windows 上别的进程(db.py vacuum、记事本…)开着 miner.log 时轮转的 rename 会失败：
+    以前之后每条日志都再试一次轮转、再失败，记录直接丢，控制台刷一堆 traceback。"""
+    import logging
+    import os
+    import logs
+    path = tmp_path / "m.log"
+    h = logs._SafeRotatingFileHandler(str(path), maxBytes=200, backupCount=2,
+                                      encoding="utf-8", delay=True)
+    lg = logging.getLogger("rot-test")
+    lg.propagate = False
+    lg.addHandler(h)
+    errors = []
+    monkeypatch.setattr(h, "handleError", lambda rec: errors.append(rec))
+
+    def locked(src, dst):
+        raise PermissionError(32, "另一个程序正在使用此文件")
+
+    monkeypatch.setattr(os, "rename", locked)
+    try:
+        for i in range(30):
+            lg.warning("record-%02d %s", i, "x" * 40)
+    finally:
+        lg.removeHandler(h)
+        h.close()
+    text = path.read_text(encoding="utf-8")
+    assert all(f"record-{i:02d}" in text for i in range(30)) and not errors

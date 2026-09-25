@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -71,8 +72,8 @@ def setup(cfg=None):
         # 裸文件名(如 "miner.log")时 dirname 为空串，makedirs("") 会抛 FileNotFoundError，
         # 被下面 except 兜住后静默退化成"只有控制台"，用户很难察觉——补个 "." 兜底
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        fh = RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backups,
-                                 encoding="utf-8", delay=True)
+        fh = _SafeRotatingFileHandler(path, maxBytes=max_bytes, backupCount=backups,
+                                      encoding="utf-8", delay=True)
         fh.setFormatter(fmt)
         root.addHandler(fh)
         _own_handlers.append(fh)
@@ -101,6 +102,28 @@ class _MaskSecrets(logging.Filter):
             record.args = tuple(self._re.sub(r"\1***", a) if isinstance(a, str) else a
                                 for a in record.args)
         return True
+
+
+class _SafeRotatingFileHandler(RotatingFileHandler):
+    """轮转失败不丢日志。Windows 上别的进程(db.py 运维命令、记事本、杀软)开着日志文件时，
+    轮转要 rename 会失败(PermissionError)：标准 handler 之后每条日志都再试一次、再失败，
+    记录直接丢、控制台刷 traceback。这里失败就接着往原文件追加，60 秒后再试。"""
+    _retry_at = 0.0
+
+    def shouldRollover(self, record):
+        if time.monotonic() < self._retry_at:
+            return False
+        return super().shouldRollover(record)
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError as e:
+            self._retry_at = time.monotonic() + 60   # 父类已关掉流；delay 模式下 emit 会自动重开追加
+            try:
+                sys.stderr.write(f"[logs] 日志轮转失败(文件被占用?)，继续写原文件，60 秒后重试: {e}\n")
+            except Exception:  # noqa: BLE001
+                pass
 
 
 def get(name):
