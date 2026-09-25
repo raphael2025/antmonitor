@@ -90,7 +90,8 @@ def _startup_selfcheck():
         if weak:
             log.error("=" * 64)
             log.error("安全警告: 用户 %s 仍在使用默认弱口令(admin888 等)", weak)
-            log.error("该系统可远程重启/换矿池全场，请立即用 `python auth.py 新强口令` 改掉")
+            log.error("这些账号只能在本机 http://127.0.0.1:%d 登录，登录后网页会强制改密码；"
+                      "或运行 `python auth.py passwd 用户名` 设置", CFG["server"]["port"])
             log.error("=" * 64)
     else:
         log.warning("auth.enabled=false：任何人可匿名只读访问面板")
@@ -167,6 +168,8 @@ def require(min_role):
             raise HTTPException(status_code=401, detail="未登录")
         if not auth.has_role(sess, min_role):
             raise HTTPException(status_code=403, detail="权限不足")
+        if sess.get("must_change") and min_role != "viewer":   # 弱口令会话：只能看，改完密码才能操作
+            raise HTTPException(status_code=403, detail="当前密码太弱，请先修改密码(右上角 🔑)")
         return sess
     return dep
 
@@ -181,17 +184,40 @@ def api_login(request: Request, response: Response, body: dict = Body(...)):
     src = _client_ip(request)
     if auth.locked(src):
         return JSONResponse({"ok": False, "error": "失败次数过多，请稍后再试"}, status_code=429)
-    token = auth.login(CFG, body.get("username", ""), body.get("password", ""), src=src)
+    token, why = auth.login_ex(CFG, body.get("username", ""), body.get("password", ""), src=src)
     if not token:
-        log.warning("登录失败: user=%r from=%s", str(body.get("username", ""))[:32], src)
-        return JSONResponse({"ok": False, "error": "用户名或密码错误"}, status_code=401)
+        log.warning("登录失败: user=%r from=%s (%s)", str(body.get("username", ""))[:32], src, why)
+        why = (why or "用户名或密码错误").replace("端口", str(CFG["server"]["port"]))
+        return JSONResponse({"ok": False, "error": why}, status_code=401)
     s = auth.session(token)
     # secure_cookie: 走 HTTPS 时设为 true；纯内网 HTTP 保持 false 否则 cookie 不发
     response.set_cookie(auth.COOKIE, token, httponly=True, samesite="lax",
                         secure=bool(CFG.get("auth", {}).get("secure_cookie", False)),
                         max_age=auth.TTL)
-    log.info("登录成功: %s (%s) from %s", s["user"], s["role"], src)
-    return {"ok": True, "user": s["user"], "role": s["role"]}
+    log.info("登录成功: %s (%s) from %s%s", s["user"], s["role"], src,
+             " [弱口令，须改密码]" if s.get("must_change") else "")
+    return {"ok": True, "user": s["user"], "role": s["role"],
+            "must_change": bool(s.get("must_change"))}
+
+
+@app.post("/api/password")
+def api_password(request: Request, body: dict = Body(...), sess: dict = Depends(require_viewer)):
+    """改自己的密码 {old, new}：写哈希进 config.yaml(原地、保留注释)，立即生效，踢掉该账号其它会话。"""
+    if not auth.enabled(CFG):
+        return JSONResponse({"ok": False, "error": "未启用登录"}, status_code=400)
+    old, new = body.get("old"), body.get("new")
+    if not isinstance(old, str) or not isinstance(new, str):
+        return JSONResponse({"ok": False, "error": "参数错误"}, status_code=400)
+    err = auth.change_password(CFG, sess["user"], old, new,
+                               keep_token=request.cookies.get(auth.COOKIE, ""))
+    src = _client_ip(request)
+    db.log_commands(SVC.conn, f'{sess["user"]}@{src}', "passwd",
+                    [{"ip": "-", "ok": not err, "msg": err or "已修改密码"}])
+    if err:
+        log.warning("修改密码失败: %s from %s (%s)", sess["user"], src, err)
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    log.info("已修改密码: %s from %s", sess["user"], src)
+    return {"ok": True}
 
 
 @app.post("/api/logout")
@@ -208,7 +234,7 @@ def api_me(request: Request):
         return JSONResponse({"authenticated": False, "auth_enabled": auth.enabled(CFG)},
                             status_code=401)
     return {"authenticated": True, "user": s["user"], "role": s["role"],
-            "auth_enabled": auth.enabled(CFG)}
+            "auth_enabled": auth.enabled(CFG), "must_change": bool(s.get("must_change"))}
 
 
 def _broadcast_threadsafe(payload):

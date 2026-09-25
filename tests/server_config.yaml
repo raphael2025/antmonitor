@@ -11,6 +11,9 @@ auth:
     - username: viewer
       password: test-viewer-password
       role: viewer
+    - username: weakops
+      password: ops888
+      role: ops
 control:
   enabled: true
   max_batch: 2

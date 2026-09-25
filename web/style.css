@@ -202,3 +202,5 @@ footer { text-align: center; padding: 20px; }
 .upd-body .upd-ok { color: #3fb950; }
 .upd-body .upd-err { color: #f85149; overflow-wrap: anywhere; }
 .upd-body .upd-note { background: #1c2128; border-left: 3px solid #d29922; padding: 6px 10px; border-radius: 5px; margin-top: 8px; font-size: 13px; }
+#pwdModal .seg-host input { width: 220px; }
+#pwdModal .seg-host { display: flex; justify-content: space-between; align-items: center; }

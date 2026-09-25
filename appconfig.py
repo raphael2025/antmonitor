@@ -9,6 +9,7 @@
 import copy
 import json
 import os
+import re
 import threading
 
 import yaml
@@ -211,6 +212,97 @@ def load_config(path=None):
     else:
         log.warning("配置文件 %s 不存在，使用全部默认值", path)
     return _validate(_merge(DEFAULTS, raw))
+
+
+def _users_of(doc):
+    return (((doc or {}).get("auth") or {}).get("users") or [])
+
+
+def set_user_password(username, pw_hash, path=None):
+    """把 config.yaml 里 auth.users 中 username 的 password 原地改成 pw_hash(保留注释/格式)。
+
+    网页改密码和 `python auth.py passwd` 共用。支持流式 `- {username: a, password: "x"}`
+    和块式写法。改完重新解析并逐项比对：只有该用户的 password 变了才落盘(先备份 .bak，
+    再原子替换)，否则一个字节都不写——宁可让人手改，也不能把配置文件改坏。
+    返回 "" 成功，否则为原因。
+    """
+    path = _anchor(path) if path else CONFIG_FILE
+    try:
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        before = yaml.safe_load(text) or {}
+    except (OSError, yaml.YAMLError) as e:
+        return f"读取配置文件失败: {e}"
+    lines = text.splitlines(keepends=True)
+    q = '"' + pw_hash + '"'
+    uname = re.compile(r'(?:^|[\s{,-])username:\s*(["\']?)' + re.escape(username) + r'\1\s*(?:,|}|$)')
+    pw_val = r'password:\s*(?:"[^"]*"|\'[^\']*\'|[^,}\r\n#]*)'
+    done = False
+    for i, ln in enumerate(lines):
+        body = ln.rstrip("\r\n")
+        m = uname.search(body)
+        if not m:
+            continue
+        if "{" in body and "password:" in body:          # 流式：同一行
+            lines[i] = re.sub(pw_val, "password: " + q, ln, count=1)
+            done = True
+            break
+        # 块式：先按列定出这个列表项的行范围，再在项内找与 username 同列的 password:
+        col = body.index("username:")
+
+        def in_item(t):   # 与 username 同列的键(前面只有空格，或是 "- " 项起点)
+            return t[:col].strip() in ("", "-") and t[col:col + 1].strip() != ""
+
+        def skip(t):
+            return not t.strip() or t.lstrip().startswith("#")
+
+        start = i
+        while body[:col].strip() != "-" and start > 0:
+            prev = lines[start - 1].rstrip("\r\n")
+            if skip(prev) or in_item(prev):
+                start -= 1
+                if prev[:col].strip() == "-":
+                    break
+                continue
+            break
+        end = i
+        while end + 1 < len(lines):
+            nxt = lines[end + 1].rstrip("\r\n")
+            if skip(nxt) or (nxt[:col].strip() == "" and in_item(nxt)):
+                end += 1
+                continue
+            break
+        for k in range(start, end + 1):
+            t = lines[k].rstrip("\r\n")
+            if in_item(t) and t[col:].startswith("password:"):
+                lines[k] = t[:col] + "password: " + q + lines[k][len(t):]
+                done = True
+                break
+        break
+    if not done:
+        return f"在配置文件里没找到用户 {username} 的 password 行，请手动修改 config.yaml"
+    new_text = "".join(lines)
+    try:
+        after = yaml.safe_load(new_text) or {}
+    except yaml.YAMLError as e:
+        return f"改写后配置无法解析，已放弃写入: {e}"
+    expect = copy.deepcopy(before)
+    hits = [u for u in _users_of(expect) if isinstance(u, dict) and u.get("username") == username]
+    if len(hits) != 1:
+        return f"配置里用户 {username} 不存在或重复，请手动修改 config.yaml"
+    hits[0]["password"] = pw_hash
+    if after != expect:
+        return "改写结果校验不一致，已放弃写入，请手动修改 config.yaml"
+    tmp = path + ".tmp"
+    try:
+        with open(path + ".bak", "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(new_text)
+        os.replace(tmp, path)
+    except OSError as e:
+        return f"写入配置文件失败(权限?): {e}"
+    return ""
 
 
 # ---- 网段(网页可编辑，存 segments.json) ----

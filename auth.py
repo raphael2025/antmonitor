@@ -18,7 +18,8 @@ import threading
 ROLE_RANK = {"viewer": 1, "ops": 2, "admin": 3}
 COOKIE = "mm_token"
 TTL = 7 * 86400  # 令牌有效期
-_PBKDF2_ITER = 200_000
+IDLE = 12 * 3600  # 空闲超时：12 小时没有任何请求就失效(挂着的大屏一直在轮询，不受影响)
+_PBKDF2_ITER = 600_000   # OWASP 2023 建议值；旧哈希按自身记录的迭代次数校验，照常可用
 
 _sessions = {}  # token -> {user, role, exp}
 _slock = threading.Lock()
@@ -26,6 +27,11 @@ _slock = threading.Lock()
 _fails = {}            # 限流键(来源IP) -> [失败次数, 锁定到期时间戳]
 _MAX_FAILS = 8         # 连续失败上限
 _LOCK_SEC = 300        # 触顶后锁定秒数(5分钟)，挡在线暴破
+# 按用户名再计一道：攻击者在 /16 网段里给网卡加几百个 IP 别名就能绕过"按 IP 计"。
+# 只对非本机来源生效——坐在监控电脑前的人永远不会被锁在外面(也防别人故意锁死 admin)。
+_ufails = {}
+_MAX_USER_FAILS = 20
+_USER_LOCK_SEC = 900
 
 # 哑口令记录：用户名不存在时拿它跑一遍等量 PBKDF2，拉平"无此用户/口令错"的耗时差(时序侧信道)。
 # 随机 salt + 全零摘要，构造本身不做哈希运算(不拖慢导入)，且永远校验不通过。
@@ -70,6 +76,33 @@ def _users(cfg):
     return {u["username"]: u for u in cfg.get("auth", {}).get("users", [])}
 
 
+def is_local(src):
+    """来源是监控电脑本机(坐在电脑前的人)。"""
+    s = str(src or "")
+    return s.startswith("127.") or s in ("::1", "localhost")
+
+
+def needs_change(u):
+    """存储的口令是出厂默认弱口令或明文(不是 pbkdf2 哈希)。仅供启动自检参考。"""
+    stored = str((u or {}).get("password", "") or "")
+    if not stored.startswith("pbkdf2$"):
+        return True
+    name = (u or {}).get("username")
+    return name in _DEFAULT_PW and _verify_password(stored, _DEFAULT_PW[name])
+
+
+def password_problem(username, new):
+    """新口令是否可用，返回 "" 或原因。"""
+    new = str(new or "")
+    if len(new) < 8:
+        return "新密码至少 8 位"
+    if new in _DEFAULT_PW.values() or new.lower() == str(username).lower():
+        return "新密码不能是默认密码或与用户名相同"
+    if len(set(new)) < 4:
+        return "新密码太简单(至少包含 4 种不同字符)"
+    return ""
+
+
 _DEFAULT_PW = {"admin": "admin888", "ops": "ops888", "viewer": "viewer888"}
 
 
@@ -108,15 +141,33 @@ def locked(src):
         return bool(rec and rec[1] > time.time())
 
 
-def login(cfg, username, password, src=None):
-    """src: 客户端 IP，用于失败限流(按来源 IP 计，避免锁死合法用户)。返回 token 或 None。"""
+def login_ex(cfg, username, password, src=None):
+    """返回 (token, "") 或 (None, 给用户看的原因)。src: 客户端 IP。"""
     now = time.time()
-    if src:   # 锁定期内直接拒绝，不再校验口令
-        with _slock:
-            rec = _fails.get(src)
-            if rec and rec[1] > now:
-                return None
-    u = _users(cfg).get(username) if isinstance(username, str) else None
+    local = is_local(src)
+    uname = username if isinstance(username, str) else None
+    with _slock:
+        rec = _fails.get(src) if src else None
+        if rec and rec[1] > now:
+            return None, "失败次数过多，请稍后再试"
+        urec = _ufails.get(uname) if uname else None
+        if urec and urec[1] > now and not local:
+            return None, "该账号失败次数过多，已临时锁定，请稍后再试(监控电脑本机不受限)"
+        # 先占位计一次失败再去校验：PBKDF2 期间会释放 GIL，若校验完才计数，
+        # 几十个并发错误请求会全部跑完校验，按 IP 的上限形同虚设
+        if src:
+            rec = _fails.setdefault(src, [0, 0])
+            rec[0] += 1
+            if rec[0] >= _MAX_FAILS:
+                rec[1], rec[0] = now + _LOCK_SEC, 0
+        if uname and not local:
+            urec = _ufails.setdefault(uname, [0, 0, now])
+            if now - urec[2] > _USER_LOCK_SEC:           # 计数窗口过期，重新计
+                urec[0], urec[2] = 0, now
+            urec[0] += 1
+            if urec[0] >= _MAX_USER_FAILS:
+                urec[1], urec[0], urec[2] = now + _USER_LOCK_SEC, 0, now
+    u = _users(cfg).get(uname) if uname else None
     try:
         if not u:   # 用户名不存在也跑一遍等量哈希，避免"无此用户"秒回暴露有效用户名(时序侧信道)
             _verify_password(_DUMMY_STORED, password)
@@ -124,25 +175,62 @@ def login(cfg, username, password, src=None):
     except Exception:   # 口令校验出任何异常都按登录失败处理，不让其冒泡成 500
         ok = False
     if not ok:
-        if src:   # 记一次失败，连续达上限则锁定该来源
-            with _slock:
-                rec = _fails.get(src, [0, 0])
-                rec[0] += 1
-                if rec[0] >= _MAX_FAILS:
-                    rec[1] = now + _LOCK_SEC
-                    rec[0] = 0
-                _fails[src] = rec
-        return None
+        if u and _unusable(str(u.get("password", "") or "")):
+            return None, (f"账号 {uname} 还没有设置密码：请在监控电脑上运行 "
+                          f"python auth.py passwd {uname} 设置")
+        return None, "用户名或密码错误"
+    with _slock:            # 口令正确：撤销刚才的占位计数
+        _fails.pop(src, None)
+        if uname and not local:
+            _ufails.pop(uname, None)
+    # 看"实际输入的口令"弱不弱，而不是存储格式：admin888/123456 这类局域网里谁都猜得到，
+    # 只准坐在监控电脑前登录，并强制改掉；够强的明文口令照常可用(不把远程运维的现场锁在外面)
+    must_change = bool(password_problem(uname, password))
+    if must_change and not local:
+        return None, ("该账号密码太弱(默认密码或少于 8 位)，只能在监控电脑本机打开 "
+                      "http://127.0.0.1:端口 登录并修改密码后，才能从其它电脑登录")
     token = secrets.token_hex(24)
     with _slock:
-        _fails.pop(src, None)   # 登录成功清除该来源失败计数
         # 顺手清理已过锁定期的陈旧限流项 + 过期会话，防内存无限增长
         for k in [k for k, v in _fails.items() if v[1] and v[1] < now]:
             _fails.pop(k, None)
-        for t in [t for t, s in _sessions.items() if s["exp"] < now]:
+        for k in [k for k, v in _ufails.items() if v[1] and v[1] < now]:
+            _ufails.pop(k, None)
+        for t in [t for t, s in _sessions.items() if s["exp"] < now or now - s["last"] > IDLE]:
             _sessions.pop(t, None)
-        _sessions[token] = {"user": username, "role": u.get("role", "viewer"), "exp": now + TTL}
-    return token
+        _sessions[token] = {"user": uname, "role": u.get("role", "viewer"), "exp": now + TTL,
+                            "last": now, "must_change": must_change}
+    return token, ""
+
+
+def login(cfg, username, password, src=None):
+    """兼容旧调用：只返回 token 或 None。"""
+    return login_ex(cfg, username, password, src)[0]
+
+
+def change_password(cfg, username, old, new, keep_token=None, path=None):
+    """改自己的密码：校验旧密码 → 写哈希进 config.yaml(原地、保留注释) → 内存立即生效 →
+    踢掉该用户其它会话。返回 "" 或原因。"""
+    import appconfig   # 延迟导入：auth 被很多地方 import，别把配置写回逻辑拖进来
+    u = _users(cfg).get(username)
+    if not u or not _verify_password(u.get("password", ""), old):
+        return "旧密码不对"
+    if old == new:
+        return "新密码不能与旧密码相同"
+    err = password_problem(username, new)
+    if err:
+        return err
+    h = hash_password(new)
+    err = appconfig.set_user_password(username, h, path)
+    if err:
+        return err
+    u["password"] = h
+    with _slock:
+        for t in [t for t, s in _sessions.items() if s["user"] == username and t != keep_token]:
+            _sessions.pop(t, None)
+        if keep_token in _sessions:
+            _sessions[keep_token]["must_change"] = False
+    return ""
 
 
 def logout(token):
@@ -155,9 +243,11 @@ def session(token):
         s = _sessions.get(token)
         if not s:
             return None
-        if s["exp"] < time.time():
+        now = time.time()
+        if s["exp"] < now or now - s.get("last", now) > IDLE:
             _sessions.pop(token, None)
             return None
+        s["last"] = now
         return s
 
 
@@ -175,8 +265,37 @@ def has_role(sess, min_role):
     return ROLE_RANK.get(sess["role"], 0) >= ROLE_RANK.get(min_role, 99)
 
 
-if __name__ == "__main__":   # python auth.py <明文密码> → 打印哈希，粘到 config.yaml 的 password
-    if len(sys.argv) > 1:
+def _cli_passwd(username):
+    """python auth.py passwd <用户>：交互输入两次新密码，直接写进 config.yaml(保留注释)。"""
+    import getpass
+    import appconfig
+    cfg = appconfig.load_config()
+    if username not in _users(cfg):
+        print(f"config.yaml 里没有用户 {username}")
+        return 1
+    while True:
+        new = getpass.getpass(f"为 {username} 设置新密码(输入时不显示): ")
+        err = password_problem(username, new)
+        if err:
+            print(err)
+            continue
+        if getpass.getpass("再输一次: ") != new:
+            print("两次不一致，重来")
+            continue
+        break
+    err = appconfig.set_user_password(username, hash_password(new))
+    if err:
+        print("写入失败:", err)
+        return 1
+    print(f"已更新 {username} 的密码(旧配置备份为 config.yaml.bak)。重启服务后生效。")
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 2 and sys.argv[1] == "passwd":
+        sys.exit(_cli_passwd(sys.argv[2]))
+    elif len(sys.argv) > 1 and sys.argv[1] != "passwd":   # 旧用法：打印哈希，手动粘到 config.yaml
         print(hash_password(sys.argv[1]))
     else:
-        print("用法: python auth.py <password>  生成 pbkdf2 哈希填入 config.yaml")
+        print("用法: python auth.py passwd <用户名>   交互设置密码并写入 config.yaml(推荐)\n"
+              "      python auth.py <password>         只打印 pbkdf2 哈希")

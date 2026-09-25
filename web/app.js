@@ -32,9 +32,14 @@ async function jpost(u, body) {
     body: JSON.stringify(body || {}),
   });
   if (r.status === 401) { showLogin(); throw new Error("401"); }
-  if (r.status === 403) { toast("权限不足：该操作需要 ops 或 admin 角色"); throw new Error("403"); }
   let j = {};
   try { j = await r.json(); } catch (e) { j = { ok: false, error: "HTTP " + r.status }; }
+  if (r.status === 403) {   // 显示后端给的原因(矿池不在白名单/须先改密码…)，不一律说"权限不足"
+    const why = j.error || j.detail || "权限不足：该操作需要 ops 或 admin 角色";
+    toast(why);
+    if (String(why).includes("修改密码")) openPwd(true);
+    throw new Error("403");
+  }
   lastOkMs = Date.now();
   return j;
 }
@@ -896,15 +901,43 @@ document.querySelectorAll("#minerTable th[data-k]").forEach(th => th.onclick = (
 
 /* ---------------- 登录 / 权限 ---------------- */
 let myRole = "admin";
+let myUser = "";
 let _timer = null;
 
 function showLogin() { stopDashboard(); $("loginOverlay").classList.remove("hidden"); }
+
+// ---- 改密码：弱口令会话登录后强制弹出，改完才能操作 ----
+let _pwdForced = false;
+function openPwd(force) {
+  _pwdForced = !!force;
+  $("pwdForce").classList.toggle("hidden", !force);
+  $("pwdClose").style.display = force ? "none" : "";
+  ["pwdOld", "pwdNew", "pwdNew2"].forEach(id => $(id).value = "");
+  $("pwdErr").textContent = "";
+  $("pwdModal").classList.remove("hidden");
+  $("pwdOld").focus();
+}
+async function savePwd() {
+  const old = $("pwdOld").value, nw = $("pwdNew").value;
+  if (nw !== $("pwdNew2").value) { $("pwdErr").textContent = "两次输入的新密码不一致"; return; }
+  let d;
+  try { d = await jpost("/api/password", { old, new: nw }); } catch (e) { return; }
+  if (!d.ok) { $("pwdErr").textContent = d.error || "修改失败"; return; }
+  $("pwdModal").classList.add("hidden");
+  _pwdForced = false;
+  toast("密码已修改", "ok");
+}
+$("btnPwd").onclick = () => openPwd(false);
+$("pwdClose").onclick = () => { if (!_pwdForced) $("pwdModal").classList.add("hidden"); };
+$("pwdSave").onclick = savePwd;
+$("pwdNew2").addEventListener("keydown", e => { if (e.key === "Enter") savePwd(); });
 
 function applyRole() {
   const canCtl = myRole === "ops" || myRole === "admin";
   document.body.classList.toggle("viewer", !canCtl);
   $("btnSeg").style.display = myRole === "admin" ? "" : "none";  // 网段设置仅 admin
   $("btnUpdate").style.display = myRole === "admin" ? "" : "none";  // 版本更新仅 admin
+  $("btnPwd").style.display = myUser && myUser !== "anonymous" ? "" : "none";
   $("userBadge").textContent = myRole;
 }
 
@@ -1063,7 +1096,8 @@ async function doLogin() {
   const d = await r.json();
   if (!d.ok) { $("loginErr").textContent = d.error || "登录失败"; return; }
   $("loginOverlay").classList.add("hidden");
-  myRole = d.role; applyRole(); startDashboard();
+  myRole = d.role; myUser = d.user; applyRole(); startDashboard();
+  if (d.must_change) openPwd(true);
 }
 
 async function doLogout() { await fetch("/api/logout", { method: "POST" }); location.reload(); }
@@ -1091,6 +1125,7 @@ async function init() {
   const r = await fetch("/api/me");
   if (r.status === 401) { showLogin(); return; }
   const me = await r.json();
-  myRole = me.role; applyRole(); startDashboard();
+  myRole = me.role; myUser = me.user; applyRole(); startDashboard();
+  if (me.must_change) openPwd(true);
 }
 init();
