@@ -272,3 +272,18 @@ def test_pool_hijack_alert_through_real_scan_pipeline(svc, monkeypatch):
     svc.scan_full("full")
     hijacked = {a["ip"] for a in db.active_alerts_by_type(svc.conn, "pool_hijack")}
     assert hijacked == {"10.9.0.2"}
+
+
+def test_container_refresh_is_not_blocked_by_a_running_miner_scan(svc, monkeypatch):
+    """巡检 5000 台要一两分钟；以前集装箱 10 秒刷新与它共用一把锁，这期间漏液/断流等
+    冷却数据不刷新、控制器离线也不判。现在集装箱有自己的锁。"""
+    called = []
+    monkeypatch.setattr(db, "known_container_ips", lambda conn: ["10.9.0.200"])
+    monkeypatch.setattr(miner_core, "scan_containers",
+                        lambda ips, cfg, progress_cb=None: called.append(ips) or [])
+    assert svc._scan_lock.acquire(blocking=False)      # 模拟一轮矿机扫描正在进行
+    try:
+        svc.scan_containers()
+    finally:
+        svc._scan_lock.release()
+    assert called == [["10.9.0.200"]]

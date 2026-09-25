@@ -33,6 +33,9 @@ class MonitorService:
         self.conn = db.init_db(cfg["db"]["path"])
         db.resolve_types_except(self.conn, alerts.MINER_TYPES)
         self._scan_lock = threading.Lock()
+        # 集装箱单独一把锁：只保护"写集装箱 + 评估冷却告警"这一小段(全网扫描和 10 秒刷新
+        # 都会做，并发会重复报)。以前共用 _scan_lock，一轮巡检一两分钟里漏液数据都不刷新
+        self._container_lock = threading.Lock()
         # 世代号：每次强制恢复 +1。被判死的旧扫描线程杀不掉，但它醒来后会发现自己
         # 的世代已作废 → 丢弃结果不落库，避免把十几分钟前的探测当成"最新快照"
         # 覆盖现状(会让刚恢复的机器被标回离线并触发一轮误告警)。
@@ -370,7 +373,11 @@ class MonitorService:
                                         state=self._alert_state)
             except Exception as e:  # noqa: BLE001
                 log.exception("alerts.evaluate error: %s", e)
-            try:   # 集装箱：记住/发现新箱 + 对采到的箱评估故障；不在此判离线
+            # 集装箱：记住/发现新箱 + 对采到的箱评估故障；不在此判离线
+            got = self._container_lock.acquire(timeout=60)   # 等正在跑的 10 秒刷新做完
+            try:
+                if not got:
+                    raise RuntimeError("等集装箱刷新超时，本轮不处理集装箱")
                 detected_ips = {c["ip"] for c in containers}
                 db.save_containers(self.conn, ts, containers)
                 db.upsert_containers(self.conn, containers, ts)
@@ -381,6 +388,9 @@ class MonitorService:
                     self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
             except Exception as e:  # noqa: BLE001
                 log.exception("container eval error: %s", e)
+            finally:
+                if got:
+                    self._container_lock.release()
 
             took = time.monotonic() - t0
             log.info("%s 扫描完成: %d 台在线 / %d 落库 (地址 %d), 集装箱 %d, 新告警 %d, 耗时 %.1fs",
@@ -469,10 +479,11 @@ class MonitorService:
         return self._do_scan(kind, ips, workers=self.cfg["scan"].get("workers", 300))
 
     def scan_containers(self):
-        """高频刷新已知集装箱（只打 /cooler）。与全网扫描共用 _scan_lock 互斥。"""
-        lock = self._scan_lock
+        """高频刷新已知集装箱（只打 /cooler）。用独立的 _container_lock：矿机扫描进行中
+        照样刷新(漏液这类数据等不起一两分钟)，只和"全网扫描里处理集装箱那一小段"互斥。"""
+        lock = self._container_lock
         if not lock.acquire(blocking=False):
-            return   # 全网扫描在跑(它已处理集装箱)，本次跳过
+            return   # 上一次刷新或全网扫描的集装箱处理还没完，本次跳过
         try:
             known = db.known_container_ips(self.conn)
             if not known:
@@ -524,7 +535,7 @@ class MonitorService:
                 full_iv = sch.get("full_interval", 3600)
                 need_full = (self._last_full == 0.0) or (start - self._last_full >= full_iv)
                 result = self.scan_full("full") if need_full else self.scan_quick()
-                skipped = result is None   # 锁被占用(手动扫/集装箱)→尽快重试，别空等满间隔
+                skipped = result is None   # 锁被占用(手动扫描在跑)→尽快重试，别空等满间隔
                 if result and result.get("kind") == "full":
                     self._last_full = time.monotonic()
             except Exception as e:  # noqa: BLE001
@@ -681,7 +692,7 @@ class MonitorService:
         with self._trigger_lock:
             if self.progress["running"] or self.progress.get("pending"):
                 return False
-            # 容器刷新可能正持 _scan_lock 但不置 running，先探一下锁
+            # 扫描可能刚拿到 _scan_lock 还没置 running，先探一下锁
             if self._scan_lock.acquire(blocking=False):
                 self._scan_lock.release()
             else:
