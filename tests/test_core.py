@@ -162,7 +162,8 @@ def test_apply_settings_revalidates_hand_edited_values(cfg):
     assert cfg["schedule"]["scan_interval"] == 30
     assert cfg["schedule"]["full_interval"] == 60
     assert cfg["schedule"]["container_interval"] == 5
-    assert cfg["scan"]["discovery_workers"] == 1
+    # 0 并发不夹成 1(那等于扫描停摆)，当作没设置、保留原值
+    assert cfg["scan"]["discovery_workers"] == appconfig.DEFAULTS["scan"]["discovery_workers"]
 
 
 def test_scan_overall_timeout_returns_unknown_instead_of_raising(monkeypatch):

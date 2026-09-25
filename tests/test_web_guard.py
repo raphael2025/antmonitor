@@ -96,3 +96,16 @@ def test_access_log_masks_token():
         "1.2.3.4", "GET", "/api/public/summary?token=SECRET123&x=1"), None)
     f.filter(rec)
     assert "SECRET123" not in rec.getMessage() and "token=***" in rec.getMessage()
+
+
+def test_settings_cannot_silently_stall_scanning(app, monkeypatch):
+    """ARP 限速存成 0：以前接口回显 0，实际被压成 1 pps，5000 台巡检要一个多小时，监控
+    形同停摆且界面上看不出来。现在超范围直接拒绝，保存成功时回显的就是实际生效的值。"""
+    server, c = app
+    monkeypatch.setitem(server.CFG["scan"], "max_pps", 100)
+    for bad in (0, 2000):
+        r = c.post("/api/settings", json={"max_pps": bad})
+        assert r.status_code == 400, bad
+        assert server.CFG["scan"]["max_pps"] == 100
+    r = c.post("/api/settings", json={"max_pps": 200})
+    assert r.status_code == 200 and r.json()["max_pps"] == 200 == server.CFG["scan"]["max_pps"]

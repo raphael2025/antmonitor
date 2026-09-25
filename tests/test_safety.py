@@ -120,3 +120,11 @@ def test_empty_or_placeholder_password_can_never_log_in():
     assert auth.login(cfg, "viewer", "") is None
     assert auth.login(cfg, "legacy", "Plain-But-Real-1")      # 已在用的明文口令不锁死现场
     assert auth.login(cfg, ["admin"], "x") is None            # 非字符串用户名不能冒泡成 500
+
+
+def test_saved_zero_pps_from_old_version_is_ignored_not_clamped_to_one():
+    import appconfig
+    cfg = appconfig._merge(appconfig.DEFAULTS, {"scan": {"max_pps": 120}})
+    appconfig.apply_settings(cfg, {"max_pps": 0, "discovery_workers": 0})
+    assert cfg["scan"]["max_pps"] == 120
+    assert cfg["scan"]["discovery_workers"] == appconfig.DEFAULTS["scan"]["discovery_workers"]

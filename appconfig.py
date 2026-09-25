@@ -401,6 +401,11 @@ def apply_settings(cfg, s):
                 v = int(s[k])
             except (TypeError, ValueError):
                 continue
+            if k in ("max_pps", "discovery_workers") and v < 1:
+                # 旧版网页清空输入框会存成 0，校验时被夹成 1 → 每秒只探 1 台，扫描形同停摆。
+                # 这种值当作没设置，沿用 config.yaml/默认值
+                log.warning("settings.json 里 %s=%s 无效(会让扫描几乎停摆)，已忽略，沿用配置值", k, v)
+                continue
             if k in ("scan_interval", "full_interval", "container_interval"):
                 cfg["schedule"][k] = v
             else:

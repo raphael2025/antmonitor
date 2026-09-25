@@ -51,7 +51,7 @@
           <span class="muted">只探已知机器(约5千台)，抓上线/掉线，日常主力</span></div>
         <div class="seg-host">全网发现间隔(秒) <input id="setFullInterval" type="number" min="60">
           <span class="muted">展开全部网段找新机(慢)，建议 3600</span></div>
-        <div class="seg-host">ARP限速 max_pps <input id="setPps" type="number" min="0"> <span class="muted">(三层CoPP限制下，建议≤500的一半)</span></div>
+        <div class="seg-host">ARP限速 max_pps <input id="setPps" type="number" min="1" max="500"> <span class="muted">(三层CoPP限制下，建议≤500的一半)</span></div>
         <hr class="seg-divider">
         <div class="muted">☁ 云端上报（多场地总览）。保存即时生效，无需重启。本场地ID：<code id="cloudSiteId">-</code></div>
         <div class="seg-host"><label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input id="cloudEnabled" type="checkbox"> 启用上报</label>

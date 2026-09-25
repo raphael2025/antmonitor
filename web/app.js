@@ -826,9 +826,11 @@ async function saveSeg(scan) {
       host_end: parseInt($("segHe").value) || 254,
     });
     if (!d.ok) { toast("保存失败：" + (d.error || "")); return; }
+    // 数字框留空/填错时不提交该项(保留原值)，别悄悄存成 0 或默认值——ARP 限速存成 0 会让扫描几乎停摆
+    const num = (id) => { const v = parseInt($(id).value); return Number.isFinite(v) ? v : undefined; };
     const body = {
-      scan_interval: parseInt($("setInterval").value) || 300,
-      max_pps: parseInt($("setPps").value) || 0,
+      scan_interval: num("setInterval"),
+      max_pps: num("setPps"),
       cloud: {
         enabled: $("cloudEnabled").checked,
         site_name: $("cloudName").value.trim(),
@@ -837,7 +839,8 @@ async function saveSeg(scan) {
         token: $("cloudToken").value.trim(),
       },
     };
-    if ($("setFullInterval")) body.full_interval = parseInt($("setFullInterval").value) || 3600;
+    if ($("setFullInterval")) body.full_interval = num("setFullInterval");
+    Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
     const d2 = await jpost("/api/settings", body);
     if (!d2.ok) { toast("保存失败：" + (d2.error || "")); return; }
     $("segModal").classList.add("hidden");
