@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from requests.auth import HTTPDigestAuth
+from urllib3.exceptions import ProtocolError
 
 import appconfig
 import miner_core
@@ -124,6 +125,46 @@ def normalize_ips(ips, max_batch, cfg=None):
     return out, ""
 
 
+def _sent_then_dropped(e):
+    """请求已送达、矿机在回响应前断开或不再回应——原厂 reboot.cgi 的常见表现
+    (系统已开始重启，web 服务先没了)。连不上(拒绝连接/连接超时)不算。"""
+    if isinstance(e, requests.ConnectTimeout):
+        return False
+    if isinstance(e, (requests.ReadTimeout, requests.exceptions.ChunkedEncodingError)):
+        return True
+    return isinstance(e, requests.ConnectionError) and bool(e.args) \
+        and isinstance(e.args[0], ProtocolError)
+
+
+def _stock_reboot(s, ip, passwords, timeout):
+    """原厂重启：GET /cgi-bin/reboot.cgi(与原厂网页一致)，个别固件回 405 再用 POST。
+
+    矿机收到后常常不回响应就断开(已经在重启)——以前这被当成"失败"，值班员看到失败
+    会再点一次，等于对正在重启的机器补发命令。现在按"已下发"处理；真没起来由
+    告警侧的"重启后 N 分钟仍未上线"兜底。只有 401(换下一组密码)/405(换 POST)才会
+    再发请求，这两种矿机都没执行，不存在重复重启。
+    """
+    url = f"http://{ip}/cgi-bin/reboot.cgi"
+    r = None
+    for u, p in passwords:
+        auth = HTTPDigestAuth(u, p)
+        for method in ("GET", "POST"):
+            try:
+                r = s.request(method, url, auth=auth, timeout=timeout)
+            except requests.RequestException as e:
+                if _sent_then_dropped(e):
+                    return True, "已下发(矿机未回响应即断开，通常表示已开始重启)"
+                return False, f"连不上矿机: {e}"
+            if r.status_code != 405:
+                break
+        if r.status_code == 401:
+            continue
+        if r.status_code == 200:
+            return True, "reboot ok"
+        return False, f"矿机拒绝重启: HTTP {r.status_code}"
+    return False, "密码无效(401)"
+
+
 def _stock(ip, action, params, passwords, timeout):
     s = requests.Session(); s.trust_env = False
 
@@ -152,8 +193,7 @@ def _stock(ip, action, params, passwords, timeout):
         return None
 
     if action == "reboot":
-        r, msg = post("reboot.cgi")
-        return (r is not None and r.status_code == 200), msg or "reboot ok"
+        return _stock_reboot(s, ip, passwords, timeout)
     if action == "locate":
         on = bool(params.get("on"))
         r, msg = post("blink.cgi", json={"blink": "true" if on else "false"})

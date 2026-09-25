@@ -112,6 +112,8 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         return []
     state = state if state is not None else {}
     streak = state.setdefault("low_hr_streak", {})
+    rebooting = state.setdefault("rebooting", {})   # ip → 下发重启的时间(MonitorService.mark_rebooting 写入)
+    rb_grace = cfg.get("control", {}).get("reboot_grace_sec", 600)
 
     cooldown = acfg.get("cooldown", 1800)
     seg_ratio = acfg.get("segment_down_ratio", 0.6)
@@ -133,6 +135,9 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     roster = set(db.roster_ips(conn, roster_age))   # 已知真机(算网段比例的分母)
 
     b = _Batch(conn, cooldown, now)
+    # 静默期内的刚重启机器：掉线是预期内的，不报单机掉线，也不计入网段掉线比例
+    # (整段批量重启不能被当成交换机/断电事件)
+    rb_quiet = {ip for ip, t in list(rebooting.items()) if now - t < rb_grace}
 
     # —— 网段级故障(基于当前绝对离线率)：交换机持续挂着会一直维持事件 ——
     # unknown(本轮未探测)不计入分子/分母——理由跟单机判断一致：拥堵时"没问过"
@@ -140,7 +145,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     # 但同时要记 seg_unknown：用于下面"回落判定"时识别"这轮数据不完整、不可信"。
     seg_total, seg_off, seg_unknown = {}, {}, {}
     for ip, r in cur.items():
-        if ip not in roster:
+        if ip not in roster or ip in rb_quiet:
             continue
         seg = ".".join(ip.split(".")[:3])
         if r["status"] == "unknown":
@@ -189,11 +194,21 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             streak.pop(ip, None)
             if ip in repair or seg in down_segments:
                 b.resolve(ip, "offline")   # 维修中/被网段事件覆盖 → 清掉历史单条
+                rebooting.pop(ip, None)
+                continue
+            if ip in rb_quiet:             # 刚下发重启，还在静默期
+                continue
+            if ip in rebooting:            # 静默期已过仍不在线：重启没起来
+                rebooting.pop(ip, None)
+                b.fire(ip, "offline", "crit",
+                       f"{ip} 重启后 {max(1, rb_grace // 60)} 分钟仍未上线")
                 continue
             if prev.get(ip, {}).get("status") == "online":
                 b.fire(ip, "offline", "crit", f"{ip} 掉线")
             continue
         b.resolve(ip, "offline")
+        if ip in rebooting and ip not in rb_quiet:   # 静默期结束时在线 → 重启完成
+            rebooting.pop(ip, None)
 
         hr = r.get("hr_rt")
         up = r.get("uptime")
@@ -251,6 +266,9 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     for ip in list(streak):     # 已不在本轮样本内的机器(下架/换IP)：别让计数无限增长
         if ip not in cur:
             streak.pop(ip, None)
+    for ip in list(rebooting):  # 同理：静默期过了还没出现在样本里的(下架/换IP)
+        if ip not in cur and ip not in rb_quiet:
+            rebooting.pop(ip, None)
 
     fired = b.commit()
     if fired:

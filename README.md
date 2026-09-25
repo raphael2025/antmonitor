@@ -82,6 +82,11 @@ python db.py vacuum       # 回收删除留下的空页（独占数据库，放�
 | ⟳ 重启 | `reboot.cgi` | `system/reboot`（需解锁） | 是·二次确认 |
 | ⚙ 换矿池 | `set_miner_conf.cgi` | `settings`（需解锁） | 是·二次确认 |
 
+**原厂重启说明**：`GET /cgi-bin/reboot.cgi`（与原厂网页一致，个别固件回 405 时改用 POST）。
+矿机收到后常常不回响应就断开（已经在重启），这种情况按「已下发」算成功，不会补发。
+下发后进入 `control.reboot_grace_sec`（默认 600 秒）**静默期**：期间掉线不报警、不算进网段掉线比例；
+过了静默期仍不在线 → 报「重启后 N 分钟仍未上线」。刚开机的零算力/掉算力本来就有 `zero_grace_sec` 宽限。
+
 破坏性命令弹窗强制二次确认；所有命令写入 `command_log` 审计表（admin 可查 `/api/commands`）。
 第三方解锁密码配 `control.uniplus_password`，原厂密码复用 `scan.passwords`。
 

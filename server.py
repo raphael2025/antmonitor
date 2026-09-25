@@ -959,6 +959,7 @@ def _run_command_bg(targets, action, params, user):
             CMD_PROGRESS["done"] = done
             CMD_PROGRESS["total"] = total
         results, _err = control.run_batch(targets, action, params, CFG, progress=prog)
+        SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
         db.log_commands(SVC.conn, user, action, results)
         ok_n = sum(1 for r in results if r["ok"])
         CMD_PROGRESS["success"] = ok_n
@@ -1046,6 +1047,7 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
             _audit_reject(user, action, "已有批量命令在执行")
             return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
                                 status_code=409)
+        SVC.mark_rebooting(ips)
         CMD_PROGRESS.update({"running": True, "action": action, "done": 0,
                              "total": len(targets), "success": 0, "failed": 0,
                              "fail_ips": [], "user": user})
@@ -1053,7 +1055,11 @@ def api_command(body: dict = Body(...), sess: dict = Depends(require_ops)):
                          daemon=True).start()
         return {"ok": True, "async": True, "action": action, "count": len(targets),
                 "batch": rb, "delay": ctl.get("reboot_delay_sec", 0)}
+    if action == "reboot":
+        SVC.mark_rebooting(ips)
     results, err = control.run_batch(targets, action, params, CFG)
+    if action == "reboot":
+        SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
     db.log_commands(SVC.conn, user, action, results)

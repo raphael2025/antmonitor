@@ -78,6 +78,7 @@ DEFAULTS = {
     "control": {
         "enabled": False, "uniplus_password": "", "timeout": 8, "max_batch": 1000,
         "reboot_concurrency": 30, "reboot_delay_sec": 8, "reboot_shuffle": True,
+        "reboot_grace_sec": 600,   # 下发重启后这么久内掉线不报警；过了仍不在线报"重启后未上线"
     },
     "auth": {"enabled": True, "secure_cookie": False, "users": []},
     "update": {"auto": False, "branch": "", "check_interval": 3600},
@@ -160,6 +161,7 @@ def _validate(cfg):
     # 会把整批重启中断在半路(前一半重启了后一半没有)。0 秒=不等待，合法。
     clamp("control", "reboot_concurrency", 1, 1000, int)
     clamp("control", "reboot_delay_sec", 0, 3600)
+    clamp("control", "reboot_grace_sec", 0, 86400, int)
     # 告警阈值：0 在这几项里是"关闭该告警"的约定语义，故下限取 0 而非正数；
     # 比例类限制在 0~1，百分比类限制在 0~100，温度取物理上可能的范围。
     clamp("alerts", "overheat_c", 0, 200)

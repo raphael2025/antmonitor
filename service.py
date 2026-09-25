@@ -56,7 +56,7 @@ class MonitorService:
         self._trigger_lock = threading.Lock()   # 手动扫描触发的判重(防两个请求都说"已启动")
         self._container_miss = {}     # 集装箱连续未采到次数(二次确认离线，防一次丢包误报)
         self._container_miss_n = 2
-        self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数)
+        self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数、刚重启的机器)
         self._last_full = 0.0         # 上次全网发现完成的 monotonic 时刻
         self._last_checkpoint = 0.0
         self._last_rollup = 0.0
@@ -85,6 +85,19 @@ class MonitorService:
         recs = db.scan_records(self.conn, ls["scan_id"])
         self._publish(ls["scan_id"], ls["ts"], ls.get("kind") or "", recs)
         return self.snapshot, recs
+
+    def mark_rebooting(self, ips):
+        """记下刚下发重启的机器：静默期内掉线不报警(见 alerts.evaluate)。
+        批量分批重启要跑几分钟，所以在下发前整批先标记，失败的再用 unmark_rebooting 撤掉。"""
+        rb = self._alert_state.setdefault("rebooting", {})
+        now = int(time.time())
+        for ip in ips:
+            rb[ip] = now
+
+    def unmark_rebooting(self, ips):
+        rb = self._alert_state.setdefault("rebooting", {})
+        for ip in ips:
+            rb.pop(ip, None)
 
     def drop_from_snapshot(self, ips):
         """下架移除后立刻从内存快照剔除，否则要等下一轮扫描列表才更新。"""
