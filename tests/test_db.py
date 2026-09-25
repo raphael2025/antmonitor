@@ -138,3 +138,32 @@ def test_hourly_boundary_uses_full_hour(conn):
     row = conn.execute("SELECT th_h FROM worker_hourly WHERE hour=? AND worker='F'",
                        (h,)).fetchone()
     assert row is not None and row["th_h"] > 0
+
+
+def test_unknown_samples_are_not_billed_as_customer_downtime(conn):
+    """扫描拥堵时本轮没探到的机器(unknown)不能算成客户停机：一小时里一半轮次拥堵，
+    一台一直在挖的机器可用率会变成 50%、交付算力也少一半，客户会拿这个索赔。"""
+    h = now_hour(-1)
+    for i in range(12):                  # 对照机 C 一直在线；U 一半轮次拥堵成 unknown
+        u = rec("10.2.5.1", worker="U", hr=100.0) if i % 2 == 0 else \
+            rec("10.2.5.1", status="unknown", worker="")
+        insert_scan(conn, h + i * 300, "quick", [u, rec("10.2.5.2", worker="C", hr=100.0)])
+    rows = {r["worker"]: r for r in db.customer_report(conn, hours=6)}
+    assert rows["U"]["uptime_pct"] == 100.0
+    assert rows["U"]["delivered_th_h"] == rows["C"]["delivered_th_h"]
+
+
+def test_report_window_does_not_bill_an_extra_hour(conn, monkeypatch):
+    """查"近 1 小时"只能算 1 小时：以前已归档部分把起点所在的整小时全算进来，
+    整点后 45 分查 1 小时会得到 1.75 小时的交付算力(24 小时报表多算约 4%)。"""
+    import time as _t
+    base = now_hour(-3)
+    for k in range(3):                       # 连续 3 个整小时，每 5 分钟一次，100 TH
+        for i in range(12):
+            insert_scan(conn, base + k * 3600 + i * 300, "quick",
+                        [rec("10.2.6.1", worker="W", hr=100.0)])
+    now = base + 2 * 3600 + 45 * 60          # 第 3 个小时的 45 分
+    monkeypatch.setattr(_t, "time", lambda: now)
+    db.rollup_hours(conn, now=now)
+    row = {r["worker"]: r for r in db.customer_report(conn, hours=1)}["W"]
+    assert abs(row["delivered_th_h"] - 100.0) < 2.0, row

@@ -891,15 +891,23 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
                 return JSONResponse({"ok": False, "error": "公网云端地址必须用 https://"},
                                     status_code=400)
         s["cloud"] = cl
-    ranges = {"scan_interval": (30, 86400), "full_interval": (60, 604800),
-              "container_interval": (5, 3600), "max_pps": (0, 2000),
-              "discovery_workers": (1, 2000)}
-    try:   # 非数字字段返回 400 而非 500
-        for k, (lo, hi) in ranges.items():
-            if k in body:
-                s[k] = max(lo, min(hi, int(body[k])))
-    except (TypeError, ValueError):
-        return JSONResponse({"ok": False, "error": "参数须为数字"}, status_code=400)
+    # 与 appconfig._validate 的上下限保持一致(max_pps/discovery_workers 硬上限 500 = 三层 CoPP)。
+    # 超范围直接拒绝而不是悄悄夹紧：以前网页清空 ARP 限速会存成 0、回显 0，实际被夹成 1 pps，
+    # 巡检一轮要一个多小时，监控形同停摆却看不出来
+    ranges = {"scan_interval": (30, 86400, "巡检间隔(秒)"), "full_interval": (60, 604800, "全网发现间隔(秒)"),
+              "container_interval": (5, 3600, "集装箱刷新间隔(秒)"), "max_pps": (1, 500, "ARP限速 max_pps"),
+              "discovery_workers": (1, 500, "发现并发")}
+    for k, (lo, hi, name) in ranges.items():
+        if k not in body:
+            continue
+        try:
+            v = int(body[k])
+        except (TypeError, ValueError, OverflowError):
+            return JSONResponse({"ok": False, "error": f"{name} 须为数字"}, status_code=400)
+        if not lo <= v <= hi:
+            return JSONResponse({"ok": False, "error": f"{name} 须在 {lo}~{hi} 之间"},
+                                status_code=400)
+        s[k] = v
     effective_scan = s.get("scan_interval", CFG["schedule"].get("scan_interval", 300))
     effective_full = s.get("full_interval", CFG["schedule"].get("full_interval", 3600))
     if effective_full < effective_scan:
@@ -909,6 +917,9 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     appconfig.apply_settings(CFG, s)   # 即时生效，无需重启
     SVC.wake()                         # 唤醒调度循环立即按新间隔重排
     out = {"ok": True, **s}
+    for k in ranges:                   # 回显实际生效的值
+        if k in s:
+            out[k] = CFG["schedule"].get(k) if k.endswith("interval") else CFG["scan"].get(k)
     if "cloud" in s:                   # 上报线程热重启(旧线程自动失效)
         _start_cloud_report()
         out["site_id"] = cloud_report.site_id(CFG)

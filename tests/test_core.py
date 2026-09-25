@@ -162,7 +162,8 @@ def test_apply_settings_revalidates_hand_edited_values(cfg):
     assert cfg["schedule"]["scan_interval"] == 30
     assert cfg["schedule"]["full_interval"] == 60
     assert cfg["schedule"]["container_interval"] == 5
-    assert cfg["scan"]["discovery_workers"] == 1
+    # 0 并发不夹成 1(那等于扫描停摆)，当作没设置、保留原值
+    assert cfg["scan"]["discovery_workers"] == appconfig.DEFAULTS["scan"]["discovery_workers"]
 
 
 def test_scan_overall_timeout_returns_unknown_instead_of_raising(monkeypatch):
@@ -186,3 +187,58 @@ def test_scan_containers_overall_timeout_does_not_raise(monkeypatch):
     orig = miner_core.as_completed
     monkeypatch.setattr(miner_core, "as_completed", lambda fs, timeout=None: orig(fs, timeout=0.3))
     assert miner_core.scan_containers(["10.0.0.9"], {}) == []
+
+
+class _R:
+    def __init__(self, payload, code=200):
+        import json as _json
+        self._p, self.status_code = payload, code
+        self.text = payload.get("sn", "") if isinstance(payload, dict) and "sn" in payload \
+            else _json.dumps(payload)
+
+    def json(self):
+        return self._p
+
+
+class _S:
+    """按 URL 片段返回预设 JSON 的假会话。"""
+    def __init__(self, routes):
+        self.routes = routes
+
+    def get(self, url, **kw):
+        for frag, payload in self.routes.items():
+            if frag in url:
+                return _R(payload)
+        raise AssertionError(url)
+
+
+def test_antbox_leak_fault_survives_malformed_minerinfo(monkeypatch):
+    """minerInfo 返回怪结构(params 是列表)时，已解析好的漏液故障不能随整条记录丢掉。"""
+    import miner_core
+    monkeypatch.setattr(miner_core, "get_session", lambda: _S({
+        "coolerState": {"ok": True, "method": "coolerState",
+                        "params": {"leakage_fault": 1, "supply_liquid_temp": 30}},
+        "minerInfo": {"params": ["n/a"]}}))
+    rec = miner_core.probe_antbox("10.0.0.9", 1, 1)
+    assert rec is not None
+    assert [f["flag"] for f in rec["faults"]] == ["leakage_fault"]
+
+
+def test_antbox_malformed_coolerstate_counts_as_not_collected(monkeypatch):
+    """coolerState 的 params 不是字典：按"没采到"(交给连续未采到→控制器离线告警)，
+    绝不能返回一条故障位全空的记录——那会把正在报的漏液告警当成已恢复消掉。"""
+    import miner_core
+    monkeypatch.setattr(miner_core, "get_session", lambda: _S({
+        "coolerState": {"ok": True, "method": "coolerState", "params": ["garbage"]}}))
+    assert miner_core.probe_antbox("10.0.0.9", 1, 1) is None
+
+
+def test_stock_miner_with_malformed_stats_stays_online(monkeypatch):
+    """stats.cgi 回了结构不对的 JSON：机器明明在线，不能被当成离线误报掉线。"""
+    import miner_core
+    for bad in ([1, 2], {"INFO": {}, "STATS": "x"}, {"STATS": [{"chain": ["bad"]}]}):
+        monkeypatch.setattr(miner_core, "get_session", lambda b=bad: _S({
+            "get_sn": {"sn": "SN1234567890"}, "stats.cgi": b}))
+        monkeypatch.setattr(miner_core, "tcp_open", lambda *a, **k: True)
+        rec = miner_core.probe_stock("10.0.0.1", 1, 1, [("root", "root")])
+        assert rec is not None and rec["status"] == "online", bad

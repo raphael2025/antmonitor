@@ -732,10 +732,20 @@ def _aggregate(rows, deltas):
         if r["worker"]:
             ip2worker[r["ip"]] = r["worker"]
     agg = {}
+    last_known = {}
     for r in rows:
         w = ip2worker.get(r["ip"]) or "(未知)"
         a = agg.setdefault(w, {"ips": set(), "samples": 0, "online": 0, "th_h": 0.0, "kwh": 0.0})
         a["ips"].add(r["ip"])
+        if r["status"] == "unknown":
+            # 本轮扫描拥堵没探到 ≠ 客户停机：沿用该机本区间内上一次确认的状态(正在挖的机器
+            # 大概率还在挖)；区间内没有可参照的就不计入分母，绝不当成停机
+            prev = last_known.get(r["ip"])
+            if prev is None:
+                continue
+            r = dict(prev, scan_id=r["scan_id"])
+        else:
+            last_known[r["ip"]] = r
         a["samples"] += 1
         if r["status"] == "online":
             a["online"] += 1
@@ -808,18 +818,28 @@ def customer_report(conn, hours=24):
                                   "online": 0, "th_h": 0.0, "kwh": 0.0})
 
     if rolled_to > frm:
-        rows = _r(conn).execute(
-            "SELECT worker, MAX(machines) m, SUM(samples) s, SUM(online) o, "
-            "SUM(th_h) th, SUM(kwh) kw FROM worker_hourly WHERE hour>=? AND hour<? "
-            "GROUP BY worker", (frm - frm % HOUR, rolled_to)).fetchall()
-        for r in rows:
-            a = slot(r["worker"])
-            # 机器数取各小时峰值：跨小时求和会把同一台机重复计数
-            a["machines"] = max(a["machines"], r["m"] or 0)
-            a["samples"] += r["s"] or 0
-            a["online"] += r["o"] or 0
-            a["th_h"] += r["th"] or 0.0
-            a["kwh"] += r["kw"] or 0.0
+        # 起点所在的整小时只算落在窗口内的那一截(按比例折算)，其余整小时全算。以前整小时
+        # 全算，再加上实时部分，整点后 45 分查"近 1 小时"会得到 1.75 小时的交付算力。
+        # 不去补查那一截的明细快照：长周期报表的起点早已超出明细保留期
+        frm_floor = frm - frm % HOUR
+        parts = [(frm_floor + HOUR if frm % HOUR else frm_floor, rolled_to, 1.0)]
+        if frm % HOUR and frm_floor < rolled_to:
+            parts.append((frm_floor, frm_floor + 1, (HOUR - frm % HOUR) / HOUR))
+        for lo, hi, weight in parts:
+            if lo >= hi:
+                continue
+            rows = _r(conn).execute(
+                "SELECT worker, MAX(machines) m, SUM(samples) s, SUM(online) o, "
+                "SUM(th_h) th, SUM(kwh) kw FROM worker_hourly WHERE hour>=? AND hour<? "
+                "GROUP BY worker", (lo, hi)).fetchall()
+            for r in rows:
+                a = slot(r["worker"])
+                # 机器数取各小时峰值：跨小时求和会把同一台机重复计数
+                a["machines"] = max(a["machines"], r["m"] or 0)
+                a["samples"] += (r["s"] or 0) * weight
+                a["online"] += (r["o"] or 0) * weight
+                a["th_h"] += (r["th"] or 0.0) * weight
+                a["kwh"] += (r["kw"] or 0.0) * weight
 
     live_from = max(frm, rolled_to)
     if live_from < now:

@@ -38,7 +38,7 @@ schedule:
   # 既压三层网络，也让 SQLite 的 WAL checkpoint 永远追不上。
   scan_interval: 300    # 名册巡检间隔(秒)
   full_interval: 3600   # 全网发现间隔(秒)
-  watchdog_minutes: 0   # 看门狗：超过N分钟无成功扫描则告警+自愈；0=自动按上面两个间隔推算
+  watchdog_minutes: 0   # 看门狗：超过N分钟无成功扫描则告警+自愈；0=自动取 max(15, 巡检间隔×3) 分钟
   container_interval: 10 # 集装箱(冷却)高频刷新间隔(秒)，独立于矿机扫描；带宽可忽略
 
 alerts:

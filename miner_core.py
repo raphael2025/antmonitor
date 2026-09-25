@@ -256,7 +256,11 @@ def probe_antbox(ip, online_to, data_to):
     if not (isinstance(d, dict) and _truthy(d.get("ok"))
             and d.get("method") == "coolerState"):
         return None
-    p = d.get("params") or {}
+    p = d.get("params")
+    if not isinstance(p, dict):
+        # 读不出冷却数据：按"本轮没采到"交给连续未采到→控制器离线告警。绝不能返回一条
+        # 故障位全空的记录，那会把正在报的漏液等告警当成"已恢复"消掉
+        return None
     rec = {
         "device": "container", "ip": ip, "status": "online", "name": ip,
         "supply_temp": _number(p.get("supply_liquid_temp")),
@@ -281,14 +285,16 @@ def probe_antbox(ip, online_to, data_to):
     }
     try:  # 矿机信息（best-effort，箱内矿机数/芯片温/成员列表）
         mj = s.get(f"http://{ip}/cooler?operation=minerInfo", timeout=data_to).json()
-        m = (mj.get("params") or {}) if isinstance(mj, dict) else {}   # 返回非dict(如数组)不崩，防中断本轮扫描
+        m = mj.get("params") if isinstance(mj, dict) else None
+        if not isinstance(m, dict):    # 数组/字符串等怪结构：忽略附加信息，冷却数据照常返回
+            m = {}
         rec["miner_num"] = _number(m.get("miner_num"), integer=True)
         ct = _number(m.get("chip_max_temp"))
         rec["chip_max_temp"] = ct if (ct is not None and ct > -100000) else None
         mi = m.get("miner_info")
         if isinstance(mi, dict):
             rec["miner_ips"] = list(mi.keys())   # 箱内矿机（populated 时）
-    except (requests.RequestException, ValueError):
+    except Exception:  # noqa: BLE001 - 附加信息出任何问题都不能连累已解析的漏液等故障位
         pass
     return rec
 
@@ -433,7 +439,9 @@ def probe_stock(ip, online_to, data_to, passwords, collect_identity=False):
         except requests.RequestException:
             rec["note"] = "6060在线,stats.cgi超时"
             return rec
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, AttributeError, TypeError, IndexError):
+            # 结构不对(数组/字符串/字段类型错)：机器明明在线，只是读不到算力。异常若冒到
+            # 扫描层会被当成离线，误报掉线
             rec["note"] = "stats.cgi响应异常"
             return rec
     rec["note"] = "密码无效(401)"
@@ -447,6 +455,8 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False):
         r = s.get(f"http://{ip}/api/v1/summary", timeout=online_to)
         d = r.json()
     except (requests.RequestException, ValueError):
+        return None
+    if not isinstance(d, dict):
         return None
     m = d.get("miner")
     if not isinstance(m, dict):
