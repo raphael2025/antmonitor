@@ -120,7 +120,7 @@ tr.sel { background: #15293f; }
 
 /* 角色：viewer 隐藏所有写操作入口 */
 body.viewer .cmdbar, body.viewer .cbcol, body.viewer .rmbtn, body.viewer .ackbtn,
-body.viewer #btnFull, body.viewer #btnQuick { display: none !important; }
+body.viewer #btnFull, body.viewer #btnQuick, body.viewer #btnScanContainers { display: none !important; }
 
 /* 网段设置 */
 #segBody textarea { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #e6e6e6;

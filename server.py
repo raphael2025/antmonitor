@@ -354,9 +354,11 @@ def _rate_ok(src):
 @app.get("/api/summary")
 def api_summary(_: dict = Depends(require_viewer)):
     ls, recs = _latest_records()
+    # stale_after：前端"数据过期"横幅用服务端看门狗同一阈值(以前写死 900 秒，巡检间隔调大后每轮都误报)
+    extra = {"progress": SVC.progress, "stale_after": int(SVC._stale_threshold())}
     if not ls:
-        return {"scanned": False, "progress": SVC.progress}
-    return {"scanned": True, **_summary_stats(ls, recs), "progress": SVC.progress}
+        return {"scanned": False, **extra}
+    return {"scanned": True, **_summary_stats(ls, recs), **extra}
 
 
 def _container_faulty(c, ignore):
