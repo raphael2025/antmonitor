@@ -32,6 +32,11 @@ _LOCK_SEC = 300        # 触顶后锁定秒数(5分钟)，挡在线暴破
 _ufails = {}
 _MAX_USER_FAILS = 20
 _USER_LOCK_SEC = 900
+# 在这个账号下成功登录过的来源：不受"按用户名锁定"影响。否则局域网里任何人用几个 IP 各错几次，
+# 就能把值班员从自己常用的电脑上锁在外面(默认用户名 admin/ops 是公开的)
+_good_src = {}
+_MAX_PW_FAILS = 5      # 同一会话改密码时旧密码连错这么多次 → 踢掉会话(防拿偷来的 cookie 在线爆破)
+_pwfails = {}
 
 # 哑口令记录：用户名不存在时拿它跑一遍等量 PBKDF2，拉平"无此用户/口令错"的耗时差(时序侧信道)。
 # 随机 salt + 全零摘要，构造本身不做哈希运算(不拖慢导入)，且永远校验不通过。
@@ -152,8 +157,9 @@ def login_ex(cfg, username, password, src=None, local=None):
         rec = _fails.get(src) if src else None
         if rec and rec[1] > now:
             return None, "失败次数过多，请稍后再试"
+        trusted_src = local or (src in _good_src.get(uname, ()))
         urec = _ufails.get(uname) if uname else None
-        if urec and urec[1] > now and not local:
+        if urec and urec[1] > now and not trusted_src:
             return None, "该账号失败次数过多，已临时锁定，请稍后再试(监控电脑本机不受限)"
         # 先占位计一次失败再去校验：PBKDF2 期间会释放 GIL，若校验完才计数，
         # 几十个并发错误请求会全部跑完校验，按 IP 的上限形同虚设
@@ -162,7 +168,7 @@ def login_ex(cfg, username, password, src=None, local=None):
             rec[0] += 1
             if rec[0] >= _MAX_FAILS:
                 rec[1], rec[0] = now + _LOCK_SEC, 0
-        if known and not local:   # 只给真实存在的账号计数：随机用户名不能把这张表撑爆
+        if known and not trusted_src:   # 只给真实存在的账号计数：随机用户名不能把这张表撑爆
             urec = _ufails.setdefault(uname, [0, 0, now])
             if now - urec[2] > _USER_LOCK_SEC:           # 计数窗口过期，重新计
                 urec[0], urec[2] = 0, now
@@ -181,16 +187,19 @@ def login_ex(cfg, username, password, src=None, local=None):
             return None, (f"账号 {uname} 还没有设置密码：请在监控电脑上运行 "
                           f"python auth.py passwd {uname} 设置")
         return None, "用户名或密码错误"
-    with _slock:            # 口令正确：撤销刚才的占位计数
+    with _slock:            # 口令正确：撤销刚才的占位计数，记住这个来源
         _fails.pop(src, None)
         if uname and not local:
             _ufails.pop(uname, None)
-    # 看"实际输入的口令"弱不弱，而不是存储格式：admin888/123456 这类局域网里谁都猜得到，
-    # 只准坐在监控电脑前登录，并强制改掉；够强的明文口令照常可用(不把远程运维的现场锁在外面)
+        if src:
+            good = _good_src.setdefault(uname, set())
+            if len(good) < 50:
+                good.add(src)
+    # 看"实际输入的口令"弱不弱，而不是存储格式：admin888/123456 这类局域网里谁都猜得到。
+    # 弱口令：本机登录后强制改；远程照常能登录、能看监控(不把远程运维的站点整个锁在外面)，
+    # 但只能看、也不能在远程改密码——猜中 admin888 的人不能借改密码把账号抢走
     must_change = bool(password_problem(uname, password))
-    if must_change and not local:
-        return None, ("该账号密码太弱(默认密码或少于 8 位)，只能在监控电脑本机打开 "
-                      "http://127.0.0.1:端口 登录并修改密码后，才能从其它电脑登录")
+    weak_remote = must_change and not local
     token = secrets.token_hex(24)
     with _slock:
         # 顺手清理已过锁定期的陈旧限流项 + 过期会话，防内存无限增长
@@ -201,7 +210,7 @@ def login_ex(cfg, username, password, src=None, local=None):
         for t in [t for t, s in _sessions.items() if s["exp"] < now or now - s["last"] > IDLE]:
             _sessions.pop(t, None)
         _sessions[token] = {"user": uname, "role": u.get("role", "viewer"), "exp": now + TTL,
-                            "last": now, "must_change": must_change}
+                            "last": now, "must_change": must_change, "weak_remote": weak_remote}
     return token, ""
 
 
@@ -214,9 +223,21 @@ def change_password(cfg, username, old, new, keep_token=None, path=None):
     """改自己的密码：校验旧密码 → 写哈希进 config.yaml(原地、保留注释) → 内存立即生效 →
     踢掉该用户其它会话。返回 "" 或原因。"""
     import appconfig   # 延迟导入：auth 被很多地方 import，别把配置写回逻辑拖进来
+    with _slock:
+        sess = _sessions.get(keep_token) if keep_token else None
+    if sess and sess.get("weak_remote"):
+        return "这个账号的密码太弱，只能在监控电脑本机(打开 http://127.0.0.1:端口)登录后修改"
     u = _users(cfg).get(username)
     if not u or not _verify_password(u.get("password", ""), old):
+        if keep_token:
+            with _slock:
+                n = _pwfails[keep_token] = _pwfails.get(keep_token, 0) + 1
+                if n >= _MAX_PW_FAILS:
+                    _pwfails.pop(keep_token, None)
+                    _sessions.pop(keep_token, None)
+                    return "旧密码连续错误次数过多，已退出登录"
         return "旧密码不对"
+    _pwfails.pop(keep_token, None)
     if old == new:
         return "新密码不能与旧密码相同"
     err = password_problem(username, new)

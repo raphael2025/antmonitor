@@ -32,12 +32,18 @@ WEAK = {"username": "admin", "password": "admin888", "role": "admin"}
 STRONG = {"username": "ops", "password": auth.hash_password("Str0ng-Pass!"), "role": "ops"}
 
 
-def test_weak_password_only_from_the_monitor_pc_and_must_change():
+def test_weak_password_remote_is_view_only_and_cannot_change_password(tmp_path):
+    """自动更新后弱口令账号不能被整个锁在外面(远程站点只能派人去现场)：远程照常能登录、
+    能看监控，但只能看；而且远程不能改密码——否则猜中 admin888 的人登录后改个密码就把账号抢走。"""
     cfg = _cfg(WEAK)
     tok, why = auth.login_ex(cfg, "admin", "admin888", src="192.168.1.50")
-    assert tok is None and "本机" in why
-    tok, why = auth.login_ex(cfg, "admin", "admin888", src="127.0.0.1")
-    assert tok and auth.session(tok)["must_change"] is True
+    s = auth.session(tok)
+    assert tok and s["must_change"] and s["weak_remote"]
+    assert "本机" in auth.change_password(cfg, "admin", "admin888", "N3w-Strong-Pw",
+                                         keep_token=tok, path=str(tmp_path / "x.yaml"))
+    tok, _ = auth.login_ex(cfg, "admin", "admin888", src="127.0.0.1")
+    s = auth.session(tok)
+    assert s["must_change"] and not s["weak_remote"]
 
 
 def test_strong_password_logs_in_from_lan_without_forced_change():
@@ -47,12 +53,15 @@ def test_strong_password_logs_in_from_lan_without_forced_change():
 
 def test_per_user_lock_defeats_ip_rotation_but_never_locks_out_the_pc():
     cfg = _cfg(STRONG)
+    auth.login_ex(cfg, "ops", "Str0ng-Pass!", src="10.8.8.8")    # 值班员平时用的电脑
     for i in range(auth._MAX_USER_FAILS):
         auth.login_ex(cfg, "ops", "wrong", src=f"10.1.{i // 250}.{i % 250 + 1}")
     tok, why = auth.login_ex(cfg, "ops", "Str0ng-Pass!", src="10.9.9.9")   # 新 IP、正确口令
     assert tok is None and "锁定" in why
     tok, _ = auth.login_ex(cfg, "ops", "Str0ng-Pass!", src="127.0.0.1")
     assert tok                                                              # 本机永远能进
+    tok, _ = auth.login_ex(cfg, "ops", "Str0ng-Pass!", src="10.8.8.8")
+    assert tok      # 以前成功登录过的电脑也不受这道锁影响：别人没法恶意把值班员锁在外面
 
 
 def test_concurrent_wrong_logins_cannot_exceed_the_per_ip_limit(monkeypatch):
@@ -95,7 +104,11 @@ def test_web_password_change_forces_weak_session_through_and_writes_config(monke
 
     c = TestClient(server.app)
     r = c.post("/api/login", json={"username": "weakops", "password": "ops888"})
-    assert r.status_code == 401 and "本机" in r.json()["error"]        # TestClient 不是本机
+    assert r.status_code == 200 and r.json()["must_change"]          # 远程弱口令：能登录、只能看
+    assert c.post("/api/command", json={"ips": ["10.0.0.1"], "action": "locate",
+                                        "params": {"on": True}}).status_code == 403
+    assert c.post("/api/password", json={"old": "ops888", "new": "N3w-Strong-Pw"}).status_code == 400
+    c.post("/api/logout")
     tok, _ = auth.login_ex(server.CFG, "weakops", "ops888", src="127.0.0.1")
     c.cookies.set(auth.COOKIE, tok)
     assert c.get("/api/me").json()["must_change"] is True
@@ -132,6 +145,7 @@ def test_loopback_behind_local_reverse_proxy_is_not_the_console(monkeypatch):
     class Req:
         def __init__(self, headers):
             self.headers = headers
+            self.client = type("C", (), {"host": "127.0.0.1"})()
 
     assert server._is_console(Req({"host": "127.0.0.1:8800"}), "127.0.0.1")
     assert server._is_console(Req({"host": "localhost:8800"}), "127.0.0.1")
@@ -139,3 +153,29 @@ def test_loopback_behind_local_reverse_proxy_is_not_the_console(monkeypatch):
                                   "127.0.0.1")
     assert not server._is_console(Req({"host": "miners.example.com"}), "127.0.0.1")
     assert not server._is_console(Req({"host": "127.0.0.1:8800"}), "192.168.1.9")
+
+
+def test_password_change_endpoint_cannot_be_used_to_brute_force(tmp_path):
+    """会话 cookie 被偷后，拿"改密码要验证旧密码"当在线爆破接口：连错 5 次就把这个会话踢掉。"""
+    cfg = _cfg(STRONG)
+    tok, _ = auth.login_ex(cfg, "ops", "Str0ng-Pass!", src="10.0.0.1")
+    for i in range(auth._MAX_PW_FAILS):
+        assert auth.change_password(cfg, "ops", f"guess{i}", "N3w-Strong-Pw", keep_token=tok,
+                                    path=str(tmp_path / "x.yaml"))
+    assert auth.session(tok) is None
+
+
+def test_request_from_trusted_proxy_is_never_the_console(monkeypatch):
+    import importlib
+    from pathlib import Path
+    monkeypatch.setenv("MINER_CONFIG", str(Path(__file__).with_name("server_config.yaml")))
+    server = importlib.import_module("server")
+    import ipaddress as _ip
+    monkeypatch.setattr(server, "_TRUSTED", [_ip.ip_network("127.0.0.1/32")])
+
+    class Req:
+        headers = {"host": "127.0.0.1:8800"}
+        client = type("C", (), {"host": "127.0.0.1"})()
+
+    # 同机 nginx 默认不加 X-Forwarded-*、Host 也是 127.0.0.1：只要对端是受信代理就不算本机
+    assert not server._is_console(Req(), "127.0.0.1")

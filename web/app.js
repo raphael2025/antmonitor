@@ -953,31 +953,52 @@ let myRole = "admin";
 let myUser = "";
 let _timer = null;
 
-function showLogin() { stopDashboard(); $("loginOverlay").classList.remove("hidden"); }
+function closePwd() { _pwdForced = false; $("pwdModal").classList.add("hidden"); }
+// 会话失效/换人登录：先关掉上一个人的强制改密弹窗，否则它会压在新登录的页面上、× 也被隐藏
+function showLogin() { stopDashboard(); closePwd(); $("loginOverlay").classList.remove("hidden"); }
 
 // ---- 改密码：弱口令会话登录后强制弹出，改完才能操作 ----
+// 远程弱口令会话(weak_remote)：只能看，也不能在远程改密码(防猜中默认密码的人借改密码抢账号)
 let _pwdForced = false;
+let _weakRemote = false;
+let _svcPort = location.port || "8800";
 function openPwd(force) {
-  _pwdForced = !!force;
-  $("pwdForce").classList.toggle("hidden", !force);
-  $("pwdClose").style.display = force ? "none" : "";
+  _pwdForced = !!force && !_weakRemote;
+  $("pwdForce").classList.toggle("hidden", !_pwdForced);
+  $("pwdRemote").classList.toggle("hidden", !_weakRemote);
+  $("pwdRemote").textContent = `当前账号密码太弱（默认密码、少于 8 位或太简单），从这台电脑只能查看、不能操作，`
+    + `也不能在这里改密码。请到监控电脑本机打开 http://127.0.0.1:${_svcPort} 登录并修改密码。`;
+  $("pwdForm").style.display = _weakRemote ? "none" : "";
+  $("pwdSave").style.display = _weakRemote ? "none" : "";
+  $("pwdClose").style.display = _pwdForced ? "none" : "";
+  $("pwdLogout").classList.toggle("hidden", !(_pwdForced || _weakRemote));   // 强制时也能换人登录
   ["pwdOld", "pwdNew", "pwdNew2"].forEach(id => $(id).value = "");
   $("pwdErr").textContent = "";
   $("pwdModal").classList.remove("hidden");
-  $("pwdOld").focus();
+  if (!_weakRemote) $("pwdOld").focus();
+}
+function afterLogin(d) {
+  _weakRemote = !!d.weak_remote;
+  if (d.port) _svcPort = String(d.port);
+  closePwd();
+  if (d.must_change) openPwd(true);
 }
 async function savePwd() {
   const old = $("pwdOld").value, nw = $("pwdNew").value;
   if (nw !== $("pwdNew2").value) { $("pwdErr").textContent = "两次输入的新密码不一致"; return; }
   let d;
   try { d = await jpost("/api/password", { old, new: nw }); } catch (e) { return; }
-  if (!d.ok) { $("pwdErr").textContent = d.error || "修改失败"; return; }
-  $("pwdModal").classList.add("hidden");
-  _pwdForced = false;
+  if (!d.ok) {
+    $("pwdErr").textContent = d.error || "修改失败";
+    if (String(d.error || "").includes("已退出登录")) setTimeout(() => location.reload(), 1500);
+    return;
+  }
+  closePwd();
   toast("密码已修改", "ok");
 }
 $("btnPwd").onclick = () => openPwd(false);
-$("pwdClose").onclick = () => { if (!_pwdForced) $("pwdModal").classList.add("hidden"); };
+$("pwdClose").onclick = () => { if (!_pwdForced) closePwd(); };
+$("pwdLogout").onclick = () => doLogout();
 $("pwdSave").onclick = savePwd;
 $("pwdNew2").addEventListener("keydown", e => { if (e.key === "Enter") savePwd(); });
 
@@ -1160,7 +1181,7 @@ async function doLogin() {
   if (!d.ok) { $("loginErr").textContent = d.error || "登录失败"; return; }
   $("loginOverlay").classList.add("hidden");
   myRole = d.role; myUser = d.user; applyRole(); startDashboard();
-  if (d.must_change) openPwd(true);
+  afterLogin(d);
 }
 
 async function doLogout() { await fetch("/api/logout", { method: "POST" }); location.reload(); }
@@ -1189,6 +1210,6 @@ async function init() {
   if (r.status === 401) { showLogin(); return; }
   const me = await r.json();
   myRole = me.role; myUser = me.user; applyRole(); startDashboard();
-  if (me.must_change) openPwd(true);
+  afterLogin(me);
 }
 init();

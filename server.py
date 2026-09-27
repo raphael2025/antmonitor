@@ -179,6 +179,10 @@ def require(min_role):
         if not auth.has_role(sess, min_role):
             raise HTTPException(status_code=403, detail="权限不足")
         if sess.get("must_change") and min_role != "viewer":   # 弱口令会话：只能看，改完密码才能操作
+            if sess.get("weak_remote"):
+                raise HTTPException(status_code=403, detail=(
+                    "当前账号密码太弱，远程只能查看。请到监控电脑本机打开 "
+                    f"http://127.0.0.1:{CFG['server']['port']} 登录并修改密码"))
             raise HTTPException(status_code=403, detail="当前密码太弱，请先修改密码(右上角 🔑)")
         return sess
     return dep
@@ -209,7 +213,8 @@ def api_login(request: Request, response: Response, body: dict = Body(...)):
     log.info("登录成功: %s (%s) from %s%s", s["user"], s["role"], src,
              " [弱口令，须改密码]" if s.get("must_change") else "")
     return {"ok": True, "user": s["user"], "role": s["role"],
-            "must_change": bool(s.get("must_change"))}
+            "must_change": bool(s.get("must_change")), "weak_remote": bool(s.get("weak_remote")),
+            "port": CFG["server"]["port"]}
 
 
 @app.post("/api/password")
@@ -227,6 +232,7 @@ def api_password(request: Request, body: dict = Body(...), sess: dict = Depends(
                     [{"ip": "-", "ok": not err, "msg": err or "已修改密码"}])
     if err:
         log.warning("修改密码失败: %s from %s (%s)", sess["user"], src, err)
+        err = err.replace("端口", str(CFG["server"]["port"]))
         return JSONResponse({"ok": False, "error": err}, status_code=400)
     log.info("已修改密码: %s from %s", sess["user"], src)
     return {"ok": True}
@@ -246,7 +252,8 @@ def api_me(request: Request):
         return JSONResponse({"authenticated": False, "auth_enabled": auth.enabled(CFG)},
                             status_code=401)
     return {"authenticated": True, "user": s["user"], "role": s["role"],
-            "auth_enabled": auth.enabled(CFG), "must_change": bool(s.get("must_change"))}
+            "auth_enabled": auth.enabled(CFG), "must_change": bool(s.get("must_change")),
+            "weak_remote": bool(s.get("weak_remote")), "port": CFG["server"]["port"]}
 
 
 def _broadcast_threadsafe(payload):
@@ -1337,6 +1344,8 @@ def _is_console(request, src):
     同机跑着 nginx/frp(http) 转发时，外部请求也来自 127.0.0.1，但会带代理头/外部 Host，
     不能当本机(否则"弱口令只准本机登录"和"本机不锁"都能被远程绕过)。"""
     if not auth.is_local(src) or any(h in request.headers for h in _PROXY_HEADERS):
+        return False
+    if _via_trusted_proxy(request):   # 同机 nginx 默认不加 X-Forwarded-*、Host 也可能是 127.0.0.1
         return False
     name = _host_name(request.headers.get("host", ""))
     return name in ("localhost", "::1") or name.startswith("127.")
