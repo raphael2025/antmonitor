@@ -1142,6 +1142,10 @@ function connectWS() {
       if (_ws !== ws) return;                // 已被新连接取代的旧连接，别动全局状态
       _ws = null;
       if (ev && ev.code === 1008) { showLogin(); return; }
+      if (ev && ev.code === 4403) {          // 访问地址/来源不被允许：别弹登录也别重连，靠 30 秒轮询
+        toast("实时推送连接被服务器拒绝(访问地址不在允许列表)，已改为每 30 秒刷新");
+        return;
+      }
       scheduleWS();
     };
     ws.onerror = () => { try { ws.close(); } catch (e) {} };

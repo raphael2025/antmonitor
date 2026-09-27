@@ -273,16 +273,20 @@ def _broadcast_threadsafe(payload):
 async def ws_endpoint(websocket: WebSocket):
     host = websocket.headers.get("host", "")
     origin = websocket.headers.get("origin")
-    if not _host_ok(host) or (origin and not _same_origin(origin, host)):   # 防跨站 WebSocket 劫持
-        await websocket.close(code=1008)
-        return
+    proxied = _via_trusted_proxy(websocket)   # 与 HTTP 的 _request_guard 同口径：受信代理免检
+    bad_origin = not proxied and (not _host_ok(host) or (origin and not _same_origin(origin, host)))
     sess = auth.current(CFG, websocket.cookies.get(auth.COOKIE, ""))
-    if not sess:
-        await websocket.close(code=1008)
-        return
-    if len(WS_CLIENTS) >= WS_MAX_CLIENTS:   # 1013 = try again later
-        log.warning("WS 连接数已达上限 %d，拒绝新连接", WS_MAX_CLIENTS)
-        await websocket.close(code=1013)
+    # 先 accept 再 close：accept 之前 close 浏览器只看到 1006，前端分不清原因。
+    # 4403 = 访问地址/来源不被允许(前端不弹登录、不重连)；1008 = 会话失效(前端弹登录)
+    if bad_origin or not sess or len(WS_CLIENTS) >= WS_MAX_CLIENTS:
+        await websocket.accept()
+        if bad_origin:              # 防跨站 WebSocket 劫持
+            await websocket.close(code=4403)
+        elif not sess:
+            await websocket.close(code=1008)
+        else:                       # 1013 = try again later
+            log.warning("WS 连接数已达上限 %d，拒绝新连接", WS_MAX_CLIENTS)
+            await websocket.close(code=1013)
         return
     await websocket.accept()
     WS_CLIENTS.add(websocket)
