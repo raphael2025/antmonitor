@@ -101,8 +101,9 @@ def _restart():
 # 卡住的 git-remote-https 孙进程还会让 subprocess 的 timeout 失效(Windows 上只杀得掉 git.exe)，
 # 更新锁永久不释放。低速阈值让半断的网络 30 秒内失败而不是挂死。
 _GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never",
-            "GIT_HTTP_LOW_SPEED_LIMIT": "1000", "GIT_HTTP_LOW_SPEED_TIME": "30",
-            "GIT_SSH_COMMAND": "ssh -o BatchMode=yes -o ConnectTimeout=15"}
+            "GIT_HTTP_LOW_SPEED_LIMIT": "1000", "GIT_HTTP_LOW_SPEED_TIME": "30"}
+# 不注入 GIT_SSH_COMMAND：它优先级高于 core.sshCommand/GIT_SSH，会覆盖现场自己配的 SSH
+# (如 TortoisePlink/pageant)，用 SSH 部署密钥的站点 fetch 直接失败
 
 
 def _load_state():
@@ -280,13 +281,15 @@ def _selfcheck():
     return _import_check()
 
 
-def apply(branch=None, restart=True):
-    """更新到远端最新(带互斥锁，同一时刻只允许一个更新任务)。"""
+def apply(branch=None, restart=True, force=False):
+    """更新到远端最新(带互斥锁，同一时刻只允许一个更新任务)。
+    force=True：人工手动更新，忽略"之前自检/启动失败"的坏版本记录再试一次(比如装好缺的依赖后)；
+    自动更新不传，坏版本照旧跳过，不会每小时合并→回滚一遍。"""
     if not _apply_lock.acquire(blocking=False):
         return {"ok": False, "msg": "已有更新任务正在执行，请稍后重试"}
     release = True
     try:
-        r = _apply(branch, restart)
+        r = _apply(branch, restart, force)
         # 已排定退出(1.5秒后 os._exit)：这段窗口期继续持锁，挡住"进程正要死"时
         # 又开一次 git 操作把仓库停在半路的情况。进程退出后锁自然随进程消失。
         release = not r.get("restarting")
@@ -296,7 +299,7 @@ def apply(branch=None, restart=True):
             _apply_lock.release()
 
 
-def _apply(branch=None, restart=True):
+def _apply(branch=None, restart=True, force=False):
     """更新到远端最新：ff-only 合并 → 自检(失败回滚) → 退出进程交给守护重启。"""
     try:
         dirty = _git("status", "--porcelain", "--untracked-files=normal", timeout=15)
@@ -307,7 +310,11 @@ def _apply(branch=None, restart=True):
     st = check(branch)
     if st.get("error") or not st.get("behind"):
         return {"ok": False, "msg": st.get("error") or "已是最新版本", "check": st}
-    if st.get("known_bad"):   # 同一个坏提交不再反复"合并→自检失败→回滚"(每小时一次，期间磁盘上是坏代码)
+    if st.get("known_bad") and force:   # 人工重试：先把它从坏版本记录里拿掉
+        s2 = _load_state()
+        s2["bad"] = [b for b in s2.get("bad", []) if b != st.get("remote_full")]
+        _save_state(s2)
+    elif st.get("known_bad"):   # 同一个坏提交不再反复"合并→自检失败→回滚"(每小时一次，期间磁盘上是坏代码)
         return {"ok": False, "msg": f"远端版本 {st['remote']} 之前自检未通过或启动失败已回滚，等待新的提交",
                 "check": st}
     prev = _git("rev-parse", "HEAD")
@@ -391,7 +398,7 @@ if __name__ == "__main__":
         else:
             print(f"已是最新 ({st.get('local')}, 分支 {st.get('branch')})")
     elif cmd == "apply":
-        r = apply(restart=False)
+        r = apply(restart=False, force=True)   # 命令行 = 人工操作
         print(r.get("msg") or f"已更新 {r['from']} → {r['to']}，请重启服务进程生效")
         sys.exit(0 if r.get("ok") else 1)
     else:

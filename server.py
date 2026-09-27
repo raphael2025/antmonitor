@@ -1269,10 +1269,11 @@ def api_update_check(force: bool = False, _: dict = Depends(require_admin)):
 
 
 @app.post("/api/update/apply")
-def api_update_apply(sess: dict = Depends(require_admin)):
+def api_update_apply(body: dict = Body(default={}), sess: dict = Depends(require_admin)):
     """拉取新代码(ff-only+编译自检+失败回滚)并重启(有守护交给守护，没有就自己拉起)。"""
     log.info("网页触发版本更新，操作人 %s", sess.get("user", "?"))
-    r = updater.apply((CFG.get("update") or {}).get("branch") or None)
+    r = updater.apply((CFG.get("update") or {}).get("branch") or None,
+                      force=bool((body or {}).get("force")))   # 网页上点"仍然重试"
     _UPDATE_CACHE["data"] = None
     log.info("版本更新结果: %s", r.get("msg") or f"{r.get('from')} → {r.get('to')}")
     return r

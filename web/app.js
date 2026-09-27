@@ -1041,6 +1041,7 @@ function applyRole() {
 let _updTimer = null;
 let _updInfo = null;
 let _updating = false;
+let _updForce = false;   // known_bad 时由用户明确点"仍然重试"
 
 function markUpdateBtn(d) {
   const n = (d && !d.error && !d.known_bad && d.behind) || 0;
@@ -1060,6 +1061,8 @@ async function checkUpdate(force) {
 function renderUpdate(d) {
   const b = $("updBody");
   $("updApply").disabled = true;
+  $("updApply").textContent = "立即更新并重启";
+  _updForce = false;
   if (!d) { b.innerHTML = `<div class="upd-err">检查失败：连不上服务器</div>`; return; }
   if (d.git === false) {
     b.innerHTML = `<div class="upd-err">${esc(d.error || "本目录不是 git 仓库")}</div>
@@ -1078,7 +1081,10 @@ function renderUpdate(d) {
     h += `<div class="upd-ok">✓ 已是最新版本</div>`;
   } else if (d.known_bad) {
     h += `<div class="upd-err">远端最新版本 <code>${esc(d.remote)}</code> 之前自检未通过（或启动失败）已自动回滚，
-      不会再拉取它；等开发者推送修复后的新提交再更新。</div>`;
+      自动更新不会再拉取它。如果原因已排除（比如缺的依赖已经 pip install 好），可以点下面「仍然重试」。</div>`;
+    $("updApply").textContent = "仍然重试";
+    $("updApply").disabled = false;
+    _updForce = true;
   } else {
     h += `<div>有 <b>${d.behind}</b> 个新提交${d.behind > 10 ? "（下面只列最近 10 个）" : ""}：</div>
       <ul>${(d.changes || []).map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
@@ -1121,12 +1127,13 @@ async function waitRestart() {
 
 async function applyUpdate() {
   if (!_updInfo || !_updInfo.behind) return;
+  if (_updForce && !confirm("这个版本之前自检失败或启动崩溃过。确定原因已经排除、要再试一次吗？\n（再失败会自动回滚）")) return;
   if (!confirm(`确认更新到最新版本（${_updInfo.behind} 个新提交）并重启服务？\n重启期间约十几秒不扫描，所有人需要重新登录。`)) return;
   _updating = true;
   $("updApply").disabled = true; $("updRecheck").disabled = true;
   $("updBody").textContent = "正在拉取新代码并自检，可能需要 1～2 分钟，请勿关闭页面…";
   let r;
-  try { r = await jpost("/api/update/apply", {}); } catch (e) { r = null; }
+  try { r = await jpost("/api/update/apply", { force: _updForce }); } catch (e) { r = null; }
   $("updRecheck").disabled = false;
   if (!r || !r.ok) {
     _updating = false;

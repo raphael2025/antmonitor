@@ -83,3 +83,22 @@ def test_healthy_new_version_clears_the_pending_marker(state, monkeypatch):
     updater.mark_healthy()
     assert "pending" not in json.loads(state.read_text(encoding="utf-8"))
     updater.boot_guard()                                    # 之后正常启动不受影响
+
+
+def test_manual_retry_ignores_the_bad_mark(state, monkeypatch):
+    """自检失败常见原因是新依赖没装：运维 pip install 后手动重试必须能过，不能被永久拉黑。
+    自动更新仍然跳过它(别每小时合并→回滚一遍)。"""
+    calls = []
+    monkeypatch.setattr(updater, "_git", _fake_git(calls))
+    monkeypatch.setattr(updater, "_selfcheck", lambda: "ModuleNotFoundError: newdep")
+    updater.apply(restart=False)                                   # 第一次：自检失败，记坏
+    assert "等待新的提交" in updater.apply(restart=False)["msg"]    # 自动/普通调用：跳过
+    monkeypatch.setattr(updater, "_selfcheck", lambda: "")          # 装好依赖了
+    calls.clear()
+    r = updater.apply(restart=False, force=True)                    # 手动重试
+    assert r["ok"] and any(c[0] == "merge" for c in calls)
+    assert "bbb" not in json.loads(state.read_text(encoding="utf-8")).get("bad", [])
+
+
+def test_git_env_does_not_override_site_ssh_setup():
+    assert "GIT_SSH_COMMAND" not in updater._GIT_ENV
