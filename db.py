@@ -476,7 +476,7 @@ def mark_miners_migrated(conn, ips):
         return
     ts = int(time.time())
     ips = list(dict.fromkeys(ips))
-    types = ("offline", "zero", "reject", "low_hashrate", "overheat")
+    types = ("offline", "zero", "reject", "low_hashrate", "overheat", "pool_hijack")
     tqm = ",".join("?" * len(types))
     with _wlock, conn:
         conn.executemany("UPDATE known_miners SET state='migrated' WHERE ip=?",
@@ -495,7 +495,7 @@ def remove_miners(conn, ips):
     ts = int(time.time())
     ips = list(dict.fromkeys(ips))
     bases = sorted({".".join(ip.split(".")[:3]) for ip in ips if ip.count(".") == 3})
-    types = ("offline", "zero", "reject", "low_hashrate", "overheat")
+    types = ("offline", "zero", "reject", "low_hashrate", "overheat", "pool_hijack")
     tqm = ",".join("?" * len(types))
     with _wlock, conn:
         conn.executemany(

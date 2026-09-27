@@ -1175,6 +1175,12 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
                                  "未配置矿池白名单，网页换矿池已禁用。请在监控电脑的 config.yaml 里"
                                  "配置 control.pool_allowlist(如 [\"f2pool.com\"])后重启服务"},
                                 status_code=403)
+        malformed = [p["url"] for p in pools if not control.pool_host(p["url"])]
+        if malformed:
+            _audit_reject(user, action, f"矿池地址格式不合格: {', '.join(malformed)[:300]}")
+            return JSONResponse({"ok": False, "error":
+                                 "矿池地址格式不对，只接受 stratum+tcp://主机名:端口 这种写法: "
+                                 + ", ".join(malformed)[:200]}, status_code=400)
         bad = [p["url"] for p in pools if not control.pool_allowed(p["url"], allow)]
         if bad:
             _audit_reject(user, action, f"矿池不在白名单: {', '.join(bad)[:300]}")
