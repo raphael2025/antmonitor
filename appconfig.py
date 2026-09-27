@@ -299,10 +299,12 @@ def set_user_password(username, pw_hash, path=None):
         return "改写结果校验不一致，已放弃写入，请手动修改 config.yaml"
     tmp = path + ".tmp"
     try:
-        with open(path + ".bak", "w", encoding="utf-8", newline="") as f:
-            f.write(text)
-        with open(tmp, "w", encoding="utf-8", newline="") as f:
-            f.write(new_text)
+        mode = os.stat(path).st_mode & 0o777   # 保留原权限(Linux 上常是 600：里面有矿机口令/token)
+        for p_, content in ((path + ".bak", text), (tmp, new_text)):
+            fd = os.open(p_, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+            os.chmod(p_, mode)
         os.replace(tmp, path)
     except OSError as e:
         return f"写入配置文件失败(权限?): {e}"

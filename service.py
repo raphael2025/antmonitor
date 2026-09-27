@@ -264,6 +264,16 @@ class MonitorService:
         if went_off > sc.get("reconfirm_max", 800):
             log.info("二次确认跳过: %d 台同时掉线超过上限，判定为真实的大面积事件", went_off)
             return miners
+        # 零算力类疑似单独设上限：全场同时掉算力(矿池故障/限电开始那一轮)时别用宽松超时把
+        # 全场重探一遍——那是真实的大面积事件，重探也不会变好，只会压网络、拖长这一轮
+        sus0 = set(suspects)
+        zero_sus = [r["ip"] for r in miners if r["ip"] in sus0 and r["status"] == "online"]
+        if len(zero_sus) > sc.get("reconfirm_max", 800):
+            log.info("二次确认: 零算力疑似 %d 台超过上限，只重探掉线的 %d 台", len(zero_sus), went_off)
+            zs = set(zero_sus)
+            suspects = [ip for ip in suspects if ip not in zs]
+            if not suspects:
+                return miners
         cc = dict(sc)
         cc["online_timeout"] = max(sc.get("online_timeout", 0.6),
                                    sc.get("reconfirm_online_timeout", 2.0))
@@ -278,7 +288,8 @@ class MonitorService:
 
         # 各轮结果只升不降：任一轮确认在线就算在线。直接覆盖会让后一轮的瞬时丢包
         # 抹掉前一轮已探到的在线，恰恰把二次确认要保护的慢响应机器误报成掉线
-        fixed = {r["ip"]: r for r in miners if r["ip"] in set(suspects)}
+        sus = set(suspects)   # 提到循环外：在推导式里每个元素重建一次集合，5000 台是 O(N²)
+        fixed = {r["ip"]: r for r in miners if r["ip"] in sus}
         remaining = suspects
         for _ in range(max(1, int(sc.get("reconfirm_passes", 1)))):
             if gen is not None and gen != self._scan_gen:

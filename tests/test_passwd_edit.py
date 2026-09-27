@@ -62,3 +62,13 @@ def test_unknown_user_or_missing_password_line_writes_nothing(tmp_path):
     assert appconfig.set_user_password("admin", "pbkdf2$1$aa$bb", str(p))
     assert appconfig.set_user_password("nobody", "pbkdf2$1$aa$bb", str(p))
     assert p.read_text(encoding="utf-8") == before
+
+
+def test_file_permissions_are_preserved(tmp_path):
+    import os
+    import stat
+    p = _write(tmp_path, FLOW)
+    os.chmod(p, 0o600)
+    assert appconfig.set_user_password("ops", "pbkdf2$1$ab$cd", str(p)) == ""
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(str(p) + ".bak").st_mode) == 0o600
