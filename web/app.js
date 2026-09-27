@@ -738,7 +738,8 @@ function openCmdDialog(cmd, includeHidden) {
   if (hiddenIps.length)
     html += `<div class="warn-box" style="border-width:2px">⚠️ 你勾选的机器里有 <b>${hiddenIps.length}</b> 台`
       + `已不在当前列表（勾选后状态变了，比如已恢复在线）：${hiddenIps.slice(0, 20).map(esc).join("、")}`
-      + `${hiddenIps.length > 20 ? " …" : ""}<br><label style="cursor:pointer"><input type="checkbox" id="cmdIncHidden"`
+      + `${hiddenIps.length > 20 ? " …" : ""}<br><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-top:6px">`
+      + `<input type="checkbox" id="cmdIncHidden" style="width:auto;margin:0"`
       + `${includeHidden ? " checked" : ""}> 也对这 ${hiddenIps.length} 台执行</label>`
       + `（默认不执行）</div>`;
   if (meta.danger)
