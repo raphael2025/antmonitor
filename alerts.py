@@ -139,9 +139,8 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     roster = set(db.roster_ips(conn, roster_age))   # 已知真机(算网段比例的分母)
     # 掉线告警按状态判，不按"上一轮 online → 本轮 offline"的跳变判：跳变那一轮只要没报出来
     # (冷却期/上一轮是 unknown/被网段事件或维修静音)，之后上一轮已是 offline 就永远不再报。
-    # 现在：名册内、当前离线、且自最后一次在线以来还没报过掉线 → 报(冷却只会推迟，不会吞掉)。
-    last_online = db.last_online_map(conn)
-    last_off_alert = db.last_alert_ts(conn, "offline", now - roster_age * 86400)
+    # 现在：名册内、当前离线、没被静音、且没有活跃的掉线告警 → 报。重复由"已有活跃告警不重报"
+    # 挡住，冷却只会推迟不会吞掉。不看"历史上报过没有"：维修/静音时消掉的旧记录不代表这次报过
 
     b = _Batch(conn, cooldown, now)
     # 静默期内的刚重启机器：掉线是预期内的，不报单机掉线，也不计入网段掉线比例
@@ -164,9 +163,18 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         if r["status"] == "offline":
             seg_off[seg] = seg_off.get(seg, 0) + 1
     down_segments = set()
+    active_segs = {a["ip"][:-2] for a in db.active_alerts_by_type(conn, "segment_down")
+                   if a["ip"].endswith(".x")}
+    clear_ratio = seg_ratio * 0.75
     for seg, off in seg_off.items():
         tot = seg_total.get(seg, 0)
-        if off >= seg_min and tot > 0 and off / tot >= seg_ratio:
+        # 回差：超过 seg_ratio 才报；已在报的降到 seg_ratio×0.75 以下才消。否则离线率在阈值
+        # 附近来回时每轮"消—报"一次(整段事件 force 不受冷却)，值班群被刷屏
+        if seg in active_segs:
+            is_down = tot > 0 and off / tot >= clear_ratio
+        else:
+            is_down = off >= seg_min and tot > 0 and off / tot >= seg_ratio
+        if is_down:
             down_segments.add(seg)
             # force：整段事件不受冷却限制。下面会用 down_segments 静音段内单机告警，
             # 若这条被冷却拦下，同一栋冷却期内第二次断电就既无网段告警也无单机告警
@@ -203,8 +211,13 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             for t in ("zero", "reject", "low_hashrate", "overheat"):
                 b.resolve(ip, t)
             streak.pop(ip, None)
-            if ip in repair or seg in down_segments:
-                b.resolve(ip, "offline")   # 维修中/被网段事件覆盖 → 清掉历史单条
+            if ip in repair:
+                b.resolve(ip, "offline")   # 维修中 → 清掉单条(人已经知道了)
+                rebooting.pop(ip, None)
+                continue
+            if seg in down_segments:
+                # 整段事件期间不新报单机，但断电前就已坏、已在报的单机告警保留：那是另一个
+                # 独立的问题，消掉的话来电后它仍离线却没有活跃告警
                 rebooting.pop(ip, None)
                 continue
             if ip in rb_quiet:             # 刚下发重启，还在静默期
@@ -214,8 +227,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                 b.fire(ip, "offline", "crit",
                        f"{ip} 重启后 {max(1, rb_grace // 60)} 分钟仍未上线")
                 continue
-            lo = last_online.get(ip)
-            if ip in roster and lo is not None and last_off_alert.get(ip, -1) <= lo:
+            if ip in roster:
                 b.fire(ip, "offline", "crit", f"{ip} 掉线")
             continue
         b.resolve(ip, "offline")
@@ -302,9 +314,10 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     return fired
 
 
-# 集装箱故障连续这么多轮读到"正常"才消警(10 秒刷新 ≈ 30 秒)。一次抖动就消警的话，
-# 下一轮故障还在却被冷却拦下，漏液最长 30 分钟没有活跃告警
-COOLER_CLEAR_ROUNDS = 3
+# 集装箱故障持续读到"正常"满这么久才消警。一次抖动就消警的话，下一轮故障还在却被冷却拦下，
+# 漏液最长 30 分钟没有活跃告警；而 crit 又不受冷却(复发立刻重报)，消得太快会在接触不良时
+# 反复"报—消—报"刷屏。按时间而不是轮数：全网扫描和 10 秒刷新都会评估，轮数不等于时长
+COOLER_CLEAR_SEC = 300
 _COOLER_STATE = {}
 
 
@@ -348,8 +361,8 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
                     (a["type"] == "cooler:return_pressure_low_th" and rp_min and rp is None):
                 continue
             k = (ip, a["type"])
-            clean[k] = clean.get(k, 0) + 1
-            if clean[k] >= COOLER_CLEAR_ROUNDS:
+            first_ok = clean.setdefault(k, now)    # 从第一次读到正常开始计时
+            if now - first_ok >= COOLER_CLEAR_SEC:
                 clean.pop(k, None)
                 b.resolve(ip, a["type"])
         b.resolve(ip, "cooler_offline")   # 箱体恢复在线

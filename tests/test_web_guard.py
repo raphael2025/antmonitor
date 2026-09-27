@@ -146,3 +146,18 @@ def test_short_cache_is_bounded(app):
     for i in range(1000):
         server._cached(("k", i), 30, lambda: [0] * 10)
     assert len(server._cache) <= server._CACHE_MAX
+
+
+def test_websocket_via_trusted_proxy_is_accepted_and_rejections_carry_a_distinct_code(app, monkeypatch):
+    """HTTP 对受信代理免检 Host/Origin，WS 以前没有 → 经 nginx/frp 访问时 WS 被 1008 关闭，
+    前端把 1008 当成会话失效 → "登录→又被踢回登录"循环。"""
+    server, c = app
+    monkeypatch.setattr(server, "_via_trusted_proxy", lambda req: True)
+    with c.websocket_connect("/ws", headers={"Host": "miners.example.com",
+                                             "Origin": "https://miners.example.com"}):
+        pass                                                    # 能连上
+    monkeypatch.setattr(server, "_via_trusted_proxy", lambda req: False)
+    with pytest.raises(WebSocketDisconnect) as e:
+        with c.websocket_connect("/ws", headers={"Origin": "http://evil.example"}) as ws:
+            ws.receive_text()
+    assert e.value.code == 4403                                 # 不是 1008：前端不会误弹登录

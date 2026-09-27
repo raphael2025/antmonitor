@@ -72,9 +72,10 @@ python db.py vacuum       # 回收删除留下的空页（独占数据库，放�
 
 会话基于 Cookie 令牌（内存存储，重启需重新登录；12 小时不活动自动登出）。
 
-- **改密码**：右上「🔑 改密码」，或在监控电脑上 `python auth.py passwd 用户名`（自动写哈希进 config.yaml）。
-- **弱密码只能本机登录**：默认密码/少于 8 位的账号只能在监控电脑上打开 `http://127.0.0.1:8800` 登录，
-  登录后强制改密码，改完才能操作、才能从其它电脑登录。
+- **改密码**：右上「🔑 改密码」（即时生效），或在监控电脑上 `python auth.py passwd 用户名`
+  （自动写哈希进 config.yaml，**重启服务后生效**，重启前旧密码仍可用）。
+- **弱密码**（默认密码、少于 8 位、少于 4 种不同字符、或与用户名相同）：在监控电脑本机打开
+  `http://127.0.0.1:8800` 登录会被强制改密码，改完才能操作；从其它电脑登录只能查看，也不能在那里改密码。
 - 用域名（而不是 IP）访问面板时，需把域名加到 `server.allowed_hosts`（防 DNS 重绑定）。
 - 完整的安全配置（矿池白名单、交换机 ACL、防火墙、HTTPS）见 [运维安全手册](docs/SECURITY.md)。
 
@@ -129,8 +130,10 @@ python server.py            # 启动面板 + 后台定时巡检（Windows 推荐
   局域网其它电脑用日志里列出的 `http://<局域网IP>:8800`。
 
 启动后按 `config.yaml` 节奏运行：
-- **全网扫描** `schedule.scan_interval`（默认 300s=5分钟）：每 5 分钟扫一遍全部网段，
-  新机/掉线/限电上下线全在 5 分钟内捕捉。并发受 `scan.max_pps`(默认100) 限速保护三层 CoPP。
+- **巡检** `schedule.scan_interval`（默认 300s=5分钟）：每 5 分钟探一遍名册内的已知矿机，
+  掉线/限电上下线/掉算力都在 5 分钟内捕捉。
+- **全网发现** `schedule.full_interval`（默认 3600s=1小时）：展开全部网段找新装的机器。
+  两种扫描的并发都受 `scan.max_pps`(默认100) 限速，保护三层 CoPP（详见下文「扫描性能与负载控制」）。
 - **集装箱刷新** `schedule.container_interval`（默认 10s）：独立高频刷新冷却数据。
 
 > 60 段(~1.5万IP)实测：每次全扫 ~150s，ARP≈100/s（你的 500 CoPP 有 5 倍余量），带宽峰值 ~26 Mbps(数据平面，不占CoPP)。
@@ -171,7 +174,7 @@ python scan_miners.py --report miners_xxx.csv  # 只从 CSV 出报告
 
 ## 机器生命周期（限电 / 维修 / 下架）
 
-- 限电拉闸下线、来电恢复上线，靠每 5 分钟的全网扫描自动捕捉（与上次对比出上/下线）。
+- 限电拉闸下线、来电恢复上线，靠每 5 分钟的巡检自动捕捉。
 - **维修中**：选中机器→「🔧维修中」。不再报离线告警、列表显示"维修中"标签，修好重新上线**自动恢复正常**。
 - **下架移除**：选中→「🗑下架移除」从名册删除（不再告警）；若重装上线，下次全网扫描当新机重新纳入。
 
@@ -288,4 +291,5 @@ cloud:
 
 ## 依赖
 
-Python 3.8+：`requests fastapi uvicorn PyYAML`（见 requirements.txt）
+Python 3.8+：`requests fastapi uvicorn websockets PyYAML`（运行必需）、`httpx`（跑测试）、
+`openpyxl`（仅 `antfleet/` 改 IP 工具用）。一律以 requirements.txt 为准：`pip install -r requirements.txt`

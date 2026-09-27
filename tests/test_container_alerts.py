@@ -4,6 +4,8 @@
 以前：某轮故障位没读到或压力读数为空 → 立即消警 → 下一轮故障还在，却被 30 分钟冷却拦下
 → 漏液持续存在但面板上没有告警，最长 30 分钟。
 """
+import time
+
 import pytest
 
 import alerts
@@ -12,9 +14,19 @@ import db
 IP = "10.0.9.1"
 
 
+class Clock:
+    t = 1_800_000_000.0
+
+    def __call__(self):
+        return self.t
+
+
 @pytest.fixture(autouse=True)
-def _quiet(monkeypatch):
+def clock(monkeypatch):
     monkeypatch.setattr(alerts, "_enqueue", lambda *a, **k: None)
+    c = Clock()
+    monkeypatch.setattr(time, "time", c)
+    return c
 
 
 def box(faults=(), sp=0.3, rp=0.2):
@@ -22,7 +34,9 @@ def box(faults=(), sp=0.3, rp=0.2):
             "supply_pressure": sp, "return_pressure": rp}
 
 
-def run(conn, cfg, c, st):
+def run(conn, cfg, c, st, clock=None, dt=10):
+    if clock is not None:
+        clock.t += dt                   # 集装箱每 10 秒刷新一轮
     return [(f[0], f[1]) for f in alerts.evaluate_containers(conn, [c], {IP}, cfg, state=st)]
 
 
@@ -33,38 +47,51 @@ def active(conn):
 LEAK = [("leakage_fault", "crit")]
 
 
-def test_one_clean_reading_does_not_clear_a_leak(conn, cfg):
+def test_one_clean_reading_does_not_clear_a_leak(conn, cfg, clock):
     st = {}
-    assert run(conn, cfg, box(LEAK), st) == [(IP, "cooler:leakage_fault")]
-    run(conn, cfg, box(), st)                              # 抖了一次
+    assert run(conn, cfg, box(LEAK), st, clock) == [(IP, "cooler:leakage_fault")]
+    run(conn, cfg, box(), st, clock)                       # 抖了一次
     assert active(conn) == ["cooler:leakage_fault"]
-    run(conn, cfg, box(LEAK), st)                          # 故障还在
+    run(conn, cfg, box(LEAK), st, clock)                   # 故障还在
     assert active(conn) == ["cooler:leakage_fault"]
     assert len(db.list_alerts(conn, False, 100)) == 1      # 没有重复刷一条新的
 
 
-def test_fault_clears_after_consecutive_clean_readings(conn, cfg):
+def test_fault_clears_after_sustained_clean_readings(conn, cfg, clock):
     st = {}
-    run(conn, cfg, box(LEAK), st)
-    for _ in range(alerts.COOLER_CLEAR_ROUNDS):
-        run(conn, cfg, box(), st)
+    run(conn, cfg, box(LEAK), st, clock)
+    for _ in range(alerts.COOLER_CLEAR_SEC // 10 - 1):
+        run(conn, cfg, box(), st, clock)
+    assert active(conn) == ["cooler:leakage_fault"]        # 还没持续正常满 5 分钟
+    for _ in range(3):
+        run(conn, cfg, box(), st, clock)
     assert active(conn) == []
 
 
-def test_crit_fault_recurring_within_cooldown_alerts_again(conn, cfg):
+def test_crit_fault_recurring_within_cooldown_alerts_again(conn, cfg, clock):
     cfg["alerts"]["cooldown"] = 1800
     st = {}
-    run(conn, cfg, box(LEAK), st)
-    for _ in range(alerts.COOLER_CLEAR_ROUNDS):
-        run(conn, cfg, box(), st)                          # 真的恢复了
-    assert run(conn, cfg, box(LEAK), st) == [(IP, "cooler:leakage_fault")]   # 又漏了：必须报
+    run(conn, cfg, box(LEAK), st, clock)
+    run(conn, cfg, box(), st, clock)                       # 开始读到正常
+    run(conn, cfg, box(), st, clock, dt=alerts.COOLER_CLEAR_SEC)   # 持续正常满 5 分钟 → 真的恢复了
+    assert active(conn) == []
+    assert run(conn, cfg, box(LEAK), st, clock) == [(IP, "cooler:leakage_fault")]   # 又漏了：必须报
 
 
-def test_missing_pressure_reading_keeps_the_pressure_alert(conn, cfg):
+def test_missing_pressure_reading_keeps_the_pressure_alert(conn, cfg, clock):
     cfg["alerts"]["container_supply_pressure_min"] = 0.2
     st = {}
-    run(conn, cfg, box(sp=0.1), st)
+    run(conn, cfg, box(sp=0.1), st, clock)
     assert active(conn) == ["cooler:supply_pressure_low"]
-    for _ in range(alerts.COOLER_CLEAR_ROUNDS + 2):
-        run(conn, cfg, box(sp=None), st)                   # 传感器读不到 ≠ 压力恢复
+    for _ in range(60):
+        run(conn, cfg, box(sp=None), st, clock)            # 传感器读不到 ≠ 压力恢复
     assert active(conn) == ["cooler:supply_pressure_low"]
+
+
+def test_flaky_leak_contact_does_not_spam(conn, cfg, clock):
+    """漏液触点接触不良、每 50 秒闪一次：以前 3 轮(30 秒)就消警、复发又不受冷却立刻重报，
+    每箱每小时 70 多条严重推送。现在持续正常满 5 分钟才消，一直闪就一直是同一条告警。"""
+    st = {}
+    for k in range(360):                                   # 1 小时，每 10 秒一轮
+        run(conn, cfg, box(LEAK if k % 5 == 0 else ()), st, clock)
+    assert len(db.list_alerts(conn, False, 1000)) == 1

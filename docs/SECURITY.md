@@ -9,12 +9,13 @@
 
 ### 1. 设置强密码
 
-- **最省事**：在监控电脑本机打开 `http://127.0.0.1:8800`，用现有账号登录。
-  密码太弱（admin888 这类默认密码、少于 8 位）会被强制弹出「修改密码」，改完才能操作。
-  新密码自动加密写进 `config.yaml`，不用手工处理哈希。
+- **最省事**：在监控电脑本机打开 `http://127.0.0.1:8800`（开了 HTTPS 就是 `https://127.0.0.1:8800`），
+  用现有账号登录。密码太弱（admin888 这类默认密码、少于 8 位、少于 4 种不同字符、或和用户名相同）
+  会被强制弹出「修改密码」，改完才能操作。新密码自动加密写进 `config.yaml`，立即生效。
 - **账号还没密码**（config.yaml 里是占位符或留空，这种账号任何地方都登不上）：
-  在监控电脑上运行 `python auth.py passwd admin`，输两遍新密码，然后重启服务。
-- 弱密码**只能在监控电脑本机登录**，局域网其它电脑会被拒并提示原因。
+  在监控电脑上运行 `python auth.py passwd admin`，输两遍新密码，然后**重启服务**才生效。
+- 弱密码账号从**其它电脑**登录：能登录、能看监控，但**只能看**，不能操作，也不能在那台电脑上改密码
+  （防止猜中 admin888 的人登录后改掉密码把账号抢走）。改密码只能在监控电脑本机。
 - 每个人用自己的账号，别共用。审计记录里会带「账号@来源 IP」，出事能追到人。
 
 ### 2. 配置矿池白名单（防偷算力）
@@ -67,26 +68,42 @@ scan:
 ### Windows 防火墙：8800 端口只放行运维电脑
 
 第一次运行 Python 时，Windows 常会弹窗「允许 python 访问网络」。点了允许就会生成一条**对所有人开放**的规则。
-用管理员 PowerShell 执行：
+不要删掉它（删了下次还会弹窗；弹窗时点"取消"会生成阻止规则，阻止优先于放行，运维电脑反而连不上），
+而是把它**收窄**到只放行指定电脑。用管理员 PowerShell 执行：
 
 ```powershell
-# 删掉自动生成的 python 放行规则
-Get-NetFirewallRule | Where-Object DisplayName -like "*python*" | Remove-NetFirewallRule
-# 只允许运维电脑访问 8800（IP 换成你们自己的）
+# 允许访问面板的电脑：运维电脑 + 通过 /api/public 取数的 agent 主机（IP 换成你们自己的）
+$allow = "192.168.1.20","192.168.1.21"
+# 自动生成的 python 放行规则：只放行上面这些电脑
+Get-NetFirewallRule -DisplayName "*python*" | Where-Object { $_.Direction -eq "Inbound" -and $_.Action -eq "Allow" } |
+  Set-NetFirewallRule -RemoteAddress $allow
+# 当初弹窗点了"取消"留下的 python 阻止规则会挡住所有人，删掉
+Get-NetFirewallRule -DisplayName "*python*" | Where-Object { $_.Direction -eq "Inbound" -and $_.Action -eq "Block" } |
+  Remove-NetFirewallRule
+# 再加一条端口规则兜底（同样只放行这些电脑）
 New-NetFirewallRule -DisplayName "矿机监控面板" -Direction Inbound -Protocol TCP `
-  -LocalPort 8800 -RemoteAddress 192.168.1.20,192.168.1.21 -Action Allow
+  -LocalPort 8800 -RemoteAddress $allow -Action Allow
 ```
 
 ### 目录权限：别让普通账号能改程序
 
 程序目录默认所有登录用户都能改。任何本地账号改了 `server.py`，等服务重启就能以服务账号的身份执行代码。
-`config.yaml` 里还存着矿机口令和各种 token。用管理员命令提示符执行（路径换成实际位置）：
+`config.yaml` 里还存着矿机口令和各种 token。
+
+**先确认服务是用哪个 Windows 账号运行的**（双击 run.bat 就是当前登录的账号；NSSM 看服务属性里的"登录身份"），
+然后**用这个账号**右键「以管理员身份运行」命令提示符，执行（路径换成实际位置）：
 
 ```bat
-icacls C:\miner-monitor /inheritance:r /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F"
+cd /d C:\miner-monitor
+icacls . /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "%USERNAME%:(OI)(CI)M" /T
 ```
 
-以后只有管理员能改这个目录，运行服务的账号必须是管理员或 SYSTEM。
+效果：管理员组、SYSTEM 和运行服务的这个账号能读写，其它本地账号都改不了、也读不到 `config.yaml`。
+**千万别漏掉 `%USERNAME%` 那一项**：开了 UAC 时，双击 run.bat 启动的进程不带管理员权限，
+只给管理员组授权会让服务连自己的程序目录都读不了，下次重启监控就停了。
+
+如果 NSSM 用 SYSTEM 账号跑服务、而仓库是别的账号 clone 的，git 会报 "dubious ownership"，网页更新失效。
+用管理员命令提示符执行一次：`git config --system --add safe.directory C:/miner-monitor`
 
 ### 远程桌面
 
@@ -99,19 +116,22 @@ icacls C:\miner-monitor /inheritance:r /grant:r "Administrators:(OI)(CI)F" "SYST
 - 如果非要用 nginx 或 frp 从外网访问：
   - 把代理的地址加到 `server.trusted_proxies`。
   - 用 http 方式转发，让代理带上 `X-Forwarded-For` 头。
-- **不要用 frp 的 tcp 方式直接转发到本机 8800**。那样外网来的请求在程序看来和"坐在监控电脑前"一模一样，
-  "弱密码只能本机登录"这道保护就失效了。
+- **不要用纯 TCP 转发直通本机 8800**：frp 的 tcp 方式、Windows 的 `netsh interface portproxy`、SSH 隧道都属于这类。
+  那样外网来的请求在程序看来和"坐在监控电脑前"一模一样，"弱密码只能本机改""本机登录不锁定"这些保护就失效了。
+  同机跑 nginx 的话，把 `127.0.0.1` 加进 `server.trusted_proxies`，程序就不会把经它转发的请求当成本机。
 
 ---
 
 ## 四、HTTPS（可选：防局域网里有人抓包偷密码）
 
-走 HTTP 时，登录密码和会话令牌在局域网里都是明文。开 HTTPS 用 Git 自带的 openssl
-（`C:\Program Files\Git\usr\bin\openssl.exe`）生成一张自签证书，把 IP 换成监控电脑的 IP：
+走 HTTP 时，登录密码和会话令牌在局域网里都是明文。开 HTTPS 用 Git 自带的 openssl 生成一张自签证书。
+在**程序目录**下打开命令提示符执行（Git 默认没把 openssl 加进 PATH，所以写全路径；把 IP 换成监控电脑的 IP）：
 
 ```bat
+cd /d C:\miner-monitor
 mkdir certs
-openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout certs\key.pem -out certs\cert.pem ^
+"C:\Program Files\Git\usr\bin\openssl.exe" req -x509 -newkey rsa:2048 -nodes -days 3650 ^
+  -keyout certs\key.pem -out certs\cert.pem ^
   -subj "/CN=miner-monitor" -addext "subjectAltName=IP:192.168.1.10,IP:127.0.0.1"
 ```
 
@@ -121,8 +141,12 @@ server:
   tls_key: "certs/key.pem"
 ```
 
-重启后改用 `https://IP:8800` 访问。每台浏览器第一次会提示证书不受信任，确认一次就行。
-开启后登录 Cookie 自动加 Secure。`certs/` 已加进 `.gitignore`，不会被提交。
+证书路径按服务的工作目录解析：run.bat 会先切到程序目录，所以没问题；用 NSSM 的话，服务属性里的
+"启动目录"（AppDirectory）要设成程序目录。
+
+重启后**所有地址都改成 https**：局域网用 `https://IP:8800`，监控电脑本机改弱密码用 `https://127.0.0.1:8800`。
+每台浏览器第一次会提示证书不受信任，确认一次就行。开启后登录 Cookie 自动加 Secure。
+`certs/` 已加进 `.gitignore`，不会被提交。
 
 ---
 
@@ -141,7 +165,7 @@ server:
 |---|---|
 | 谁重启/换池了 | admin 登录后调用 `/api/commands`（审计），`user` 字段是「账号@来源 IP」。换池记录里有完整的矿池地址和矿工名，重要操作保留 400 天，不会被大量定位灯/维修记录冲掉 |
 | 「矿池不在白名单」告警 | 立刻去看告警里列出的矿池地址。确认不是自己人配的，就用面板把该机矿池改回来，并按第二节查网络和矿机口令 |
-| 登录失败很多 | `logs/miner.log` 里搜「登录失败」，能看到账号和来源 IP。同一来源连错 8 次锁 5 分钟；同一账号连错 20 次锁 15 分钟（监控电脑本机不受限） |
+| 登录失败很多 | `logs/miner.log` 里搜「登录失败」，能看到账号和来源 IP。同一来源连错 8 次锁 5 分钟（监控电脑本机也一样）；同一账号连错 20 次锁 15 分钟，但监控电脑本机、以及这个账号以前成功登录过的电脑不受这条限制（别人没法故意把值班员锁在外面） |
 | 页面提示「不允许用 xxx 访问」 | 用了域名访问面板。改用 IP，或把域名加到 `server.allowed_hosts` |
 
 ---
@@ -149,12 +173,15 @@ server:
 ## 附：系统已自带的防护
 
 - **账号权限分三级**：viewer 只能看；ops 能下发命令；admin 能改设置、更新版本、看审计。
-- **弱密码**：只能在本机登录，登录后强制改。
+- **弱密码**：本机登录后强制改；其它电脑登录只能查看、不能操作、也不能改密码。
+- **改密码防爆破**：同一会话改密码时旧密码连错 5 次，会被强制登出。
 - **登录限流**：按来源 IP 和按账号各计一道，并发请求绕不过去。
 - **会话过期**：12 小时不活动自动登出。
 - **重启和换矿池要二次确认**，而且后端强制校验，不能靠绕过前端跳过。
 - **命令只能发往已配置网段内的矿机**。网段本身只能是内网地址。
 - **防 DNS 重绑定**：只接受用 IP、本机名或白名单域名访问。
-- **防跨站伪造**：写请求带了别的网站的来源会被拒，请求体必须是 JSON；WebSocket 同样校验来源。
+- **防跨站伪造**：写请求带了别的网站的来源会被拒，请求体必须是 JSON；WebSocket 同样校验来源
+  （经 `trusted_proxies` 里的代理进来的除外）。
+- **矿池地址严格校验**：只接受 `stratum+tcp://主机名:端口` 这种标准写法，带 `@`、`?`、`#`、`%` 等字符的地址一律当成可疑。
 - **云端上报只往外推数据**，从不执行云端返回的任何内容。公网云端地址必须用 https。
 - **日志打码**：日志里的 token 和密码参数都会被打码。

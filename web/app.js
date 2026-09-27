@@ -151,6 +151,9 @@ async function removeFromAlert(ip) {
   } catch (e) {}
 }
 function alertClick(x) {
+  // 内联 onclick 里的 JS 字符串：esc() 转出的 &#39; 会被 HTML 解码回单引号，挡不住注入。
+  // 只给形如 IP/网段的值生成点击，别的一律不可点
+  if (!/^[0-9.]+(\.x)?$/.test(String(x.ip || ""))) return "";
   if (x.type && x.type.startsWith("cooler")) return `openContainer('${esc(x.ip)}')`;
   // 网段事件的 ip 是 "172.16.101.x"：以前被当成单台矿机打开一个空详情；改为筛出该段离线机
   if (x.ip && x.ip.endsWith(".x")) return `focusSegment('${esc(x.ip.slice(0, -2))}')`;
@@ -163,6 +166,7 @@ function focusSegment(seg) {
     const o = document.createElement("option"); o.value = seg; o.textContent = seg + ".x"; sel.appendChild(o);
   }
   sel.value = seg; $("fStatus").value = "offline";
+  $("search").value = ""; $("fFw").value = ""; showAllRows = false;   // 别让原来的搜索/固件筛选把结果筛空
   if (typeof setView === "function") setView("list");
   refreshMiners();
   $("minerTable").scrollIntoView({ behavior: "smooth" });
@@ -696,34 +700,48 @@ document.querySelector(".cmdbar").addEventListener("click", (e) => {
 async function doMachineState(action) {
   if (!selected.size) { toast("请先选择矿机"); return; }
   const ips = [...selected];
+  // 单次上限 control.max_batch 是安全闸：超了直接提示分批，别在确认之后才被后端拒绝，
+  // 也别在前端悄悄分批绕过它(下架 5000 台只需确认两次)
+  if (ips.length > maxBatch) { toast(`一次最多 ${maxBatch} 台（control.max_batch），请缩小选择范围分批操作`); return; }
   // 维修/下架影响大(停告警/删名册)，二次确认把后果讲清；大批量再确认一次
   if (action === "repair" && !confirm(`确认把 ${ips.length} 台标记「维修中」？\n期间这些机器掉线/零算力将不再报警、也不计入客户统计。`)) return;
   if (action === "remove" && !confirm(`确认从名册「下架移除」${ips.length} 台？\n将不再探测/告警；若机器仍通电，下次扫描可能被重新收录。`)) return;
   if (ips.length > 500 && !confirm(`⚠️ 本次将影响 ${ips.length} 台（数量很大），请再确认一次！`)) return;
   try {
-    let count = 0;
-    for (let i = 0; i < ips.length; i += 500) {   // 分批提交：后端单次上限 control.max_batch(默认1000)
-      const d = await jpost("/api/machine-state", { ips: ips.slice(i, i + 500), action });
-      if (!d.ok) { toast(`失败（已处理 ${count} 台）：` + (d.error || "")); refreshMiners(); return; }
-      count += d.count || 0;
-    }
-    toast(`${ { repair: "标记维修", active: "取消维修", remove: "下架移除" }[action] } ${count} 台`, "ok");
+    const d = await jpost("/api/machine-state", { ips, action });
+    if (!d.ok) { toast("失败：" + (d.error || "")); return; }
+    toast(`${ { repair: "标记维修", active: "取消维修", remove: "下架移除" }[action] } ${d.count} 台`, "ok");
     selected.clear(); refreshMiners();
-  } catch (e) {}
+  } catch (e) { if (!String(e.message).match(/^40[13]$/)) toast("请求失败(网络/服务异常)，请刷新后确认结果"); }
 }
 
+let maxBatch = 1000;        // 单次命令/维修/下架上限，登录后取服务端 control.max_batch
 let pendingCmd = null;
 let _cmdInFlight = false;   // 命令在途：禁止再开新命令弹窗，防两次执行的结果/按钮串台
-function openCmdDialog(cmd) {
+function openCmdDialog(cmd, includeHidden) {
   if (_cmdInFlight) { toast("上一条命令还在执行，完成后会弹出结果，请稍候"); return; }
   if (!selected.size) { toast("请先选择矿机"); return; }
   const meta = CMD_META[cmd];
-  const ips = [...selected];
+  // 勾选里"已不在当前列表"的机器(自动刷新后状态变了，比如按"离线"勾的已恢复在线在挖矿)：
+  // 默认不对它们执行，醒目列出，要执行得自己勾上。以前照样下发且弹窗里毫无提示
+  const visible = new Set(lastMiners.map(m => m.ip));
+  const hiddenIps = [...selected].filter(ip => !visible.has(ip));
+  const ips = includeHidden ? [...selected] : [...selected].filter(ip => visible.has(ip));
+  if (ips.length > maxBatch) { toast(`一次最多 ${maxBatch} 台（control.max_batch），请缩小选择范围分批操作`); return; }
+  const keepPools = [0, 1, 2].map(i => ["poolUrl", "poolUser", "poolPass"].map(k =>
+    ($(`${k}${i}`) || {}).value));   // 切换"是否包含"时重画弹窗，别丢已填的矿池
   // 目标在打开弹窗这一刻冻结：弹窗里列的就是确认后下发的，期间自动刷新不会改变目标
   pendingCmd = { action: meta.action, params: { ...meta.params }, danger: !!meta.danger,
                  short: meta.short || meta.title, ips };
   $("cmdTitle").textContent = meta.title;
   let html = `对 <b>${ips.length}</b> 台矿机执行：<b>${esc(meta.title)}</b>`;
+  if (hiddenIps.length)
+    html += `<div class="warn-box" style="border-width:2px">⚠️ 你勾选的机器里有 <b>${hiddenIps.length}</b> 台`
+      + `已不在当前列表（勾选后状态变了，比如已恢复在线）：${hiddenIps.slice(0, 20).map(esc).join("、")}`
+      + `${hiddenIps.length > 20 ? " …" : ""}<br><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-top:6px">`
+      + `<input type="checkbox" id="cmdIncHidden" style="width:auto;margin:0"`
+      + `${includeHidden ? " checked" : ""}> 也对这 ${hiddenIps.length} 台执行</label>`
+      + `（默认不执行）</div>`;
   if (meta.danger)
     html += `<div class="warn-box">⚠️ 这是破坏性操作，会立即影响矿机运行（${meta.action === "reboot" ? "重启会中断挖矿约数分钟" : "改矿池会切换挖矿目标"}）。请确认无误。</div>`;
   // 规模分级提示：几台和几千台的后果完全不是一回事，弹窗里必须让人看清影响范围
@@ -748,13 +766,19 @@ function openCmdDialog(cmd) {
     + `<div style="max-height:120px;overflow:auto;font-size:12px;line-height:1.6;border:1px solid #30363d;border-radius:6px;padding:6px;margin-top:4px">`
     + ips.map(esc).join("、") + `</div>`;
   $("cmdBody").innerHTML = html;
+  keepPools.forEach((vals, i) => vals.forEach((v, j) => {
+    const el = $(`${["poolUrl", "poolUser", "poolPass"][j]}${i}`);
+    if (el && v !== undefined) el.value = v;
+  }));
+  if ($("cmdIncHidden")) $("cmdIncHidden").onchange = (e) => openCmdDialog(cmd, e.target.checked);
+  $("cmdConfirm").disabled = ips.length === 0;
   // 确认按钮上写清「几台 + 干什么」，避免用户凭肌肉记忆点掉一个通用的"确认执行"
   $("cmdConfirm").textContent = `确认对 ${ips.length} 台执行【${meta.short || meta.title}】`;
   $("cmdModal").classList.remove("hidden");
 }
 
 $("cmdConfirm").onclick = async () => {
-  if (!pendingCmd || _cmdInFlight) return;
+  if (!pendingCmd || _cmdInFlight || !pendingCmd.ips.length) return;
   const cmd = pendingCmd;          // 局部持有：执行中点了取消/×，结果也照样显示，不影响下一个弹窗
   const ips = cmd.ips;
   if (cmd.action === "set_pools") {
@@ -805,14 +829,16 @@ $("cmdCancel").onclick = $("cmdClose").onclick = () => {
 };
 
 // 分批重启后台进度轮询：界面不卡，跑完弹最终结果
+let _cmdPollTimer = null;   // 只保留一条进度轮询链：快速重新登录时别再起一条、结束时弹两次结果
 async function pollCmdProgress(onlyIfRunning) {
   if (_wsStop) return;   // 登出/会话失效后停止，别成僵尸轮询
+  if (_cmdPollTimer) { clearTimeout(_cmdPollTimer); _cmdPollTimer = null; }
   try {
     const p = await jget("/api/command/progress");
     if (onlyIfRunning && !p.running) return;   // 刷新页面时：没有在跑的就别弹旧结果
     if (p.running) {
       document.title = `重启 ${p.done}/${p.total} · 矿机监控面板`;
-      setTimeout(pollCmdProgress, 3000);
+      _cmdPollTimer = setTimeout(pollCmdProgress, 3000);
     } else if (p.total) {
       document.title = "矿机监控面板";
       let msg = `分批重启完成：成功 ${p.success} / 失败 ${p.failed}（共 ${p.total} 台）`;
@@ -820,7 +846,7 @@ async function pollCmdProgress(onlyIfRunning) {
       toast(msg, p.failed ? "fail" : "ok");
       refreshMiners();
     }
-  } catch (e) { if (!_wsStop) setTimeout(pollCmdProgress, 5000); }
+  } catch (e) { if (!_wsStop) _cmdPollTimer = setTimeout(pollCmdProgress, 5000); }
 }
 
 // toast 用 textContent 而不是 innerHTML：内容里会拼进矿机/矿池返回的错误串(control.py 把异常
@@ -953,31 +979,53 @@ let myRole = "admin";
 let myUser = "";
 let _timer = null;
 
-function showLogin() { stopDashboard(); $("loginOverlay").classList.remove("hidden"); }
+function closePwd() { _pwdForced = false; $("pwdModal").classList.add("hidden"); }
+// 会话失效/换人登录：先关掉上一个人的强制改密弹窗，否则它会压在新登录的页面上、× 也被隐藏
+function showLogin() { stopDashboard(); closePwd(); $("loginOverlay").classList.remove("hidden"); }
 
 // ---- 改密码：弱口令会话登录后强制弹出，改完才能操作 ----
+// 远程弱口令会话(weak_remote)：只能看，也不能在远程改密码(防猜中默认密码的人借改密码抢账号)
 let _pwdForced = false;
+let _weakRemote = false;
+let _svcPort = location.port || "8800";
 function openPwd(force) {
-  _pwdForced = !!force;
-  $("pwdForce").classList.toggle("hidden", !force);
-  $("pwdClose").style.display = force ? "none" : "";
+  _pwdForced = !!force && !_weakRemote;
+  $("pwdForce").classList.toggle("hidden", !_pwdForced);
+  $("pwdRemote").classList.toggle("hidden", !_weakRemote);
+  $("pwdRemote").textContent = `当前账号密码太弱（默认密码、少于 8 位或太简单），从这台电脑只能查看、不能操作，`
+    + `也不能在这里改密码。请到监控电脑本机打开 http://127.0.0.1:${_svcPort} 登录并修改密码。`;
+  $("pwdForm").style.display = _weakRemote ? "none" : "";
+  $("pwdSave").style.display = _weakRemote ? "none" : "";
+  $("pwdClose").style.display = _pwdForced ? "none" : "";
+  $("pwdLogout").classList.toggle("hidden", !(_pwdForced || _weakRemote));   // 强制时也能换人登录
   ["pwdOld", "pwdNew", "pwdNew2"].forEach(id => $(id).value = "");
   $("pwdErr").textContent = "";
   $("pwdModal").classList.remove("hidden");
-  $("pwdOld").focus();
+  if (!_weakRemote) $("pwdOld").focus();
+}
+function afterLogin(d) {
+  _weakRemote = !!d.weak_remote;
+  if (d.port) _svcPort = String(d.port);
+  if (d.max_batch) maxBatch = d.max_batch;
+  closePwd();
+  if (d.must_change) openPwd(true);
 }
 async function savePwd() {
   const old = $("pwdOld").value, nw = $("pwdNew").value;
   if (nw !== $("pwdNew2").value) { $("pwdErr").textContent = "两次输入的新密码不一致"; return; }
   let d;
   try { d = await jpost("/api/password", { old, new: nw }); } catch (e) { return; }
-  if (!d.ok) { $("pwdErr").textContent = d.error || "修改失败"; return; }
-  $("pwdModal").classList.add("hidden");
-  _pwdForced = false;
+  if (!d.ok) {
+    $("pwdErr").textContent = d.error || "修改失败";
+    if (String(d.error || "").includes("已退出登录")) setTimeout(() => location.reload(), 1500);
+    return;
+  }
+  closePwd();
   toast("密码已修改", "ok");
 }
 $("btnPwd").onclick = () => openPwd(false);
-$("pwdClose").onclick = () => { if (!_pwdForced) $("pwdModal").classList.add("hidden"); };
+$("pwdClose").onclick = () => { if (!_pwdForced) closePwd(); };
+$("pwdLogout").onclick = () => doLogout();
 $("pwdSave").onclick = savePwd;
 $("pwdNew2").addEventListener("keydown", e => { if (e.key === "Enter") savePwd(); });
 
@@ -994,6 +1042,7 @@ function applyRole() {
 let _updTimer = null;
 let _updInfo = null;
 let _updating = false;
+let _updForce = false;   // known_bad 时由用户明确点"仍然重试"
 
 function markUpdateBtn(d) {
   const n = (d && !d.error && !d.known_bad && d.behind) || 0;
@@ -1013,6 +1062,8 @@ async function checkUpdate(force) {
 function renderUpdate(d) {
   const b = $("updBody");
   $("updApply").disabled = true;
+  $("updApply").textContent = "立即更新并重启";
+  _updForce = false;
   if (!d) { b.innerHTML = `<div class="upd-err">检查失败：连不上服务器</div>`; return; }
   if (d.git === false) {
     b.innerHTML = `<div class="upd-err">${esc(d.error || "本目录不是 git 仓库")}</div>
@@ -1031,7 +1082,10 @@ function renderUpdate(d) {
     h += `<div class="upd-ok">✓ 已是最新版本</div>`;
   } else if (d.known_bad) {
     h += `<div class="upd-err">远端最新版本 <code>${esc(d.remote)}</code> 之前自检未通过（或启动失败）已自动回滚，
-      不会再拉取它；等开发者推送修复后的新提交再更新。</div>`;
+      自动更新不会再拉取它。如果原因已排除（比如缺的依赖已经 pip install 好），可以点下面「仍然重试」。</div>`;
+    $("updApply").textContent = "仍然重试";
+    $("updApply").disabled = false;
+    _updForce = true;
   } else {
     h += `<div>有 <b>${d.behind}</b> 个新提交${d.behind > 10 ? "（下面只列最近 10 个）" : ""}：</div>
       <ul>${(d.changes || []).map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
@@ -1053,8 +1107,11 @@ async function openUpdate() {
 
 // 等服务重启：先等它下线(或最多 20 秒)，再等它回来，回来就刷新页面
 async function waitRestart() {
+  // 只有本服务自己的响应(200 已登录 / 401 会话已随重启失效)才算回来了：经 nginx/frp 访问时
+  // 服务停着代理也会回 502/404，不能当成"已恢复"去刷新页面
   const alive = async () => {
-    try { await fetch("/api/me", { cache: "no-store" }); return true; } catch (e) { return false; }
+    try { const r = await fetch("/api/me", { cache: "no-store" }); return r.status === 200 || r.status === 401; }
+    catch (e) { return false; }
   };
   const t0 = Date.now();
   let wentDown = false;
@@ -1066,16 +1123,18 @@ async function waitRestart() {
   }
   $("updBody").innerHTML = `<div class="upd-err">3 分钟了服务还没回来，请到服务器上检查程序窗口 / logs\\miner.log。</div>`;
   _updating = false;
+  startDashboard();   // 恢复轮询和失联检测：否则关掉弹窗后大屏是一张不更新、也不报警的静止画面
 }
 
 async function applyUpdate() {
   if (!_updInfo || !_updInfo.behind) return;
+  if (_updForce && !confirm("这个版本之前自检失败或启动崩溃过。确定原因已经排除、要再试一次吗？\n（再失败会自动回滚）")) return;
   if (!confirm(`确认更新到最新版本（${_updInfo.behind} 个新提交）并重启服务？\n重启期间约十几秒不扫描，所有人需要重新登录。`)) return;
   _updating = true;
   $("updApply").disabled = true; $("updRecheck").disabled = true;
   $("updBody").textContent = "正在拉取新代码并自检，可能需要 1～2 分钟，请勿关闭页面…";
   let r;
-  try { r = await jpost("/api/update/apply", {}); } catch (e) { r = null; }
+  try { r = await jpost("/api/update/apply", { force: _updForce }); } catch (e) { r = null; }
   $("updRecheck").disabled = false;
   if (!r || !r.ok) {
     _updating = false;
@@ -1121,6 +1180,10 @@ function connectWS() {
       if (_ws !== ws) return;                // 已被新连接取代的旧连接，别动全局状态
       _ws = null;
       if (ev && ev.code === 1008) { showLogin(); return; }
+      if (ev && ev.code === 4403) {          // 访问地址/来源不被允许：别弹登录也别重连，靠 30 秒轮询
+        toast("实时推送连接被服务器拒绝(访问地址不在允许列表)，已改为每 30 秒刷新");
+        return;
+      }
       scheduleWS();
     };
     ws.onerror = () => { try { ws.close(); } catch (e) {} };
@@ -1160,7 +1223,7 @@ async function doLogin() {
   if (!d.ok) { $("loginErr").textContent = d.error || "登录失败"; return; }
   $("loginOverlay").classList.add("hidden");
   myRole = d.role; myUser = d.user; applyRole(); startDashboard();
-  if (d.must_change) openPwd(true);
+  afterLogin(d);
 }
 
 async function doLogout() { await fetch("/api/logout", { method: "POST" }); location.reload(); }
@@ -1189,6 +1252,6 @@ async function init() {
   if (r.status === 401) { showLogin(); return; }
   const me = await r.json();
   myRole = me.role; myUser = me.user; applyRole(); startDashboard();
-  if (me.must_change) openPwd(true);
+  afterLogin(me);
 }
 init();

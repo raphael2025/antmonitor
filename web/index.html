@@ -77,14 +77,20 @@
   <div id="pwdModal" class="modal hidden">
     <div class="modal-box" style="width:420px">
       <div class="modal-head"><span>🔑 修改密码</span><button id="pwdClose">×</button></div>
-      <div id="pwdForce" class="upd-note hidden">当前密码太弱(默认密码或少于 8 位)，局域网里谁都可能猜到，
+      <div id="pwdForce" class="upd-note hidden">当前密码太弱(默认密码、少于 8 位或太简单)，局域网里谁都可能猜到，
         而这个账号能重启全场/换矿池。请先改密码，改完才能操作。</div>
-      <div class="seg-host">旧密码 <input id="pwdOld" type="password" autocomplete="current-password"></div>
-      <div class="seg-host">新密码 <input id="pwdNew" type="password" autocomplete="new-password"></div>
-      <div class="seg-host">再输一次 <input id="pwdNew2" type="password" autocomplete="new-password"></div>
-      <div class="muted">至少 8 位、至少 4 种不同字符，不能是默认密码或与用户名相同。改完其它电脑上的该账号会被登出。</div>
+      <div id="pwdRemote" class="upd-note hidden"></div>
+      <div id="pwdForm">
+        <div class="seg-host">旧密码 <input id="pwdOld" type="password" autocomplete="current-password"></div>
+        <div class="seg-host">新密码 <input id="pwdNew" type="password" autocomplete="new-password"></div>
+        <div class="seg-host">再输一次 <input id="pwdNew2" type="password" autocomplete="new-password"></div>
+        <div class="muted">至少 8 位、至少 4 种不同字符，不能是默认密码或与用户名相同。改完其它电脑上的该账号会被登出。</div>
+      </div>
       <div id="pwdErr" class="login-err"></div>
-      <div class="modal-foot"><button id="pwdSave" class="primary">保存</button></div>
+      <div class="modal-foot">
+        <button id="pwdLogout" class="hidden">退出登录</button>
+        <button id="pwdSave" class="primary">保存</button>
+      </div>
     </div>
   </div>
 

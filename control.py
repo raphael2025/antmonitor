@@ -9,6 +9,7 @@
 """
 import ipaddress
 import random
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,20 +23,27 @@ import miner_core
 ACTIONS = {"reboot", "locate", "set_pools"}
 
 
+# 只认严格的 stratum+tcp|ssl://host[:port][/]：host 只含字母数字.-，端口 1~5 位数字。
+# 不能"从一个怪地址里猜主机名"：cgminer/bmminer 按第一个 ':' 截主机、端口缓冲只有 5 位，
+# stratum+tcp://evil.com:03333@f2pool.com 在我们这边若按 '@' 取主机会看成 f2pool.com，
+# 矿机实际却连 evil.com。任何可能让两边理解不一致的写法(@ ? # % \ 空白…)一律不合格
+_POOL_RE = re.compile(r"^stratum\+(?:tcp|ssl)://([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\.?)"
+                      r"(?::(\d{1,5}))?/?$")
+
+
 def pool_host(url):
-    """stratum+tcp://Host:3333/xx → host(小写)；解析不出返回 ""。"""
-    s = str(url or "").strip()
-    if "://" in s:
-        s = s.split("://", 1)[1]
-    s = s.split("/", 1)[0].split("@")[-1]
-    if s.startswith("["):                      # [ipv6]:port
-        return s[1:s.find("]")].lower() if "]" in s else ""
-    return s.rsplit(":", 1)[0].lower() if ":" in s else s.lower()
+    """合格的矿池地址 → host(小写、去尾点)；不合格返回 ""。"""
+    m = _POOL_RE.match(str(url or "").strip())
+    if not m:
+        return ""
+    if m.group(2) is not None and not 1 <= int(m.group(2)) <= 65535:
+        return ""
+    return m.group(1).lower().rstrip(".")
 
 
 def pool_allowed(url, allowlist):
     """矿池地址是否在白名单内。白名单项 "f2pool.com" 同时放行其子域名(btc.f2pool.com)，
-    但不放行 evilf2pool.com / f2pool.com.evil.io。白名单为空 → 一律不放行。"""
+    但不放行 evilf2pool.com / f2pool.com.evil.io。地址格式不合格、白名单为空 → 一律不放行。"""
     host = pool_host(url)
     if not host:
         return False

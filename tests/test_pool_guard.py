@@ -20,7 +20,8 @@ from conftest import rec
 
 def test_pool_host_parsing_and_allowlist_suffix_match():
     assert control.pool_host("stratum+tcp://BTC.F2Pool.com:3333") == "btc.f2pool.com"
-    assert control.pool_host("stratum+ssl://ss.antpool.com:443/x") == "ss.antpool.com"
+    assert control.pool_host("stratum+ssl://ss.antpool.com:443") == "ss.antpool.com"
+    assert control.pool_host("stratum+ssl://ss.antpool.com:443/x") == ""   # 带路径：不合格
     allow = ["f2pool.com", "ss.antpool.com"]
     assert control.pool_allowed("stratum+tcp://btc.f2pool.com:3333", allow)
     assert control.pool_allowed("stratum+tcp://f2pool.com:3333", allow)
@@ -150,3 +151,33 @@ def test_audit_of_set_pools_survives_flood_of_low_value_rows(conn):
     acts = [r["action"] for r in conn.execute("SELECT action FROM command_log")]
     assert "set_pools" in acts
     assert acts.count("state:active") == 5000
+
+
+@pytest.mark.parametrize("url", [
+    "stratum+tcp://evil.com:03333@f2pool.com",      # 矿机按第一个 ':' 取主机 → 连 evil.com
+    "stratum+tcp://evil.com:3333?@f2pool.com",
+    "stratum+tcp://evil.com:3333#@f2pool.com",
+    "stratum+tcp://evil.com:3333\\@f2pool.com",
+    "stratum+tcp://evil.com%2f@f2pool.com:3333",
+    "stratum+tcp://f2pool.com@evil.com:3333",
+    "stratum+tcp:// f2pool.com:3333",
+    "stratum+tcp://f2pool.com:3333 evil.com:1",
+    "stratum+tcp://f2pool.com:99999",
+    "http://f2pool.com:3333",
+    "stratum+tcp://",
+])
+def test_tricky_pool_urls_are_never_allowed(url):
+    """白名单只认严格的 stratum+tcp|ssl://host[:port]：任何让"白名单看到的主机"和"矿机实际
+    连的主机"可能不一致的写法一律拒绝(下发时)、判为篡改(扫描时)。"""
+    assert not control.pool_allowed(url, ["f2pool.com"])
+
+
+def test_trailing_dot_and_case_are_normalized():
+    assert control.pool_allowed("stratum+tcp://BTC.F2Pool.com.:3333", ["f2pool.com"])
+    assert control.pool_allowed("stratum+ssl://btc.f2pool.com:443/", ["F2Pool.com."])
+
+
+def test_removing_a_hijacked_machine_clears_its_pool_alert(conn):
+    db.raise_alerts_bulk(conn, [("10.0.0.1", "pool_hijack", "crit", "x")])
+    db.remove_miners(conn, ["10.0.0.1"])
+    assert db.active_alert(conn, "10.0.0.1", "pool_hijack") is None

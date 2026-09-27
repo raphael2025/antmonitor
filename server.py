@@ -179,6 +179,10 @@ def require(min_role):
         if not auth.has_role(sess, min_role):
             raise HTTPException(status_code=403, detail="权限不足")
         if sess.get("must_change") and min_role != "viewer":   # 弱口令会话：只能看，改完密码才能操作
+            if sess.get("weak_remote"):
+                raise HTTPException(status_code=403, detail=(
+                    "当前账号密码太弱，远程只能查看。请到监控电脑本机打开 "
+                    f"http://127.0.0.1:{CFG['server']['port']} 登录并修改密码"))
             raise HTTPException(status_code=403, detail="当前密码太弱，请先修改密码(右上角 🔑)")
         return sess
     return dep
@@ -209,7 +213,8 @@ def api_login(request: Request, response: Response, body: dict = Body(...)):
     log.info("登录成功: %s (%s) from %s%s", s["user"], s["role"], src,
              " [弱口令，须改密码]" if s.get("must_change") else "")
     return {"ok": True, "user": s["user"], "role": s["role"],
-            "must_change": bool(s.get("must_change"))}
+            "must_change": bool(s.get("must_change")), "weak_remote": bool(s.get("weak_remote")),
+            "port": CFG["server"]["port"], "max_batch": CFG.get("control", {}).get("max_batch", 1000)}
 
 
 @app.post("/api/password")
@@ -227,6 +232,7 @@ def api_password(request: Request, body: dict = Body(...), sess: dict = Depends(
                     [{"ip": "-", "ok": not err, "msg": err or "已修改密码"}])
     if err:
         log.warning("修改密码失败: %s from %s (%s)", sess["user"], src, err)
+        err = err.replace("端口", str(CFG["server"]["port"]))
         return JSONResponse({"ok": False, "error": err}, status_code=400)
     log.info("已修改密码: %s from %s", sess["user"], src)
     return {"ok": True}
@@ -246,7 +252,9 @@ def api_me(request: Request):
         return JSONResponse({"authenticated": False, "auth_enabled": auth.enabled(CFG)},
                             status_code=401)
     return {"authenticated": True, "user": s["user"], "role": s["role"],
-            "auth_enabled": auth.enabled(CFG), "must_change": bool(s.get("must_change"))}
+            "auth_enabled": auth.enabled(CFG), "must_change": bool(s.get("must_change")),
+            "weak_remote": bool(s.get("weak_remote")), "port": CFG["server"]["port"],
+            "max_batch": CFG.get("control", {}).get("max_batch", 1000)}
 
 
 def _broadcast_threadsafe(payload):
@@ -266,16 +274,20 @@ def _broadcast_threadsafe(payload):
 async def ws_endpoint(websocket: WebSocket):
     host = websocket.headers.get("host", "")
     origin = websocket.headers.get("origin")
-    if not _host_ok(host) or (origin and not _same_origin(origin, host)):   # 防跨站 WebSocket 劫持
-        await websocket.close(code=1008)
-        return
+    proxied = _via_trusted_proxy(websocket)   # 与 HTTP 的 _request_guard 同口径：受信代理免检
+    bad_origin = not proxied and (not _host_ok(host) or (origin and not _same_origin(origin, host)))
     sess = auth.current(CFG, websocket.cookies.get(auth.COOKIE, ""))
-    if not sess:
-        await websocket.close(code=1008)
-        return
-    if len(WS_CLIENTS) >= WS_MAX_CLIENTS:   # 1013 = try again later
-        log.warning("WS 连接数已达上限 %d，拒绝新连接", WS_MAX_CLIENTS)
-        await websocket.close(code=1013)
+    # 先 accept 再 close：accept 之前 close 浏览器只看到 1006，前端分不清原因。
+    # 4403 = 访问地址/来源不被允许(前端不弹登录、不重连)；1008 = 会话失效(前端弹登录)
+    if bad_origin or not sess or len(WS_CLIENTS) >= WS_MAX_CLIENTS:
+        await websocket.accept()
+        if bad_origin:              # 防跨站 WebSocket 劫持
+            await websocket.close(code=4403)
+        elif not sess:
+            await websocket.close(code=1008)
+        else:                       # 1013 = try again later
+            log.warning("WS 连接数已达上限 %d，拒绝新连接", WS_MAX_CLIENTS)
+            await websocket.close(code=1013)
         return
     await websocket.accept()
     WS_CLIENTS.add(websocket)
@@ -355,7 +367,10 @@ def _rate_ok(src):
 def api_summary(_: dict = Depends(require_viewer)):
     ls, recs = _latest_records()
     # stale_after：前端"数据过期"横幅用服务端看门狗同一阈值(以前写死 900 秒，巡检间隔调大后每轮都误报)
-    extra = {"progress": SVC.progress, "stale_after": int(SVC._stale_threshold())}
+    # 下限 2 个巡检间隔+2 分钟：watchdog_minutes 显式配得比巡检间隔还小时，横幅别每轮都闪
+    sch = CFG["schedule"]
+    stale_after = max(SVC._stale_threshold(), sch.get("scan_interval", 300) * 2 + 120)
+    extra = {"progress": SVC.progress, "stale_after": int(stale_after)}
     if not ls:
         return {"scanned": False, **extra}
     return {"scanned": True, **_summary_stats(ls, recs), **extra}
@@ -1175,6 +1190,12 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
                                  "未配置矿池白名单，网页换矿池已禁用。请在监控电脑的 config.yaml 里"
                                  "配置 control.pool_allowlist(如 [\"f2pool.com\"])后重启服务"},
                                 status_code=403)
+        malformed = [p["url"] for p in pools if not control.pool_host(p["url"])]
+        if malformed:
+            _audit_reject(user, action, f"矿池地址格式不合格: {', '.join(malformed)[:300]}")
+            return JSONResponse({"ok": False, "error":
+                                 "矿池地址格式不对，只接受 stratum+tcp://主机名:端口 这种写法: "
+                                 + ", ".join(malformed)[:200]}, status_code=400)
         bad = [p["url"] for p in pools if not control.pool_allowed(p["url"], allow)]
         if bad:
             _audit_reject(user, action, f"矿池不在白名单: {', '.join(bad)[:300]}")
@@ -1248,10 +1269,11 @@ def api_update_check(force: bool = False, _: dict = Depends(require_admin)):
 
 
 @app.post("/api/update/apply")
-def api_update_apply(sess: dict = Depends(require_admin)):
+def api_update_apply(body: dict = Body(default={}), sess: dict = Depends(require_admin)):
     """拉取新代码(ff-only+编译自检+失败回滚)并重启(有守护交给守护，没有就自己拉起)。"""
     log.info("网页触发版本更新，操作人 %s", sess.get("user", "?"))
-    r = updater.apply((CFG.get("update") or {}).get("branch") or None)
+    r = updater.apply((CFG.get("update") or {}).get("branch") or None,
+                      force=bool((body or {}).get("force")))   # 网页上点"仍然重试"
     _UPDATE_CACHE["data"] = None
     log.info("版本更新结果: %s", r.get("msg") or f"{r.get('from')} → {r.get('to')}")
     return r
@@ -1263,7 +1285,7 @@ def api_commands(limit: int = 100, _: dict = Depends(require_admin)):
 
 
 @app.post("/api/machine-state")
-def api_machine_state(body: dict = Body(...), sess: dict = Depends(require_ops)):
+def api_machine_state(request: Request, body: dict = Body(...), sess: dict = Depends(require_ops)):
     """标记维修/取消维修/下架移除：{ips:[...], action:"repair"|"active"|"remove"}"""
     action = body.get("action")
     if action not in ("repair", "active", "remove"):
@@ -1277,7 +1299,7 @@ def api_machine_state(body: dict = Body(...), sess: dict = Depends(require_ops))
         SVC.drop_from_snapshot(ips)   # 内存快照同步剔除，否则要等下轮扫描才消失
     else:
         db.set_machine_state(SVC.conn, ips, action)
-    db.log_commands(SVC.conn, sess.get("user", "?"), "state:" + action,
+    db.log_commands(SVC.conn, f'{sess.get("user", "?")}@{_client_ip(request)}', "state:" + action,
                     [{"ip": ip, "ok": True, "msg": action} for ip in ips])
     log.info("机器状态 %s: %d 台, 操作人 %s", action, len(ips), sess.get("user", "?"))
     return {"ok": True, "action": action, "count": len(ips)}
@@ -1331,6 +1353,8 @@ def _is_console(request, src):
     同机跑着 nginx/frp(http) 转发时，外部请求也来自 127.0.0.1，但会带代理头/外部 Host，
     不能当本机(否则"弱口令只准本机登录"和"本机不锁"都能被远程绕过)。"""
     if not auth.is_local(src) or any(h in request.headers for h in _PROXY_HEADERS):
+        return False
+    if _via_trusted_proxy(request):   # 同机 nginx 默认不加 X-Forwarded-*、Host 也可能是 127.0.0.1
         return False
     name = _host_name(request.headers.get("host", ""))
     return name in ("localhost", "::1") or name.startswith("127.")

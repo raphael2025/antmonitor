@@ -321,3 +321,22 @@ def test_steady_zero_hashrate_machines_do_not_trip_the_reconfirm_breaker(svc, mo
     svc.scan_full("full")
     svc.scan_full("full")
     assert db.active_alert(svc.conn, flaky, "offline") is None
+
+
+def test_mass_hashrate_drop_does_not_reprobe_the_whole_farm(svc, monkeypatch):
+    """全场同时掉算力(矿池故障)：零算力疑似超过上限就不重探它们，但掉线的照样二次确认。"""
+    svc.cfg["scan"]["reconfirm_max"] = 3
+    ok = [rec(f"10.9.0.{i}") for i in (1, 2, 3, 4)] + [rec("10.9.0.5")]
+    zero = [rec(f"10.9.0.{i}", hr=0.0) for i in (1, 2, 3, 4)]
+    calls = []
+    rounds = iter([ok, zero, [rec("10.9.0.5")]])
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        calls.append(sorted(ips))
+        by_ip = {r["ip"]: r for r in next(rounds)}
+        return [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    svc.scan_full("full")
+    svc.scan_full("full")
+    assert calls[-1] == ["10.9.0.5"]                  # 只重探了掉线的那台

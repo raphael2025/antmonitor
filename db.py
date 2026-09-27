@@ -445,19 +445,6 @@ def roster_ips(conn, max_age_days=7):
         "OR state='repair'", (cutoff,)).fetchall()]
 
 
-def last_online_map(conn):
-    """{ip: 最后一次在线的扫描时间}，掉线告警按"这次掉线报过没有"判断用。"""
-    return {r["ip"]: r["last_online"] or 0 for r in
-            _r(conn).execute("SELECT ip,last_online FROM known_miners").fetchall()}
-
-
-def last_alert_ts(conn, type_, since=0):
-    """{ip: 该类告警最近一次发出时间}(含已恢复的)。"""
-    return {r["ip"]: r["ts"] for r in _r(conn).execute(
-        "SELECT ip, MAX(ts) ts FROM alerts WHERE type=? AND ts>=? GROUP BY ip",
-        (type_, since)).fetchall()}
-
-
 def repair_ips(conn):
     return set(r["ip"] for r in
                _r(conn).execute("SELECT ip FROM known_miners WHERE state='repair'").fetchall())
@@ -476,7 +463,7 @@ def mark_miners_migrated(conn, ips):
         return
     ts = int(time.time())
     ips = list(dict.fromkeys(ips))
-    types = ("offline", "zero", "reject", "low_hashrate", "overheat")
+    types = ("offline", "zero", "reject", "low_hashrate", "overheat", "pool_hijack")
     tqm = ",".join("?" * len(types))
     with _wlock, conn:
         conn.executemany("UPDATE known_miners SET state='migrated' WHERE ip=?",
@@ -495,7 +482,7 @@ def remove_miners(conn, ips):
     ts = int(time.time())
     ips = list(dict.fromkeys(ips))
     bases = sorted({".".join(ip.split(".")[:3]) for ip in ips if ip.count(".") == 3})
-    types = ("offline", "zero", "reject", "low_hashrate", "overheat")
+    types = ("offline", "zero", "reject", "low_hashrate", "overheat", "pool_hijack")
     tqm = ",".join("?" * len(types))
     with _wlock, conn:
         conn.executemany(
