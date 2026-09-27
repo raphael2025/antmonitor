@@ -73,10 +73,10 @@ def test_machines_still_down_when_segment_event_clears_get_their_own_alert(conn,
     _round(conn, cfg, clock, [rec(ip) for ip in ips], st)
     fired = _round(conn, cfg, clock, [rec(ip, status="offline") for ip in ips], st)
     assert fired == [("10.0.1.x", "segment_down")]                  # 整段只报一条
-    half = [rec(ip) for ip in ips[:5]] + [rec(ip, status="offline") for ip in ips[5:]]
-    _round(conn, cfg, clock, half, st)                              # 5/10 < 0.6 → 网段事件消除
+    most = [rec(ip) for ip in ips[:6]] + [rec(ip, status="offline") for ip in ips[6:]]
+    _round(conn, cfg, clock, most, st)                              # 4/10 低于消除线 → 网段事件消除
     assert _active(conn, "segment_down") == []
-    assert set(_active(conn)) == set(ips[5:])                       # 剩下 5 台必须单独报
+    assert set(_active(conn)) == set(ips[6:])                       # 剩下 4 台必须单独报
 
 
 def test_segment_down_again_within_cooldown_is_not_silent(conn, cfg, clock):
@@ -175,3 +175,17 @@ def test_repair_cancelled_long_ago_resolved_alert_does_not_suppress_forever(conn
     db.set_machine_state(conn, [IP], "active")
     _round(conn, cfg, clock, [rec(IP, status="offline")], st)
     assert _active(conn) == [IP]
+
+
+def test_segment_hovering_around_threshold_does_not_spam(conn, cfg, clock):
+    """离线率在 60% 上下来回：以前每次回落都消警、再超过又因 force 立刻重报，每轮一条推送。
+    加回差：超过 60% 才报，报了之后降到 45% 以下才消。"""
+    ips = [f"10.0.1.{i}" for i in range(1, 11)]
+    st = {}
+    _round(conn, cfg, clock, [rec(ip) for ip in ips], st)
+    for k in range(10):
+        n_off = 6 if k % 2 == 0 else 5                              # 60% / 50% 交替
+        _round(conn, cfg, clock, [rec(ip, status="offline") for ip in ips[:n_off]]
+               + [rec(ip) for ip in ips[n_off:]], st)
+    rows = [a for a in db.list_alerts(conn, False, 100) if a["type"] == "segment_down"]
+    assert len(rows) == 1 and not rows[0]["resolved"]

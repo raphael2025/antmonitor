@@ -163,9 +163,18 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         if r["status"] == "offline":
             seg_off[seg] = seg_off.get(seg, 0) + 1
     down_segments = set()
+    active_segs = {a["ip"][:-2] for a in db.active_alerts_by_type(conn, "segment_down")
+                   if a["ip"].endswith(".x")}
+    clear_ratio = seg_ratio * 0.75
     for seg, off in seg_off.items():
         tot = seg_total.get(seg, 0)
-        if off >= seg_min and tot > 0 and off / tot >= seg_ratio:
+        # 回差：超过 seg_ratio 才报；已在报的降到 seg_ratio×0.75 以下才消。否则离线率在阈值
+        # 附近来回时每轮"消—报"一次(整段事件 force 不受冷却)，值班群被刷屏
+        if seg in active_segs:
+            is_down = tot > 0 and off / tot >= clear_ratio
+        else:
+            is_down = off >= seg_min and tot > 0 and off / tot >= seg_ratio
+        if is_down:
             down_segments.add(seg)
             # force：整段事件不受冷却限制。下面会用 down_segments 静音段内单机告警，
             # 若这条被冷却拦下，同一栋冷却期内第二次断电就既无网段告警也无单机告警
@@ -305,9 +314,10 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     return fired
 
 
-# 集装箱故障连续这么多轮读到"正常"才消警(10 秒刷新 ≈ 30 秒)。一次抖动就消警的话，
-# 下一轮故障还在却被冷却拦下，漏液最长 30 分钟没有活跃告警
-COOLER_CLEAR_ROUNDS = 3
+# 集装箱故障持续读到"正常"满这么久才消警。一次抖动就消警的话，下一轮故障还在却被冷却拦下，
+# 漏液最长 30 分钟没有活跃告警；而 crit 又不受冷却(复发立刻重报)，消得太快会在接触不良时
+# 反复"报—消—报"刷屏。按时间而不是轮数：全网扫描和 10 秒刷新都会评估，轮数不等于时长
+COOLER_CLEAR_SEC = 300
 _COOLER_STATE = {}
 
 
@@ -351,8 +361,8 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
                     (a["type"] == "cooler:return_pressure_low_th" and rp_min and rp is None):
                 continue
             k = (ip, a["type"])
-            clean[k] = clean.get(k, 0) + 1
-            if clean[k] >= COOLER_CLEAR_ROUNDS:
+            first_ok = clean.setdefault(k, now)    # 从第一次读到正常开始计时
+            if now - first_ok >= COOLER_CLEAR_SEC:
                 clean.pop(k, None)
                 b.resolve(ip, a["type"])
         b.resolve(ip, "cooler_offline")   # 箱体恢复在线
