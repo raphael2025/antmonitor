@@ -445,19 +445,6 @@ def roster_ips(conn, max_age_days=7):
         "OR state='repair'", (cutoff,)).fetchall()]
 
 
-def last_online_map(conn):
-    """{ip: 最后一次在线的扫描时间}，掉线告警按"这次掉线报过没有"判断用。"""
-    return {r["ip"]: r["last_online"] or 0 for r in
-            _r(conn).execute("SELECT ip,last_online FROM known_miners").fetchall()}
-
-
-def last_alert_ts(conn, type_, since=0):
-    """{ip: 该类告警最近一次发出时间}(含已恢复的)。"""
-    return {r["ip"]: r["ts"] for r in _r(conn).execute(
-        "SELECT ip, MAX(ts) ts FROM alerts WHERE type=? AND ts>=? GROUP BY ip",
-        (type_, since)).fetchall()}
-
-
 def repair_ips(conn):
     return set(r["ip"] for r in
                _r(conn).execute("SELECT ip FROM known_miners WHERE state='repair'").fetchall())

@@ -139,9 +139,8 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     roster = set(db.roster_ips(conn, roster_age))   # 已知真机(算网段比例的分母)
     # 掉线告警按状态判，不按"上一轮 online → 本轮 offline"的跳变判：跳变那一轮只要没报出来
     # (冷却期/上一轮是 unknown/被网段事件或维修静音)，之后上一轮已是 offline 就永远不再报。
-    # 现在：名册内、当前离线、且自最后一次在线以来还没报过掉线 → 报(冷却只会推迟，不会吞掉)。
-    last_online = db.last_online_map(conn)
-    last_off_alert = db.last_alert_ts(conn, "offline", now - roster_age * 86400)
+    # 现在：名册内、当前离线、没被静音、且没有活跃的掉线告警 → 报。重复由"已有活跃告警不重报"
+    # 挡住，冷却只会推迟不会吞掉。不看"历史上报过没有"：维修/静音时消掉的旧记录不代表这次报过
 
     b = _Batch(conn, cooldown, now)
     # 静默期内的刚重启机器：掉线是预期内的，不报单机掉线，也不计入网段掉线比例
@@ -203,8 +202,13 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             for t in ("zero", "reject", "low_hashrate", "overheat"):
                 b.resolve(ip, t)
             streak.pop(ip, None)
-            if ip in repair or seg in down_segments:
-                b.resolve(ip, "offline")   # 维修中/被网段事件覆盖 → 清掉历史单条
+            if ip in repair:
+                b.resolve(ip, "offline")   # 维修中 → 清掉单条(人已经知道了)
+                rebooting.pop(ip, None)
+                continue
+            if seg in down_segments:
+                # 整段事件期间不新报单机，但断电前就已坏、已在报的单机告警保留：那是另一个
+                # 独立的问题，消掉的话来电后它仍离线却没有活跃告警
                 rebooting.pop(ip, None)
                 continue
             if ip in rb_quiet:             # 刚下发重启，还在静默期
@@ -214,8 +218,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                 b.fire(ip, "offline", "crit",
                        f"{ip} 重启后 {max(1, rb_grace // 60)} 分钟仍未上线")
                 continue
-            lo = last_online.get(ip)
-            if ip in roster and lo is not None and last_off_alert.get(ip, -1) <= lo:
+            if ip in roster:
                 b.fire(ip, "offline", "crit", f"{ip} 掉线")
             continue
         b.resolve(ip, "offline")

@@ -143,3 +143,35 @@ def test_machines_under_repair_do_not_count_toward_segment_down(conn, cfg, clock
     fired = _round(conn, cfg, clock, recs, st)
     assert _active(conn, "segment_down") == []
     assert (ips[9], "offline") in fired                 # 同段真掉线的那台照常报
+
+
+def test_machine_already_down_before_a_segment_outage_is_not_forgotten(conn, cfg, clock):
+    """两台先坏并已报警 → 整段断电 → 来电后这两台仍离线。以前单机告警在断电时被"静音消掉"，
+    又因为"报过了"(旧告警时间 > 最后在线时间)不再报，直到 3 天后记录被清理才冒出来。"""
+    ips = [f"10.0.1.{i}" for i in range(1, 11)]
+    st = {}
+    _round(conn, cfg, clock, [rec(ip) for ip in ips], st)
+    broken = ips[:2]
+    _round(conn, cfg, clock, [rec(ip, status="offline") for ip in broken]
+           + [rec(ip) for ip in ips[2:]], st)
+    assert set(_active(conn)) == set(broken)
+    _round(conn, cfg, clock, [rec(ip, status="offline") for ip in ips], st)   # 整段断电
+    assert _active(conn, "segment_down") == ["10.0.1.x"]
+    assert set(_active(conn)) == set(broken)            # 断电前就坏的那两台，告警不能被抹掉
+    _round(conn, cfg, clock, [rec(ip, status="offline") for ip in broken]
+           + [rec(ip) for ip in ips[2:]], st)           # 来电，其它恢复
+    assert _active(conn, "segment_down") == []
+    assert set(_active(conn)) == set(broken)
+
+
+def test_repair_cancelled_long_ago_resolved_alert_does_not_suppress_forever(conn, cfg, clock):
+    """维修期间消掉的告警(已恢复记录)不能算"报过了"：取消维修后仍离线就要报。"""
+    st = {}
+    _round(conn, cfg, clock, [rec(IP)], st)
+    _round(conn, cfg, clock, [rec(IP, status="offline")], st)           # 报警
+    db.set_machine_state(conn, [IP], "repair")
+    _round(conn, cfg, clock, [rec(IP, status="offline")], st)           # 维修 → 消警
+    clock.tick(3600)
+    db.set_machine_state(conn, [IP], "active")
+    _round(conn, cfg, clock, [rec(IP, status="offline")], st)
+    assert _active(conn) == [IP]
