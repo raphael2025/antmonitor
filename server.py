@@ -214,7 +214,7 @@ def api_login(request: Request, response: Response, body: dict = Body(...)):
              " [弱口令，须改密码]" if s.get("must_change") else "")
     return {"ok": True, "user": s["user"], "role": s["role"],
             "must_change": bool(s.get("must_change")), "weak_remote": bool(s.get("weak_remote")),
-            "port": CFG["server"]["port"]}
+            "port": CFG["server"]["port"], "max_batch": CFG.get("control", {}).get("max_batch", 1000)}
 
 
 @app.post("/api/password")
@@ -253,7 +253,8 @@ def api_me(request: Request):
                             status_code=401)
     return {"authenticated": True, "user": s["user"], "role": s["role"],
             "auth_enabled": auth.enabled(CFG), "must_change": bool(s.get("must_change")),
-            "weak_remote": bool(s.get("weak_remote")), "port": CFG["server"]["port"]}
+            "weak_remote": bool(s.get("weak_remote")), "port": CFG["server"]["port"],
+            "max_batch": CFG.get("control", {}).get("max_batch", 1000)}
 
 
 def _broadcast_threadsafe(payload):
@@ -366,7 +367,10 @@ def _rate_ok(src):
 def api_summary(_: dict = Depends(require_viewer)):
     ls, recs = _latest_records()
     # stale_after：前端"数据过期"横幅用服务端看门狗同一阈值(以前写死 900 秒，巡检间隔调大后每轮都误报)
-    extra = {"progress": SVC.progress, "stale_after": int(SVC._stale_threshold())}
+    # 下限 2 个巡检间隔+2 分钟：watchdog_minutes 显式配得比巡检间隔还小时，横幅别每轮都闪
+    sch = CFG["schedule"]
+    stale_after = max(SVC._stale_threshold(), sch.get("scan_interval", 300) * 2 + 120)
+    extra = {"progress": SVC.progress, "stale_after": int(stale_after)}
     if not ls:
         return {"scanned": False, **extra}
     return {"scanned": True, **_summary_stats(ls, recs), **extra}
@@ -1280,7 +1284,7 @@ def api_commands(limit: int = 100, _: dict = Depends(require_admin)):
 
 
 @app.post("/api/machine-state")
-def api_machine_state(body: dict = Body(...), sess: dict = Depends(require_ops)):
+def api_machine_state(request: Request, body: dict = Body(...), sess: dict = Depends(require_ops)):
     """标记维修/取消维修/下架移除：{ips:[...], action:"repair"|"active"|"remove"}"""
     action = body.get("action")
     if action not in ("repair", "active", "remove"):
@@ -1294,7 +1298,7 @@ def api_machine_state(body: dict = Body(...), sess: dict = Depends(require_ops))
         SVC.drop_from_snapshot(ips)   # 内存快照同步剔除，否则要等下轮扫描才消失
     else:
         db.set_machine_state(SVC.conn, ips, action)
-    db.log_commands(SVC.conn, sess.get("user", "?"), "state:" + action,
+    db.log_commands(SVC.conn, f'{sess.get("user", "?")}@{_client_ip(request)}', "state:" + action,
                     [{"ip": ip, "ok": True, "msg": action} for ip in ips])
     log.info("机器状态 %s: %d 台, 操作人 %s", action, len(ips), sess.get("user", "?"))
     return {"ok": True, "action": action, "count": len(ips)}
