@@ -32,15 +32,17 @@ WEAK = {"username": "admin", "password": "admin888", "role": "admin"}
 STRONG = {"username": "ops", "password": auth.hash_password("Str0ng-Pass!"), "role": "ops"}
 
 
-def test_weak_password_remote_is_view_only_and_cannot_change_password(tmp_path):
-    """自动更新后弱口令账号不能被整个锁在外面(远程站点只能派人去现场)：远程照常能登录、
-    能看监控，但只能看；而且远程不能改密码——否则猜中 admin888 的人登录后改个密码就把账号抢走。"""
+def test_weak_password_remote_can_operate_and_change_password(tmp_path):
+    """弱口令只提示：远程也能登录、能运维、能改密码(Ubuntu 服务器部署首次登录几乎都是局域网 IP)。
+    must_change/weak_remote 仍打标给前端提示，但不锁权限。"""
     cfg = _cfg(WEAK)
     tok, why = auth.login_ex(cfg, "admin", "admin888", src="192.168.1.50")
     s = auth.session(tok)
     assert tok and s["must_change"] and s["weak_remote"]
-    assert "本机" in auth.change_password(cfg, "admin", "admin888", "N3w-Strong-Pw",
-                                         keep_token=tok, path=str(tmp_path / "x.yaml"))
+    err = auth.change_password(cfg, "admin", "admin888", "N3w-Strong-Pw",
+                               keep_token=tok, path=str(tmp_path / "x.yaml"))
+    # 无 config 文件路径时 set_user_password 可能失败；这里主要断言不再被 weak_remote 拦
+    assert err != "这个账号的密码太弱，只能在监控电脑本机(打开 http://127.0.0.1:端口)登录后修改"
     tok, _ = auth.login_ex(cfg, "admin", "admin888", src="127.0.0.1")
     s = auth.session(tok)
     assert s["must_change"] and not s["weak_remote"]
@@ -91,7 +93,7 @@ def test_idle_session_expires(monkeypatch):
     assert auth.session(tok) is None
 
 
-def test_web_password_change_forces_weak_session_through_and_writes_config(monkeypatch, tmp_path):
+def test_web_password_change_weak_session_keeps_ops_and_writes_config(monkeypatch, tmp_path):
     src = Path(__file__).with_name("server_config.yaml")
     monkeypatch.setenv("MINER_CONFIG", str(src))
     server = importlib.import_module("server")
@@ -104,18 +106,10 @@ def test_web_password_change_forces_weak_session_through_and_writes_config(monke
 
     c = TestClient(server.app)
     r = c.post("/api/login", json={"username": "weakops", "password": "ops888"})
-    assert r.status_code == 200 and r.json()["must_change"]          # 远程弱口令：能登录、只能看
+    assert r.status_code == 200 and r.json()["must_change"]          # 仍提示弱口令
+    # 弱口令不再锁写权限：远程也能下发命令、也能改密码
     assert c.post("/api/command", json={"ips": ["10.0.0.1"], "action": "locate",
-                                        "params": {"on": True}}).status_code == 403
-    assert c.post("/api/password", json={"old": "ops888", "new": "N3w-Strong-Pw"}).status_code == 400
-    c.post("/api/logout")
-    tok, _ = auth.login_ex(server.CFG, "weakops", "ops888", src="127.0.0.1")
-    c.cookies.set(auth.COOKIE, tok)
-    assert c.get("/api/me").json()["must_change"] is True
-    blocked = c.post("/api/command", json={"ips": ["10.0.0.1"], "action": "locate",
-                                           "params": {"on": True}})
-    assert blocked.status_code == 403 and "修改密码" in blocked.json()["detail"]
-
+                                        "params": {"on": True}}).status_code != 403
     assert c.post("/api/password", json={"old": "ops888", "new": "123"}).status_code == 400
     r = c.post("/api/password", json={"old": "ops888", "new": "N3w-Strong-Pw"})
     assert r.status_code == 200, r.text

@@ -161,12 +161,13 @@ class MonitorService:
         空闲时 last_finished 每个巡检间隔刷新一次；扫描进行中看进度心跳(每 200 台刷新，
         全网发现也一样)。所以按巡检间隔推算即可。以前取 full_interval×1.5 —— 把全扫的
         "间隔"当成了"耗时"，默认要 90 分钟才发现巡检卡死。下限 15 分钟：单轮扫描/二次确认
-        各有 600 秒整体超时兜底(期间可能没有心跳)，留出余量，别在兜底之前就误判触发强制恢复。"""
+        各有 900 秒(15 分钟)整体超时兜底(期间可能没有心跳)，留出余量，别在兜底之前就误判触发强制恢复。"""
         sch = self.cfg["schedule"]
         cfgd = sch.get("watchdog_minutes", 0)
         if cfgd:
             return max(120, float(cfgd) * 60)
-        return max(900.0, sch.get("scan_interval", 300) * 3.0)
+        # 下限 20 分钟：高于 miner_core 整体超时 15 分钟，避免全网发现还在跑就被判停滞
+        return max(1200.0, sch.get("scan_interval", 300) * 3.0)
 
     def is_stale(self, now=None):
         """扫描中看进度心跳；空闲时看上次完成时间与调度线程心跳。"""

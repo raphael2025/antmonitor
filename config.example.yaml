@@ -15,7 +15,7 @@ scan:
   discovery_workers: 300 # 全网发现并发
   liveness_gate: true   # 发现时先快速 TCP 连 80 判活(三类设备都开80)，死IP不再白跑3个探测
   gate_timeout: 2.0     # 判活连接超时(秒)；须明显大于到矿机的 RTT，否则整网假离线
-  max_pps: 100          # 每秒新建连接上限(≈死IP的ARP速率)，保护三层500pps CoPP(5倍余量)；代码强制上限500，不可配更高
+  max_pps: 300          # 每秒新建连接上限(≈死IP的ARP速率)，保护三层500pps CoPP；代码强制上限500，不可配更高
   # 二次确认：上次在线、本次掉线/零算力的机器，用更宽松超时重探，去掉抖动/慢响应误判
   reconfirm_enabled: true
   reconfirm_online_timeout: 3.0  # 二次确认的连接超时(秒)

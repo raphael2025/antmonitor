@@ -983,32 +983,30 @@ function closePwd() { _pwdForced = false; $("pwdModal").classList.add("hidden");
 // 会话失效/换人登录：先关掉上一个人的强制改密弹窗，否则它会压在新登录的页面上、× 也被隐藏
 function showLogin() { stopDashboard(); closePwd(); $("loginOverlay").classList.remove("hidden"); }
 
-// ---- 改密码：弱口令会话登录后强制弹出，改完才能操作 ----
-// 远程弱口令会话(weak_remote)：只能看，也不能在远程改密码(防猜中默认密码的人借改密码抢账号)
+// ---- 改密码：弱口令登录后弹提示，可关掉继续用；不锁权限（服务器部署首次登录多是远程） ----
 let _pwdForced = false;
 let _weakRemote = false;
 let _svcPort = location.port || "8800";
 function openPwd(force) {
-  _pwdForced = !!force && !_weakRemote;
-  $("pwdForce").classList.toggle("hidden", !_pwdForced);
-  $("pwdRemote").classList.toggle("hidden", !_weakRemote);
-  $("pwdRemote").textContent = `当前账号密码太弱（默认密码、少于 8 位或太简单），从这台电脑只能查看、不能操作，`
-    + `也不能在这里改密码。请到监控电脑本机打开 http://127.0.0.1:${_svcPort} 登录并修改密码。`;
-  $("pwdForm").style.display = _weakRemote ? "none" : "";
-  $("pwdSave").style.display = _weakRemote ? "none" : "";
-  $("pwdClose").style.display = _pwdForced ? "none" : "";
-  $("pwdLogout").classList.toggle("hidden", !(_pwdForced || _weakRemote));   // 强制时也能换人登录
+  // force 仅表示"建议改"：仍可关、可操作；不再因弱口令锁死写权限
+  _pwdForced = false;
+  $("pwdForce").classList.toggle("hidden", !force);
+  $("pwdRemote").classList.add("hidden");
+  $("pwdForm").style.display = "";
+  $("pwdSave").style.display = "";
+  $("pwdClose").style.display = "";
+  $("pwdLogout").classList.add("hidden");
   ["pwdOld", "pwdNew", "pwdNew2"].forEach(id => $(id).value = "");
   $("pwdErr").textContent = "";
   $("pwdModal").classList.remove("hidden");
-  if (!_weakRemote) $("pwdOld").focus();
+  $("pwdOld").focus();
 }
 function afterLogin(d) {
   _weakRemote = !!d.weak_remote;
   if (d.port) _svcPort = String(d.port);
   if (d.max_batch) maxBatch = d.max_batch;
   closePwd();
-  if (d.must_change) openPwd(true);
+  if (d.must_change) openPwd(true);   // 提示改密，可关
 }
 async function savePwd() {
   const old = $("pwdOld").value, nw = $("pwdNew").value;

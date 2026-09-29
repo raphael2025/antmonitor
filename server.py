@@ -178,12 +178,8 @@ def require(min_role):
             raise HTTPException(status_code=401, detail="未登录")
         if not auth.has_role(sess, min_role):
             raise HTTPException(status_code=403, detail="权限不足")
-        if sess.get("must_change") and min_role != "viewer":   # 弱口令会话：只能看，改完密码才能操作
-            if sess.get("weak_remote"):
-                raise HTTPException(status_code=403, detail=(
-                    "当前账号密码太弱，远程只能查看。请到监控电脑本机打开 "
-                    f"http://127.0.0.1:{CFG['server']['port']} 登录并修改密码"))
-            raise HTTPException(status_code=403, detail="当前密码太弱，请先修改密码(右上角 🔑)")
+        # 弱口令只提示改密，不锁写权限：Ubuntu 服务器/局域网部署时几乎都是远程登录，
+        # 以前把 must_change 当成只读会让首次登录直接没法运维。
         return sess
     return dep
 

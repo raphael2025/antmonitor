@@ -42,7 +42,7 @@ DEFAULTS = {
         "base": "172.16", "lo": 100, "hi": 160,
         "online_timeout": 2.5, "data_timeout": 5.0,
         "workers": 300, "discovery_workers": 300,
-        "liveness_gate": True, "gate_timeout": 2.0, "max_pps": 100,
+        "liveness_gate": True, "gate_timeout": 2.0, "max_pps": 300,
         "reconfirm_enabled": True, "reconfirm_online_timeout": 3.0,
         "reconfirm_data_timeout": 6.0, "reconfirm_passes": 2, "reconfirm_max": 800,
         "fetch_worker": True,
@@ -55,7 +55,7 @@ DEFAULTS = {
         "enabled": True,
         "scan_interval": 300,      # 名册巡检间隔(秒)
         "full_interval": 3600,     # 全网发现间隔(秒)；发现新机/新网段
-        "watchdog_minutes": 0,     # 0=自动取 max(15分钟, 巡检间隔×3)
+        "watchdog_minutes": 0,     # 0=自动取 max(20分钟, 巡检间隔×3)，高于扫描整体超时15分钟
         "container_interval": 10,
     },
     "alerts": {

@@ -546,7 +546,9 @@ def scan(ips, cfg, progress_cb=None, workers=None):
     done = 0
     seen = set()
     pps = max_pps or 100
-    overall_to = max(600.0, total / max(pps, 1) * 3.0)   # 防线程池永久挂死
+    # 整体超时：下限 15 分钟。空号多时真实吞吐≈workers/判活超时，远低于 max_pps；
+    # 以前用 max(600, 总数/pps×3)，pps 一高就卡在 10 分钟地板，后段网段发现不完。
+    overall_to = max(900.0, total / max(pps, 1) * 3.0)
     bag = _new_bag()          # 本次调用私有的会话袋，收尾只关自己创建的会话
     ex = ThreadPoolExecutor(max_workers=workers, initializer=_bind_bag, initargs=(bag,))
     futs = {ex.submit(probe, ip, cfg, limiter): ip for ip in ips}
