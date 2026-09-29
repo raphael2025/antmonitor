@@ -1,5 +1,11 @@
 # AntMonitor · 蚂蚁矿机监控
 
+**Language / 语言 / Язык / Idioma / Sprache / اللغة：**  
+[🇨🇳 中文](docs/guide/zh.md) · [🇬🇧 English](docs/guide/en.md) · [🇷🇺 Русский](docs/guide/ru.md) · [🇪🇸 Español](docs/guide/es.md) · [🇩🇪 Deutsch](docs/guide/de.md) · [🇸🇦 العربية](docs/guide/ar.md)
+
+> 简介 · 部署 · 使用 → 点上方选语言。Intro · Deploy · How to use → pick a language above.  
+> 索引 Index：[docs/guide/](docs/guide/README.md)
+
 **中文**：比特大陆蚂蚁矿机（ANTMINER）局域网批量监控与运维系统  
 **English**: Local bulk monitoring & ops for BITMAIN **ANTMINER** / **ANTBOX** farms
 
@@ -13,7 +19,7 @@ Scan LAN miners & hydro containers, auto-detect firmware, read hashrate — **We
 | 场地本地 Site ops | https://github.com/raphael2025/antmonitor （本仓库） |
 | 云端总览 Multi-site | https://github.com/raphael2025/cloud-overview |
 
-> 📚 **文档 Docs**：[开发 DEVELOPMENT](docs/DEVELOPMENT.md) ｜ [内部API INTERNAL](docs/INTERNAL_API.md) ｜
+> 📚 **文档 Docs**：[多语言指南 Guides](docs/guide/README.md) ｜ [开发 DEVELOPMENT](docs/DEVELOPMENT.md) ｜ [内部API INTERNAL](docs/INTERNAL_API.md) ｜
 > [外部API EXTERNAL](docs/EXTERNAL_API.md) ｜ **[运维安全 SECURITY](docs/SECURITY.md)**
 
 > 算力按**千进制**显示：1000 TH = 1 PH，1000 PH = 1 EH（总算力/客户/趋势自动选单位；
@@ -21,7 +27,7 @@ Scan LAN miners & hydro containers, auto-detect firmware, read hashrate — **We
 
 ### 定制 / Custom
 
-需要特殊功能（报表、对接矿池/电费、权限改造、多场地策略等）可联系定制：
+需要特殊功能（报表、对接矿池/电费、权限改造、多场地策略、Agent Skill / MCP 等）可联系定制：
 
 | 渠道 Channel | |
 |---|---|
