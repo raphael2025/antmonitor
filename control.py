@@ -23,6 +23,42 @@ import miner_core
 ACTIONS = {"reboot", "locate", "set_pools"}
 
 
+def filter_reboot_targets(conn, targets, cfg):
+    """按 control.reboot_max_per_day / reboot_min_interval_sec 过滤待重启目标。
+
+    targets: [(ip, firmware), ...]。返回 (allowed_targets, skipped_results)。
+    skipped_results 形如 {ip, ok:False, msg:...}，调用方应写入 command_log；
+    不抛错、不打断整批——超限的跳过，其余照常下发。手动与自动共用。
+    """
+    import db  # 延迟导入：避免 control↔db 顶层环依赖(测试里常单独 mock)
+    ctl = cfg.get("control") or {}
+    max_day = int(ctl.get("reboot_max_per_day", 4) or 4)
+    min_iv = int(ctl.get("reboot_min_interval_sec", 900) or 900)
+    ips = [t[0] for t in targets]
+    stats = db.reboot_stats(conn, ips, window_sec=86400)
+    now = int(time.time())
+    allowed, skipped = [], []
+    for ip, fw in targets:
+        st = stats.get(ip) or {"count": 0, "last_ts": 0}
+        cnt = int(st.get("count") or 0)
+        last = int(st.get("last_ts") or 0)
+        if cnt >= max_day:
+            skipped.append({
+                "ip": ip, "ok": False,
+                "msg": f"24h内已成功重启{cnt}次(上限{max_day})，跳过",
+            })
+            continue
+        if last and min_iv > 0 and now - last < min_iv:
+            left = min_iv - (now - last)
+            skipped.append({
+                "ip": ip, "ok": False,
+                "msg": f"距上次成功重启不足{max(1, min_iv // 60)}分钟(还需{left}s)，跳过",
+            })
+            continue
+        allowed.append((ip, fw))
+    return allowed, skipped
+
+
 # 只认严格的 stratum+tcp|ssl://host[:port][/]：host 只含字母数字.-，端口 1~5 位数字。
 # 不能"从一个怪地址里猜主机名"：cgminer/bmminer 按第一个 ':' 截主机、端口缓冲只有 5 位，
 # stratum+tcp://evil.com:03333@f2pool.com 在我们这边若按 '@' 取主机会看成 f2pool.com，

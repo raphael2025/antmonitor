@@ -29,6 +29,12 @@
     <div class="actions">
       <span id="lastScan" class="muted">尚未扫描</span>
       <span id="userBadge" class="badge" title="当前角色"></span>
+      <span id="rebootBar" class="reboot-bar" title="掉线自动重启：关则只手动；开则掉线后自动下发(受24h≤4次、间隔≥15分钟限流)">
+        <label class="reboot-tog"><input type="checkbox" id="rebootEnabled"> 掉线自动重启</label>
+        <label>间隔s <input id="rebootDelay" type="number" min="0" max="3600"></label>
+        <label>并发 <input id="rebootConc" type="number" min="1" max="1000"></label>
+        <button id="btnRebootSave" class="mini-btn" title="保存重启设置(admin)">保存</button>
+      </span>
       <button id="btnPwd" title="修改自己的登录密码">🔑 改密码</button>
       <button id="btnLogout" title="退出登录">退出</button>
       <button id="btnVoice" title="掉线/告警语音播报">🔇 语音告警: 关</button>
@@ -196,7 +202,6 @@
       <button data-cmd="locate-on" class="mini-btn">💡 定位灯开</button>
       <button data-cmd="locate-off" class="mini-btn">定位灯关</button>
       <button data-cmd="reboot" class="mini-btn danger">⟳ 重启</button>
-      <button data-cmd="set-pools" class="mini-btn danger">⚙ 换矿池</button>
       <span class="sep"></span>
       <button data-cmd="repair" class="mini-btn">🔧 维修中</button>
       <button data-cmd="unrepair" class="mini-btn">取消维修</button>

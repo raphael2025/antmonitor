@@ -674,14 +674,12 @@ const CMD_META = {
   "locate-on":  { action: "locate", params: { on: true },  title: "💡 开启定位灯", short: "开定位灯", danger: false },
   "locate-off": { action: "locate", params: { on: false }, title: "关闭定位灯", short: "关定位灯", danger: false },
   "reboot":     { action: "reboot", params: {}, title: "⟳ 重启矿机", short: "重启", danger: true },
-  "set-pools":  { action: "set_pools", params: {}, title: "⚙ 修改矿池", short: "换矿池", danger: true },
 };
-// 破坏性命令(重启/换矿池)的「大批量」阈值。比 repair/remove 的 500 更低：换矿池直接改全场
-// 收益去向、重启让全场同时离线，误操作代价远高于标记维修，所以更早开始拦。
+// 破坏性命令(重启)的「大批量」阈值。比 repair/remove 的 500 更低：重启让全场同时离线，
+// 误操作代价远高于标记维修，所以更早开始拦。换矿池面板入口已去掉(API 仍保留)。
 const DANGER_BULK = 200;
-// 后端 /api/command 对 reboot/set_pools 强制要求请求体带 confirm:true，否则 400。
-// 字段名与 server.py 约定死，改这里必须同步改后端。
-const NEED_CONFIRM_FLAG = new Set(["reboot", "set_pools"]);
+// 后端 /api/command 对 reboot 强制要求请求体带 confirm:true，否则 400。
+const NEED_CONFIRM_FLAG = new Set(["reboot"]);
 
 document.querySelector(".cmdbar").addEventListener("click", (e) => {
   const cmd = e.target.dataset && e.target.dataset.cmd;
@@ -728,8 +726,6 @@ function openCmdDialog(cmd, includeHidden) {
   const hiddenIps = [...selected].filter(ip => !visible.has(ip));
   const ips = includeHidden ? [...selected] : [...selected].filter(ip => visible.has(ip));
   if (ips.length > maxBatch) { toast(`一次最多 ${maxBatch} 台（control.max_batch），请缩小选择范围分批操作`); return; }
-  const keepPools = [0, 1, 2].map(i => ["poolUrl", "poolUser", "poolPass"].map(k =>
-    ($(`${k}${i}`) || {}).value));   // 切换"是否包含"时重画弹窗，别丢已填的矿池
   // 目标在打开弹窗这一刻冻结：弹窗里列的就是确认后下发的，期间自动刷新不会改变目标
   pendingCmd = { action: meta.action, params: { ...meta.params }, danger: !!meta.danger,
                  short: meta.short || meta.title, ips };
@@ -743,33 +739,17 @@ function openCmdDialog(cmd, includeHidden) {
       + `${includeHidden ? " checked" : ""}> 也对这 ${hiddenIps.length} 台执行</label>`
       + `（默认不执行）</div>`;
   if (meta.danger)
-    html += `<div class="warn-box">⚠️ 这是破坏性操作，会立即影响矿机运行（${meta.action === "reboot" ? "重启会中断挖矿约数分钟" : "改矿池会切换挖矿目标"}）。请确认无误。</div>`;
+    html += `<div class="warn-box">⚠️ 这是破坏性操作，会立即影响矿机运行（重启会中断挖矿约数分钟）。请确认无误。</div>`;
   // 规模分级提示：几台和几千台的后果完全不是一回事，弹窗里必须让人看清影响范围
   if (meta.danger && ips.length > DANGER_BULK)
     html += `<div class="warn-box" style="border-width:2px;font-weight:700;font-size:15px;line-height:1.7">`
       + `🚨 即将对 <span style="font-size:19px">${ips.length}</span> 台矿机执行【${esc(meta.short || meta.title)}】<br>`
-      + (meta.action === "reboot"
-          ? `这会让这 ${ips.length} 台矿机同时离线数分钟（分批下发，仍有整片算力掉坑）。`
-          : `这会把这 ${ips.length} 台矿机的挖矿收益去向整体切换到新矿池。`)
+      + `这会让这 ${ips.length} 台矿机同时离线数分钟（分批下发，仍有整片算力掉坑）。`
       + `<br>这是破坏性操作，请再次确认选中范围无误！</div>`;
-  if (meta.action === "set_pools") {
-    // 后端支持 1-8 个池，这里给主池 + 两个备用池(矿场标准配置就是一主两备)
-    html += `<div class="muted" style="margin:6px 0">主池必填；备用池留空则不下发。矿机会在主池不可用时自动切备用池。</div>`;
-    for (let i = 0; i < 3; i++) {
-      html += `<div class="poolrow"><b>${i === 0 ? "主池" : "备用池" + i}</b>`
-        + `<input id="poolUrl${i}" placeholder="stratum+tcp://host:port">`
-        + `<input id="poolUser${i}" placeholder="矿工名 worker">`
-        + `<input id="poolPass${i}" value="x" placeholder="密码"></div>`;
-    }
-  }
   html += `<div class="muted" style="margin-top:8px">目标 ${ips.length} 台：</div>`
     + `<div style="max-height:120px;overflow:auto;font-size:12px;line-height:1.6;border:1px solid #30363d;border-radius:6px;padding:6px;margin-top:4px">`
     + ips.map(esc).join("、") + `</div>`;
   $("cmdBody").innerHTML = html;
-  keepPools.forEach((vals, i) => vals.forEach((v, j) => {
-    const el = $(`${["poolUrl", "poolUser", "poolPass"][j]}${i}`);
-    if (el && v !== undefined) el.value = v;
-  }));
   if ($("cmdIncHidden")) $("cmdIncHidden").onchange = (e) => openCmdDialog(cmd, e.target.checked);
   $("cmdConfirm").disabled = ips.length === 0;
   // 确认按钮上写清「几台 + 干什么」，避免用户凭肌肉记忆点掉一个通用的"确认执行"
@@ -781,19 +761,6 @@ $("cmdConfirm").onclick = async () => {
   if (!pendingCmd || _cmdInFlight || !pendingCmd.ips.length) return;
   const cmd = pendingCmd;          // 局部持有：执行中点了取消/×，结果也照样显示，不影响下一个弹窗
   const ips = cmd.ips;
-  if (cmd.action === "set_pools") {
-    const pools = [];
-    for (let i = 0; i < 3; i++) {
-      const el = $(`poolUrl${i}`);
-      const url = el ? el.value.trim() : "";
-      if (!url) continue;
-      const user = $(`poolUser${i}`).value.trim();
-      if (!user) { toast(`第 ${i + 1} 个矿池填了地址但没填矿工名`); return; }
-      pools.push({ url, user, pass: $(`poolPass${i}`).value || "x" });
-    }
-    if (!pools.length) { toast("请至少填写主池地址与矿工名"); return; }
-    cmd.params.pools = pools;
-  }
   // 大批量破坏性命令再拦一道原生确认，和 repair/remove 的交互保持一致
   if (cmd.danger && ips.length > DANGER_BULK &&
       !confirm(`⚠️ 即将对 ${ips.length} 台矿机执行【${cmd.short}】，数量很大且不可撤销。\n确定继续吗？`)) return;
@@ -803,17 +770,19 @@ $("cmdConfirm").onclick = async () => {
   $("cmdCancel").textContent = "后台执行，关闭窗口";
   try {
     const body = { ips, action: cmd.action, params: cmd.params };
-    // 后端对 reboot/set_pools 强制校验 confirm===true，缺了直接 400
+    // 后端对 reboot 强制校验 confirm===true，缺了直接 400
     if (NEED_CONFIRM_FLAG.has(cmd.action)) body.confirm = true;
     const d = await jpost("/api/command", body);
     if (!d.ok) { toast("失败：" + (d.error || "")); }
     else if (d.async) {   // 分批重启：后台执行，轮询进度，界面不卡
-      toast(`已开始分批重启 ${d.count} 台（打乱顺序，每批 ${d.batch} 台、间隔 ${d.delay}s，防变压器浪涌），后台执行中…`, "ok");
+      const skipTip = d.skipped ? `（限流跳过 ${d.skipped} 台）` : "";
+      toast(`已开始分批重启 ${d.count} 台${skipTip}（打乱顺序，每批 ${d.batch} 台、间隔 ${d.delay}s，防变压器浪涌），后台执行中…`, "ok");
       pollCmdProgress();
       selected.clear(); updateSelCount(); refreshMiners();   // 勾选框和"已选 N 台"一起清掉
     } else {
       const fails = (d.results || []).filter(x => !x.ok);
       let msg = `${cmd.action}：成功 ${d.success} / 失败 ${d.failed}`;
+      if (d.skipped) msg += `（限流跳过 ${d.skipped}）`;
       if (fails.length) msg += "\n" + fails.slice(0, 5).map(x => `${x.ip}: ${x.msg}`).join("\n");
       toast(msg, fails.length ? "fail" : "ok");
     }
@@ -932,6 +901,40 @@ $("segClose").onclick = $("segCancel").onclick = () => {
 $("segSave").onclick = () => saveSeg(false);
 $("segSaveScan").onclick = () => saveSeg(true);
 
+/* ---------------- 顶部：掉线自动重启设置 ---------------- */
+async function loadRebootSettings() {
+  if (!$("rebootBar") || myRole === "viewer") return;
+  try {
+    const s = await jget("/api/settings");
+    if ($("rebootEnabled")) $("rebootEnabled").checked = !!s.reboot_enabled;
+    if ($("rebootDelay")) $("rebootDelay").value = s.reboot_delay_sec ?? 8;
+    if ($("rebootConc")) $("rebootConc").value = s.reboot_concurrency ?? 30;
+  } catch (e) {}
+}
+async function saveRebootSettings() {
+  if (myRole !== "admin") { toast("仅 admin 可改重启设置"); return; }
+  const delay = parseInt(($("rebootDelay") || {}).value);
+  const conc = parseInt(($("rebootConc") || {}).value);
+  if (!Number.isFinite(delay) || !Number.isFinite(conc)) {
+    toast("间隔/并发须为数字"); return;
+  }
+  try {
+    const d = await jpost("/api/settings", {
+      reboot_enabled: !!($("rebootEnabled") && $("rebootEnabled").checked),
+      reboot_delay_sec: delay,
+      reboot_concurrency: conc,
+    });
+    if (!d.ok) { toast("保存失败：" + (d.error || "")); return; }
+    if ($("rebootDelay")) $("rebootDelay").value = d.reboot_delay_sec;
+    if ($("rebootConc")) $("rebootConc").value = d.reboot_concurrency;
+    if ($("rebootEnabled")) $("rebootEnabled").checked = !!d.reboot_enabled;
+    toast(d.reboot_enabled
+      ? `已开启掉线自动重启（并发 ${d.reboot_concurrency}、批间隔 ${d.reboot_delay_sec}s；仍受限流）`
+      : `已关闭掉线自动重启（手动重启仍可用；并发 ${d.reboot_concurrency}、批间隔 ${d.reboot_delay_sec}s）`, "ok");
+  } catch (e) {}
+}
+if ($("btnRebootSave")) $("btnRebootSave").onclick = saveRebootSettings;
+
 $("btnFull").onclick = () => triggerScan("full");
 $("btnQuick").onclick = () => triggerScan("quick");
 $("btnVoice").onclick = () => setVoice(!voiceOn, true);
@@ -1034,6 +1037,15 @@ function applyRole() {
   $("btnUpdate").style.display = myRole === "admin" ? "" : "none";  // 版本更新仅 admin
   $("btnPwd").style.display = myUser && myUser !== "anonymous" ? "" : "none";
   $("userBadge").textContent = myRole;
+  // 重启设置条：ops/admin 可见；保存仅 admin(与 /api/settings POST 一致)
+  const rb = $("rebootBar");
+  if (rb) {
+    const admin = myRole === "admin";
+    ["rebootEnabled", "rebootDelay", "rebootConc", "btnRebootSave"].forEach(id => {
+      const el = $(id); if (!el) return;
+      el.disabled = !admin;
+    });
+  }
 }
 
 // ---- 版本更新（仅 admin）：后台定时查有没有新版本，按钮变绿提示；点开看更新内容，一键更新 ----
@@ -1201,6 +1213,7 @@ function startDashboard() {
   _wsRetry = 0;   // 重新登录 = 全新一轮连接，别背着上一轮的退避时长
   lastOkMs = Date.now();   // 登录成功，重置失联计时，避免刚进来误报
   loadSegOptions();
+  loadRebootSettings();
   refreshAll();
   connectWS();
   if (!_timer) _timer = setInterval(refreshAll, 30000);  // WS 推送为主，轮询兜底

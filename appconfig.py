@@ -80,6 +80,12 @@ DEFAULTS = {
         "enabled": False, "uniplus_password": "", "timeout": 8, "max_batch": 1000,
         "reboot_concurrency": 30, "reboot_delay_sec": 8, "reboot_shuffle": True,
         "reboot_grace_sec": 600,
+        # 掉线自动重启：默认关。开后扫描评估到名册内掉线(非维修/非静默期/非整段掉线)会自动下发。
+        # 手动与自动共用限流：滚动 24h 内每 IP 最多 reboot_max_per_day 次成功重启，
+        # 且距上次成功至少 reboot_min_interval_sec 秒。
+        "reboot_enabled": False,
+        "reboot_max_per_day": 4,
+        "reboot_min_interval_sec": 900,
         # 允许换到的矿池主机名(含子域名)。只能在 config.yaml 配置，网页改不了。
         # 为空 = 禁止网页换矿池、也不做矿池篡改告警
         "pool_allowlist": [],   # 下发重启后这么久内掉线不报警；过了仍不在线报"重启后未上线"
@@ -170,6 +176,10 @@ def _validate(cfg):
     clamp("control", "reboot_concurrency", 1, 1000, int)
     clamp("control", "reboot_delay_sec", 0, 3600)
     clamp("control", "reboot_grace_sec", 0, 86400, int)
+    clamp("control", "reboot_max_per_day", 1, 100, int)
+    clamp("control", "reboot_min_interval_sec", 0, 86400, int)
+    # reboot_enabled 是 bool；yaml/json 里可能写成 0/1，归一成真正布尔
+    cfg["control"]["reboot_enabled"] = bool(cfg["control"].get("reboot_enabled"))
     # 告警阈值：0 在这几项里是"关闭该告警"的约定语义，故下限取 0 而非正数；
     # 比例类限制在 0~1，百分比类限制在 0~100，温度取物理上可能的范围。
     clamp("alerts", "overheat_c", 0, 200)
@@ -393,6 +403,9 @@ def _atomic_json(path, data):
 
 _INT_SETTINGS = ("scan_interval", "full_interval", "container_interval",
                  "max_pps", "discovery_workers")
+# 网页可热改的 control 整数项(掉线自动重启相关)；与 _INT_SETTINGS 分开，避免误写到 scan/schedule
+_CONTROL_INT_SETTINGS = ("reboot_concurrency", "reboot_delay_sec",
+                         "reboot_max_per_day", "reboot_min_interval_sec")
 
 
 def apply_settings(cfg, s):
@@ -412,6 +425,16 @@ def apply_settings(cfg, s):
                 cfg["schedule"][k] = v
             else:
                 cfg["scan"][k] = v
+    ctl = cfg.setdefault("control", {})
+    if "reboot_enabled" in s:
+        ctl["reboot_enabled"] = bool(s["reboot_enabled"])
+    for k in _CONTROL_INT_SETTINGS:
+        if k not in s:
+            continue
+        try:
+            ctl[k] = int(s[k])
+        except (TypeError, ValueError):
+            continue
     if isinstance(s.get("cloud"), dict):   # 云端上报(网页可配)
         cfg.setdefault("cloud", {}).update(s["cloud"])
     # settings.json 可被人工编辑，也可能来自旧版本。运行时覆盖必须再次走与
