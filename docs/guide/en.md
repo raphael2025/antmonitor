@@ -1,113 +1,57 @@
-# AntMonitor · English guide
+# AntMonitor · English
 
-**Language:** [中文](zh.md) · [English](en.md) · [Русский](ru.md) · [Español](es.md) · [Deutsch](de.md) · [العربية](ar.md)
+[中文](zh.md) · [English](en.md) · [Русский](ru.md) · [Español](es.md) · [Deutsch](de.md) · [العربية](ar.md)
 
-Repo: https://github.com/raphael2025/antmonitor  
-Cloud overview: https://github.com/raphael2025/cloud-overview
-
----
-
-## 1. Intro
-
-**AntMonitor** is a **LAN bulk monitoring & ops** system for **BITMAIN ANTMINER** miners and **ANTBOX** hydro containers.
-
-What you get:
-
-- Scan miners & coolers on the LAN; read hashrate, temp, power, worker names
-- Web UI: summary, list, rack map, alerts, customer reports
-- Scheduled scans + offline / overheat / low-hashrate / cooler-fault alerts (voice, Telegram)
-- Remote locate LED & reboot (24h / interval rate limits; optional auto-reboot on offline, **off by default**)
-- Multi-site push to cloud overview; roadmap: **Agent Skills + MCP** for smarter ops
-
-Best for hosting / colocation farms — one Windows or Ubuntu box on site.
+**Site** https://github.com/raphael2025/antmonitor · **Cloud** https://github.com/raphael2025/antmonitor-cloud
 
 ---
 
-## 2. Deploy
+## Intro
 
-### 2.1 Requirements
+AntMonitor is **on-prem LAN** monitoring & ops for mining farms: clear fleet visibility, reliable alerts, gated remote actions.
 
-- Python 3.8+
-- Same LAN (or routed) access to miner subnets
-- Prefer a dedicated PC or Ubuntu + systemd
+- Dashboard / list / rack map / alerts / containers / customer reports
+- Scheduled scans; offline, low hashrate, overheat, cooler faults (voice + Telegram)
+- Locate LED & batch reboot (rate-limited); optional auto-reboot (**off** by default)
+- Multi-site push to AntMonitor Cloud; roadmap: Agent Skills + MCP
 
-### 2.2 Quick start
+For hosting / colocation — one Windows or Ubuntu box on site.
+
+---
+
+## Deploy
+
+**Needs:** Python 3.8+, reachability to miner subnets.
 
 ```bash
-git clone https://github.com/raphael2025/antmonitor.git
-cd antmonitor
-python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp config.example.yaml config.yaml   # edit segments, users, passwords
-python server.py                     # http://0.0.0.0:8800
+cp config.example.yaml config.yaml    # set segments & users
+python server.py                      # http://<IP>:8800
 ```
 
-On Windows you can use **`run.bat`** (auto-restart on crash).
+Windows: `run.bat`. Production: systemd. Security: [SECURITY](../SECURITY.md).
 
-### 2.3 Must-configure (`config.yaml`)
-
-1. **Subnets** — `scan.segments` or Web **Segments** (admin) → `segments.json`
-2. **Users** — `auth.users` (hash via `python auth.py <new-password>`)
-3. **Miner passwords** — `scan.passwords` (stock Digest; often root/root)
-4. Optional: Telegram, `cloud` ingest, `control.pool_allowlist`
-
-See [docs/SECURITY.md](../SECURITY.md).
-
-### 2.4 Ubuntu systemd (example)
-
-```ini
-[Unit]
-Description=AntMonitor
-After=network.target
-
-[Service]
-User=ubuntu
-WorkingDirectory=/opt/antmonitor
-ExecStart=/opt/antmonitor/.venv/bin/python server.py
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Panel: `http://127.0.0.1:8800` locally; use the LAN IP printed in startup logs.
+As admin, configure subnets and run a full discovery once.
 
 ---
 
-## 3. How to use
-
-### 3.1 Roles
+## Use
 
 | Role | Access |
 |---|---|
 | viewer | read-only |
-| ops | read + scan + remote commands |
-| admin | everything (segments, settings, audit, updates) |
+| ops | scans + remote commands |
+| admin | segments / settings / audit / updates |
 
-Weak passwords only **prompt** a change — they do **not** lock ops. Change them ASAP.
+Daily: watch summary & alerts → select machines for locate/reboot → mark repair to silence alerts.  
+Reboots are rate-limited per IP. Weak passwords only prompt a change.
 
-### 3.2 Daily ops
+---
 
-1. Open the panel → check online count / hashrate / alerts
-2. Admin: Segments → save miner ranges → full discovery scan
-3. Default: ~5 min **quick** roster scan; ~1 h **full** discovery
-4. Enable voice alerts (top-right); optional Telegram
-5. Select miners → locate LED / reboot (destructive actions need confirm)
-6. Top bar: auto-reboot switch, batch delay & concurrency (admin; default off)
-7. Repair / remove from command bar (repair silences offline alerts)
+## Custom
 
-### 3.3 Limits
+WeChat **`raphael-2024`** · Telegram https://t.me/+W3J9yAypNgpjNTk9
 
-- Reboot rate limit: ≤4 successful reboots / IP / rolling 24h, ≥15 min apart
-- Pool-change UI removed; API remains (needs pool allowlist)
-- Hashrate units: 1000 TH = 1 PH
-
-### 3.4 Custom & support
-
-Custom reports, integrations, RBAC, multi-site policy, Agent/MCP, etc.:
-
-- WeChat: search **`raphael-2024`**
-- Telegram: https://t.me/+W3J9yAypNgpjNTk9
-
-Deep docs: [DEVELOPMENT](../DEVELOPMENT.md) · [INTERNAL_API](../INTERNAL_API.md) · [EXTERNAL_API](../EXTERNAL_API.md)
+[DEVELOPMENT](../DEVELOPMENT.md) · Agent API [EXTERNAL_API](../EXTERNAL_API.md)

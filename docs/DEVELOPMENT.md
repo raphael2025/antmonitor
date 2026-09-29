@@ -1,11 +1,11 @@
 # 开发文档（Development Guide）
 
-**AntMonitor**（蚂蚁矿机监控）——给托管/包机场地用的 ANTMINER + ANTBOX 监控平台。
-本文面向**维护/二次开发**：架构、数据模型、控制流、线程模型、配置、约定与坑。
+**AntMonitor** — 场地本地监控（私有仓库）。本文面向维护/二次开发：架构、数据模型、线程、配置与约定。
 
-- 用户/功能说明见 [../README.md](../README.md)（含中英简介与定制联系方式）
-- 矿机/设备接口（本系统调设备）见 [INTERNAL_API.md](INTERNAL_API.md)
-- 外部 Agent 取数接口（别人调本系统）见 [EXTERNAL_API.md](EXTERNAL_API.md)
+- 用户入门（多语言）：[guide/](guide/README.md)
+- 对外 Agent 取数：[EXTERNAL_API.md](EXTERNAL_API.md)
+- 设备固件侧协议：**不公开**，见 [INTERNAL_API.md](INTERNAL_API.md) 说明
+- 运维安全：[SECURITY.md](SECURITY.md)
 
 ---
 
