@@ -3,6 +3,11 @@
 扫描局域网矿机、自动识别固件、读取算力，提供 **Web 面板 + 定时巡检 + 主动告警**。
 已提供 **Agent 公共 API**（`/api/public/*`，Token 鉴权、只读）供 hermes 等 AI agent 取数。
 
+| 仓库 | 地址 | 职责 |
+|---|---|---|
+| **本仓库（场地本地）** | https://github.com/raphael2025/miner-monitor | 内网扫描 / 运维面板 / 告警 / 远程命令 |
+| **云端总览（多场地）** | https://github.com/raphael2025/cloud-overview | 云服务器汇聚各场地摘要看板 |
+
 > 📚 **文档**：[开发文档](docs/DEVELOPMENT.md) ｜ [内部API-矿机接口](docs/INTERNAL_API.md) ｜
 > [外部API-Agent取数接口](docs/EXTERNAL_API.md)（详细） ｜ **[运维安全手册](docs/SECURITY.md)（上线前必读）**
 
@@ -74,8 +79,8 @@ python db.py vacuum       # 回收删除留下的空页（独占数据库，放�
 
 - **改密码**：右上「🔑 改密码」（即时生效），或在监控电脑上 `python auth.py passwd 用户名`
   （自动写哈希进 config.yaml，**重启服务后生效**，重启前旧密码仍可用）。
-- **弱密码**（默认密码、少于 8 位、少于 4 种不同字符、或与用户名相同）：在监控电脑本机打开
-  `http://127.0.0.1:8800` 登录会被强制改密码，改完才能操作；从其它电脑登录只能查看，也不能在那里改密码。
+- **弱密码**（默认密码、少于 8 位、少于 4 种不同字符、或与用户名相同）：登录后只**提示**尽快改密，
+  **不锁权限**——局域网/Ubuntu 服务器部署时远程也能正常运维、也能改密码（可关掉提示继续用）。
 - 用域名（而不是 IP）访问面板时，需把域名加到 `server.allowed_hosts`（防 DNS 重绑定）。
 - 完整的安全配置（矿池白名单、交换机 ACL、防火墙、HTTPS）见 [运维安全手册](docs/SECURITY.md)。
 
@@ -83,20 +88,31 @@ python db.py vacuum       # 回收删除留下的空页（独占数据库，放�
 
 表格勾选矿机（或「选中当前筛选」），用命令栏批量执行：
 
-| 命令 | 原厂 Bitmain | 第三方 UniPlusOS | 破坏性 |
-|---|---|---|---|
-| 💡 定位灯 | `blink.cgi` | `find-miner`（免解锁） | 否 |
-| ⟳ 重启 | `reboot.cgi` | `system/reboot`（需解锁） | 是·二次确认 |
-| ⚙ 换矿池 | `set_miner_conf.cgi` | `settings`（需解锁） | 是·二次确认 |
+| 命令 | 原厂 Bitmain | 第三方 UniPlusOS | 面板入口 | 破坏性 |
+|---|---|---|---|---|
+| 💡 定位灯 | `blink.cgi` | `find-miner`（免解锁） | 有 | 否 |
+| ⟳ 重启 | `reboot.cgi` | `system/reboot`（需解锁） | 有 | 是·二次确认 |
+| ⚙ 换矿池 | `set_miner_conf.cgi` | `settings`（需解锁） | **无**（仅 API） | 是·二次确认 |
 
 **原厂重启说明**：`GET /cgi-bin/reboot.cgi`（与原厂网页一致，个别固件回 405 时改用 POST）。
 矿机收到后常常不回响应就断开（已经在重启），这种情况按「已下发」算成功，不会补发。
 下发后进入 `control.reboot_grace_sec`（默认 600 秒）**静默期**：期间掉线不报警、不算进网段掉线比例；
 过了静默期仍不在线 → 报「重启后 N 分钟仍未上线」。刚开机的零算力/掉算力本来就有 `zero_grace_sec` 宽限。
 
-**换矿池白名单（防偷算力）**：必须在 `config.yaml` 配 `control.pool_allowlist`（如 `["f2pool.com"]`，
-子域名自动放行），网页只能换到白名单内的矿池，未配置则禁用换矿池。扫描时发现矿机上配了白名单外的矿池
-（含备用池）→ 严重告警「矿池不在白名单（疑似被篡改）」。重启/换池/被拒的换池尝试都推 Telegram。
+**重启限流（手动 + 自动共用）**：同一 IP 在滚动 **24 小时内最多 4 次成功重启**
+（`control.reboot_max_per_day`，只计 `command_log` 里 `ok=1`），且距上次成功至少
+**15 分钟**（`control.reboot_min_interval_sec=900`）。超限则跳过并写审计，不打断整批。
+
+**掉线自动重启**：面板顶部「掉线自动重启」开关（`control.reboot_enabled`，**默认关**）。
+打开后，每轮扫描评估到名册内掉线、且不在维修 / 重启静默期 / 整段掉线静音内时，自动下发重启
+（审计用户 `system@auto-reboot`）。开关**只挡自动**；手动重启始终可用，但仍走同一套限流。
+顶部还可改每批并发（`reboot_concurrency`）与批间隔秒数（`reboot_delay_sec`），保存走
+`/api/settings`（admin），热生效。
+
+**换矿池**：面板已去掉「换矿池」按钮；`POST /api/command` `action=set_pools` 仍保留。
+必须在 `config.yaml` 配 `control.pool_allowlist`（如 `["f2pool.com"]`，子域名自动放行），
+未配置则 API 也拒绝换池。扫描时发现矿机上配了白名单外的矿池（含备用池）→ 严重告警
+「矿池不在白名单（疑似被篡改）」。重启/换池/被拒的换池尝试都推 Telegram。
 
 破坏性命令弹窗强制二次确认；所有命令写入 `command_log` 审计表（admin 可查 `/api/commands`）。
 第三方解锁密码配 `control.uniplus_password`，原厂密码复用 `scan.passwords`。
@@ -133,10 +149,11 @@ python server.py            # 启动面板 + 后台定时巡检（Windows 推荐
 - **巡检** `schedule.scan_interval`（默认 300s=5分钟）：每 5 分钟探一遍名册内的已知矿机，
   掉线/限电上下线/掉算力都在 5 分钟内捕捉。
 - **全网发现** `schedule.full_interval`（默认 3600s=1小时）：展开全部网段找新装的机器。
-  两种扫描的并发都受 `scan.max_pps`(默认100) 限速，保护三层 CoPP（详见下文「扫描性能与负载控制」）。
+  两种扫描的并发都受 `scan.max_pps`(默认 **300**) 限速，保护三层 CoPP（详见下文「扫描性能与负载控制」）。
+  全网发现整体超时下限 **15 分钟**（`max(900, 地址数/pps×3)`），避免大网段扫到一半被裁掉漏新机。
 - **集装箱刷新** `schedule.container_interval`（默认 10s）：独立高频刷新冷却数据。
 
-> 60 段(~1.5万IP)实测：每次全扫 ~150s，ARP≈100/s（你的 500 CoPP 有 5 倍余量），带宽峰值 ~26 Mbps(数据平面，不占CoPP)。
+> 60 段(~1.5万IP)实测：每次全扫 ~150s，ARP≈100/s（你的 500 CoPP 有余量），带宽峰值 ~26 Mbps(数据平面，不占CoPP)。
 
 ## 命令行（不依赖服务）
 
@@ -195,8 +212,9 @@ checkpoint 永远追不上（本项目曾因此把 WAL 涨到 800MB）。单轮�
 - **快速判活闸门**（`scan.liveness_gate`）：先 1 次 TCP 连 80 判活（原厂/第三方/AntBox 三类都开80），
   死 IP 直接判离线，不再白跑 3 个探测。（6060 只对原厂有效，故用 80 通用判活。）
   `gate_timeout` 必须明显大于到矿机的 RTT，否则整网假离线。
-- **ARP 限速**（`scan.max_pps`，默认 100）：令牌桶限制每秒新建连接(≈死IP的 ARP 速率)，
+- **ARP 限速**（`scan.max_pps`，默认 **300**）：令牌桶限制每秒新建连接(≈死IP的 ARP 速率)，
   护住三层的 ARP/控制平面(CoPP)限制。`discovery_workers` 是并发上限，实际由 max_pps 节流。
+  网页「网段」设置也可改，写入 `settings.json` 热生效；合法范围 1~500。
 - 数据流量（读矿机/箱子）是硬件转发的数据平面，**不占 CoPP**，无需限制。
 
 ## 告警确认与防误判
@@ -249,10 +267,14 @@ checkpoint 永远追不上（本项目曾因此把 WAL 涨到 800MB）。单轮�
 
 ## 云端总览上报（多场地汇聚）
 
-配好 `config.yaml > cloud` 段后，本地每分钟向云端总览（E:\main 项目，部署在云服务器）
-**主动推送**场地摘要（在线/算力/功耗/告警/集装箱，几KB/次）+ 每10分钟推客户报表。
-方向是本地→云端，**场地在 NAT 后面不需要任何端口映射**；第一次上报云端自动注册本场地。
-断网自动中断（云端显示"未收到上报"），恢复自动续传；上报线程独立，不影响扫描/告警。
+配好 `config.yaml > cloud` 段后，本地每分钟向**云端总览**主动推送场地摘要
+（在线/算力/功耗/告警/集装箱，几KB/次）+ 每10分钟推客户报表。
+
+- **云端项目**：https://github.com/raphael2025/cloud-overview  
+  （多场地汇聚看板，部署在云服务器；本地本仓库负责运维与完整历史。）
+- 方向是本地→云端，**场地在 NAT 后面不需要任何端口映射**；第一次上报云端自动注册本场地。
+- 断网自动中断（云端显示"未收到上报"），恢复自动续传；上报线程独立，不影响扫描/告警。
+- 公网云端地址须用 **https**（明文 HTTP 只放行内网调试地址）。
 
 **场地身份 = 唯一 site_id**：首次启动自动生成存 `cloud_site_id.txt`（启动日志会打印），
 云端按它识别本场地——`site_name` 随时可改不丢数据。
@@ -261,7 +283,7 @@ checkpoint 永远追不上（本项目曾因此把 WAL 涨到 800MB）。单轮�
 ```yaml
 cloud:
   enabled: true
-  url: "https://overview.example.com"   # 云端总览地址
+  url: "https://overview.example.com"   # 云端总览地址（见 cloud-overview 部署文档）
   token: "<云端 config.yaml > ingest.token>"
   site_name: "内蒙一场"                  # 云端显示名(全网唯一)
   site_type: air                         # air=风冷 | hydro=水冷
@@ -281,7 +303,8 @@ cloud:
   （需 NSSM 守护或用 `run.bat` 启动——退出后 3 秒自动重新拉起）
 - 手动：机器上跑 `python updater.py check / apply`（apply 后重启服务），
   或 API `GET /api/update/check`、`POST /api/update/apply`（admin，apply 自动重启）
-- 语法错误的坏版本会被编译自检拦下并**自动回滚**；发布流程见 E:\main [docs/DEPLOY.md §6](../main/docs/DEPLOY.md)
+- 语法错误的坏版本会被编译自检拦下并**自动回滚**；云端侧发布/场地接入见
+  [cloud-overview/docs/DEPLOY.md](https://github.com/raphael2025/cloud-overview/blob/master/docs/DEPLOY.md)
 
 ## 后续规划（功能定稿后再做）
 
