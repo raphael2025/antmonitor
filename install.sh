@@ -8,7 +8,7 @@ APP_NAME="AntMonitor"
 INSTALL_DIR="${ANTMONITOR_HOME:-/opt/antmonitor}"
 SERVICE_NAME="antmonitor"
 REPO_URL="${ANTMONITOR_REPO:-https://github.com/raphael2025/antmonitor.git}"
-BRANCH="${ANTMONITOR_BRANCH:-master}"
+BRANCH="${ANTMONITOR_BRANCH:-dev}"
 PY_MIN="3.8"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
