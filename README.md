@@ -134,3 +134,7 @@ Windows 可用 `run.bat`（崩溃自动拉起）。
 ---
 
 <sub>AntMonitor · Not affiliated with BITMAIN. ANTMINER / ANTBOX are trademarks of their respective owners.</sub>
+
+### UI languages
+
+Panel language switcher (top-right): 中文 / English / Русский / Español / Deutsch / العربية — same set as the guides.

@@ -61,3 +61,7 @@ We keep shipping updates — feedback welcome. Roadmap includes **multi-customer
 WeChat **`raphael-2024`** · Telegram https://t.me/+W3J9yAypNgpjNTk9
 
 [DEVELOPMENT](../DEVELOPMENT.md) · Agent API [EXTERNAL_API](../EXTERNAL_API.md)
+
+## Panel language
+
+Use the language selector on the login page and top bar. Preference is saved in the browser.

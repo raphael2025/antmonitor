@@ -4,6 +4,18 @@ let sortKey = "hr_rt", sortOrder = "desc";
 const HOT = 90;
 const RENDER_CAP = 800;   // 一次最多渲染多少行：5000 行 innerHTML 重建会让低配运维机明显卡顿
 
+function kindLabel(k) {
+  const key = "kind." + (k || "");
+  const v = t(key);
+  return v === key ? (k || "") : v;
+}
+function statusLabel(s) {
+  if (s === "online") return t("status.online");
+  if (s === "offline") return t("status.offline");
+  if (s === "unknown") return t("status.unknown");
+  return s || "";
+}
+
 // 转义设备/矿池返回的不可信字符串，防止 innerHTML 注入(XSS)
 function esc(s) {
   if (s == null) return "";
@@ -36,7 +48,7 @@ async function jpost(u, body) {
   let j = {};
   try { j = await r.json(); } catch (e) { j = { ok: false, error: "HTTP " + r.status }; }
   if (r.status === 403) {   // 显示后端给的原因(矿池不在白名单/须先改密码…)，不一律说"权限不足"
-    const why = j.error || j.detail || "权限不足：该操作需要 ops 或 admin 角色";
+    const why = j.error || j.detail || t("err.forbidden");
     toast(why);
     if (String(why).includes("修改密码")) openPwd(true);
     throw new Error("403");
@@ -55,9 +67,9 @@ function checkStale() {
   const scanAge = lastScanTs ? Math.round(now / 1000 - lastScanTs) : 0;
   let cls = "", msg = "";
   if (noContact > 90) {
-    cls = "lost"; msg = `⚠ 监控失联：已 ${noContact} 秒连不上服务器，屏幕上的数据可能已停止更新！请立即检查监控程序/网络`;
+    cls = "lost"; msg = t("stale.disconnected", { n: noContact });
   } else if (lastScanTs && scanAge > staleAfter) {
-    cls = "stale"; msg = `⚠ 数据已约 ${Math.round(scanAge / 60)} 分钟未更新，扫描可能已停滞，请核实监控是否正常`;
+    cls = "stale"; msg = t("stale.scan_old", { n: Math.round(scanAge / 60) });
   }
   if (cls) {
     b.className = "stale-banner " + cls; b.textContent = msg;
@@ -85,15 +97,15 @@ function hashUnit(maxTh) {
 }
 
 function fmtTime(ts) {
-  if (!ts) return "尚未扫描";
+  if (!ts) return t("header.last_scan_none");
   return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
 }
 function ago(ts) {
   if (!ts) return "";
   const s = Math.floor(Date.now() / 1000 - ts);
-  if (s < 60) return s + "秒前";
-  if (s < 3600) return Math.floor(s / 60) + "分钟前";
-  return Math.floor(s / 3600) + "小时前";
+  if (s < 60) return t("time.sec_ago", { n: s });
+  if (s < 3600) return t("time.min_ago", { n: Math.floor(s / 60) });
+  return t("time.hour_ago", { n: Math.floor(s / 3600) });
 }
 function fmtPower(w) {   // 功率 W → kW/MW
   if (w == null) return "-";
@@ -111,18 +123,18 @@ function fmtDT(ts) {   // 告警时间戳: MM-DD HH:MM
 function fmtUptime(sec) {
   if (sec == null) return "-";
   const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600), m = Math.floor((sec % 3600) / 60);
-  if (d) return `${d}天${h}时`;
-  if (h) return `${h}时${m}分`;
-  return `${m}分`;
+  if (d) return t("time.day_h", { d, h });
+  if (h) return t("time.h_m", { h, m });
+  return t("time.m_only", { m });
 }
-const KIND_LABEL = { full: "全网发现", quick: "巡检", manual: "手动" };
+const KIND_LABEL = { get full(){return t("kind.full");}, get quick(){return t("kind.quick");}, get manual(){return t("kind.manual");} };
 
 async function refreshSummary() {
   const s = await jget("/api/summary");
   updateProgress(s.progress);
   if (s.scan_ts) lastScanTs = s.scan_ts;   // 记录服务器最近完成扫描时间(失联自检用)
   if (s.stale_after) staleAfter = s.stale_after;
-  if (!s.scanned) { $("lastScan").textContent = "尚未扫描，等待首轮…"; return; }
+  if (!s.scanned) { $("lastScan").textContent = t("scan.none_wait"); return; }
   $("cOnline").textContent = `${s.online} / ${s.total}`;
   $("cTotalHr").textContent = fmtHash(s.total_hashrate_th);
   $("cAvgHr").textContent = fmtHash(s.avg_hashrate_th);
@@ -134,7 +146,7 @@ async function refreshSummary() {
   $("cEff").textContent = s.avg_efficiency || 0;
   $("cContainers").textContent = `${s.containers || 0}`
     + ((s.containers_faulty || s.containers_offline) ? ` (${(s.containers_faulty || 0) + (s.containers_offline || 0)})` : "");
-  $("lastScan").textContent = `上次扫描 ${ago(s.scan_ts)} (${KIND_LABEL[s.scan_kind] || s.scan_kind})`;
+  $("lastScan").textContent = t("scan.last", { ago: ago(s.scan_ts), kind: KIND_LABEL[s.scan_kind] || s.scan_kind });
 }
 
 async function ackAlert(id) {
@@ -142,11 +154,11 @@ async function ackAlert(id) {
 }
 // 告警里直接下架坏机器：从名册移除 + 清掉它的告警(不再探测/告警)
 async function removeFromAlert(ip) {
-  if (!confirm(`确认下架移除 ${ip}？\n将从名册删除、不再探测/告警。若机器仍通电，下次扫描可能被重新收录。`)) return;
+  if (!confirm(t("toast.remove_confirm", { ip }))) return;
   try {
     const d = await jpost("/api/machine-state", { ips: [ip], action: "remove" });
-    if (!d.ok) { toast("下架失败：" + (d.error || "")); return; }
-    toast(`已下架 ${ip}`, "ok");
+    if (!d.ok) { toast(t("toast.remove_fail", { msg: d.error || "" })); return; }
+    toast(t("toast.removed", { ip }), "ok");
     refreshAlerts(); refreshMiners();
   } catch (e) {}
 }
@@ -182,16 +194,16 @@ async function refreshAlerts() {
     const isMiner = x.ip && x.ip.split(".").length === 4 && !x.ip.endsWith(".x");  // 单台矿机
     let tail = "";
     if (!isCooler) {   // 集装箱告警不给按钮(修好自动消失)
-      tail = x.ack_by ? `<span class="acked">✓ ${esc(x.ack_by)} 已确认</span>`
-                      : `<button class="ackbtn" onclick="ackAlert(${x.id})">确认</button>`;
-      if (isMiner) tail += `<button class="rmbtn" onclick="removeFromAlert('${esc(x.ip)}')" title="从名册下架移除该机器">下架</button>`;
+      tail = x.ack_by ? `<span class="acked">${esc(t("ack.done", { user: x.ack_by }))}</span>`
+                      : `<button class="ackbtn" onclick="ackAlert(${x.id})">${esc(t("ack.confirm"))}</button>`;
+      if (isMiner) tail += `<button class="rmbtn" onclick="removeFromAlert('${esc(x.ip)}')" title="${esc(t("alert.remove_title"))}">${esc(t("alert.remove_btn"))}</button>`;
     }
     return `<div class="a ${esc(x.severity)}${x.ack_by ? " is-ack" : ""}"><span class="atime">${fmtDT(x.ts)} · ${ago(x.ts)}</span>`
       + `<span class="ip"${click ? ` onclick="${click}"` : ""}>${esc(x.ip)}</span>`
       + `<span class="adetail">${esc(x.detail)}</span>${tail}</div>`;
-  }).join("") : '<div class="muted">无</div>')
-    + (total > a.length ? `<div class="muted" style="text-align:center;padding:6px">…仅显示前 ${a.length} 条，共 <b>${total}</b> 条活跃告警</div>` : "");
-  document.title = total ? `(${total}) 矿机监控面板` : "矿机监控面板";
+  }).join("") : `<div class="muted">${esc(t("alerts.none"))}</div>`)
+    + (total > a.length ? `<div class="muted" style="text-align:center;padding:6px">${esc(t("alert.more", { shown: a.length, total }))}</div>` : "");
+  document.title = total ? t("doc.title_alert", { n: total }) : t("doc.title");
   handleVoice(a, d.counts || {}, total);
 }
 
@@ -220,7 +232,7 @@ function beep(freq = 880, dur = 0.25) {
 function speak(text) {
   try {
     const u = new SpeechSynthesisUtterance(text);
-    u.lang = "zh-CN"; u.rate = 1; u.volume = 1;
+    u.lang = (window.I18N && I18N.lang === "zh") ? "zh-CN" : (window.I18N ? I18N.lang : "zh-CN"); u.rate = 1; u.volume = 1;
     speechSynthesis.speak(u);
   } catch (e) {}
 }
@@ -237,19 +249,19 @@ function announceCounts(counts) {
   const n = (t) => counts[t] || 0;
   const cooler = Object.keys(counts).filter(t => t.startsWith("cooler")).reduce((s, t) => s + counts[t], 0);
   const parts = [];
-  if (n("pool_hijack")) parts.push(`矿池被篡改 ${n("pool_hijack")} 台，请立即核查`);
-  if (n("stalled")) parts.push("监控停滞");
-  if (n("segment_down")) parts.push(`${n("segment_down")} 个网段掉线`);
-  if (n("offline")) parts.push(`掉线 ${n("offline")} 台`);
-  if (n("zero")) parts.push(`零算力 ${n("zero")} 台`);
-  if (n("low_hashrate")) parts.push(`掉算力 ${n("low_hashrate")} 台`);
-  if (n("overheat")) parts.push(`高温 ${n("overheat")} 台`);
-  if (n("reject")) parts.push(`拒绝率偏高 ${n("reject")} 台`);
-  if (cooler) parts.push(`集装箱故障 ${cooler} 处`);
+  if (n("pool_hijack")) parts.push(t("voice.pool_hijack", { n: n("pool_hijack") }));
+  if (n("stalled")) parts.push(t("voice.stalled"));
+  if (n("segment_down")) parts.push(t("voice.segment_down", { n: n("segment_down") }));
+  if (n("offline")) parts.push(t("voice.offline", { n: n("offline") }));
+  if (n("zero")) parts.push(t("voice.zero", { n: n("zero") }));
+  if (n("low_hashrate")) parts.push(t("voice.low_hr", { n: n("low_hashrate") }));
+  if (n("overheat")) parts.push(t("voice.overheat", { n: n("overheat") }));
+  if (n("reject")) parts.push(t("voice.reject", { n: n("reject") }));
+  if (cooler) parts.push(t("voice.cooler", { n: cooler }));
   if (!parts.length) return;
   beep(880, 0.3); beep(660, 0.3);
-  speak("告警，" + parts.join("，"));
-  notify("⛏ 矿机告警", parts.join(" / "));
+  speak(t("voice.prefix") + parts.join("，"));
+  notify(t("voice.notify_title"), parts.join(" / "));
 }
 
 function handleVoice(alerts, counts, total) {
@@ -265,7 +277,7 @@ function handleVoice(alerts, counts, total) {
     // 列表被截断时不做"已恢复"播报：老告警被挤出窗口会被误判成已恢复
     if (!(total > alerts.length)) {
       const recovered = [...prevActiveIds].filter(id => !curIds.has(id));
-      if (recovered.length) { beep(523, 0.15); speak(`${recovered.length} 项告警已恢复`); }
+      if (recovered.length) { beep(523, 0.15); speak(t("voice.recovered", { n: recovered.length })); }
     }
   }
   prevActiveIds = curIds;
@@ -275,10 +287,10 @@ function setVoice(on, gesture) {
   voiceOn = on;
   localStorage.setItem("voiceOn", on ? "1" : "0");
   const b = $("btnVoice");
-  b.textContent = (on ? "🔊" : "🔇") + " 语音告警: " + (on ? "开" : "关");
+  b.textContent = on ? t("header.voice_on") : t("header.voice_off");
   b.classList.toggle("primary", on);
   if (on && gesture) {                       // 用户手势：解锁音频 + 申请通知权限
-    beep(660, 0.15); speak("语音告警已开启");
+    beep(660, 0.15); speak(t("voice.enabled"));
     if ("Notification" in window && Notification.permission === "default")
       Notification.requestPermission();
   }
@@ -314,7 +326,7 @@ async function refreshTrend() {
   const { div, unit } = hashUnit(raw.length ? Math.max(...raw) : 0);
   const data = raw.map(v => v / div);
   const yScale = trendYScale(data);
-  const tt = $("trendTitle"); if (tt) tt.textContent = `总算力趋势 (${unit})`;
+  const tt = $("trendTitle"); if (tt) tt.textContent = t("trend.title_u", { unit });
   if (!window.Chart) return;   // 无网/CDN 不可达时图表库缺失，不能让整个面板挂掉
   if (!trendChart) {
     trendChart = new Chart($("trendChart"), {
@@ -346,7 +358,7 @@ function rowClass(r) {
 // 口径必须与后端告警一致：hr_rt===0 才是"零算力"(会告警)；null 是"这次没读到数"(不告警)。
 // 之前前端把 null 也画成红色的 0 TH，运维看到满屏红却一条告警都没有，反过来怀疑监控坏了。
 function hrCell(r) {
-  if (r.hr_rt == null) return `<td class="muted" title="本次未读到算力(接口超时/密码错)，不计为零算力">无数据</td>`;
+  if (r.hr_rt == null) return `<td class="muted" title="${esc(t("td.no_hr_title"))}">${esc(t("td.no_hr"))}</td>`;
   return `<td class="${r.hr_rt === 0 ? "low" : ""}">${fmtHash(r.hr_rt)}</td>`;
 }
 function tempCell(r) {
@@ -387,7 +399,7 @@ async function refreshMiners() {
   }
   $("minerCount").textContent = d.count != null ? d.count : lastMiners.length;
   const a = d.agg || {};
-  $("segStat").textContent = `${seg ? seg + ".x ｜ " : ""}在线 ${a.online || 0} ｜ 算力 ${fmtHash(a.total_hr)} ｜ 功耗 ${fmtPower(a.total_power)}`;
+  $("segStat").textContent = t("seg.stat", { seg: seg ? seg + ".x ｜ " : "", online: a.online || 0, hr: fmtHash(a.total_hr), pw: fmtPower(a.total_power) });
 
   const rows = showAllRows ? lastMiners : lastMiners.slice(0, RENDER_CAP);
   $("minerBody").innerHTML = rows.map(r => {
@@ -395,7 +407,7 @@ async function refreshMiners() {
     return `<tr class="${rowClass(r)} ${selected.has(r.ip) ? "sel" : ""}">`
       + `<td class="cbcol"><input type="checkbox" data-ip="${esc(r.ip)}" ${ck}></td>`
       + `<td class="ip-link" onclick="openMiner('${esc(r.ip)}')">${esc(r.ip)}</td>`
-      + `<td>${r.mstate === "repair" ? '<span class="pill repair">维修中</span>' : `<span class="pill ${esc(r.status)}" title="${r.status === "unknown" ? "本轮扫描超时没来得及探测，非确认离线" : ""}">${r.status === "online" ? "在线" : r.status === "unknown" ? "未探测" : "离线"}</span>`}</td>`
+      + `<td>${r.mstate === "repair" ? `<span class="pill repair">${esc(t("status.repair"))}</span>` : `<span class="pill ${esc(r.status)}" title="${r.status === "unknown" ? esc(t("pill.unknown_title")) : ""}">${esc(statusLabel(r.status))}</span>`}</td>`
       + `<td>${r.firmware ? `<span class="pill ${esc(r.firmware)}">${esc(r.firmware)}</span>` : "-"}</td>`
       + `<td>${esc(r.model) || "-"}</td>`
       + hrCell(r) + `<td>${r.hr_avg != null ? fmtHash(r.hr_avg) : "-"}</td>`
@@ -411,9 +423,8 @@ async function refreshMiners() {
   const more = $("renderNote");
   if (more) {
     if (!showAllRows && lastMiners.length > RENDER_CAP) {
-      more.innerHTML = `仅渲染前 <b>${RENDER_CAP}</b> 行（共 ${lastMiners.length} 台）以保证页面流畅。`
-        + `批量操作/「选中当前筛选」仍作用于全部 ${lastMiners.length} 台。`
-        + ` <button id="btnShowAll" class="mini-btn">仍要渲染全部</button>`;
+      more.innerHTML = `${t("render.cap", { cap: RENDER_CAP, total: lastMiners.length }).replace(String(RENDER_CAP), `<b>${RENDER_CAP}</b>`)}`
+          + ` <button id="btnShowAll" class="mini-btn">${esc(t("render.show_all"))}</button>`;
       more.classList.remove("hidden");
       const b = $("btnShowAll");
       if (b) b.onclick = () => { showAllRows = true; refreshMiners(); };
@@ -427,7 +438,9 @@ async function refreshMiners() {
 function updateSelCount() {
   const visible = new Set(lastMiners.map(m => m.ip));
   const hidden = [...selected].filter(ip => !visible.has(ip)).length;
-  $("selCount").textContent = `已选 ${selected.size} 台` + (hidden ? `（其中 ${hidden} 台已不在当前列表）` : "");
+  $("selCount").textContent = hidden
+    ? t("cmd.selected_hidden", { n: selected.size, h: hidden })
+    : t("cmd.selected", { n: selected.size });
   const all = $("cbAll");   // 全选框跟随当前结果集同步
   if (all) all.checked = lastMiners.length > 0 && lastMiners.every(m => selected.has(m.ip));
 }
@@ -438,22 +451,22 @@ async function refreshRacks() {
   if (!rackMode) return;
   const d = await jget("/api/racks");
   const legend = `<div class="legend" style="margin-bottom:12px">`
-    + `<span><i class="dot slot ok"></i>在线</span><span><i class="dot slot zero"></i>零算力</span>`
-    + `<span><i class="dot slot offline"></i>离线</span><span><i class="dot slot empty"></i>空机位</span>`
-    + `<span><i class="dot slot unknown"></i>未探测(本轮扫描超时)</span>`
-    + `<span class="muted">（格子里是机位号，空号一眼可见）</span></div>`;
+    + `<span><i class="dot slot ok"></i>${esc(t("rack.legend_extra"))}</span><span><i class="dot slot zero"></i>${esc(t("rack.legend_zero"))}</span>`
+    + `<span><i class="dot slot offline"></i>${esc(t("rack.legend_off"))}</span><span><i class="dot slot empty"></i>${esc(t("rack.legend_empty"))}</span>`
+    + `<span><i class="dot slot unknown"></i>${esc(t("rack.legend_unk"))}</span>`
+    + `<span class="muted">${esc(t("rack.legend_hint"))}</span></div>`;
   $("rackList").innerHTML = legend + (d.racks || []).map(rk => {
     const slots = rk.slots.map(s => {
       if (s.st === "empty")   // 空机位：灰、不可点
-        return `<div class="slot empty" title="${esc(s.ip)} · 空机位">${s.h}</div>`;
+        return `<div class="slot empty" title="${esc(t("rack.empty_title", { ip: s.ip }))}">${s.h}</div>`;
       if (s.st === "unknown")   // 本轮未探测：不是离线，别吓人
-        return `<div class="slot unknown" title="${esc(s.ip)} · 本轮扫描超时没来得及探测" onclick="openMiner('${esc(s.ip)}')">${s.h}</div>`;
+        return `<div class="slot unknown" title="${esc(t("rack.unk_title", { ip: s.ip }))}" onclick="openMiner('${esc(s.ip)}')">${s.h}</div>`;
       const tip = `${s.ip}${s.hr != null ? " · " + fmtHash(s.hr) : ""}${s.temp != null ? " · " + s.temp + "℃" : ""}`;
       return `<div class="slot ${s.st}" title="${esc(tip)}" onclick="openMiner('${esc(s.ip)}')">${s.h}</div>`;
     }).join("");
-    const bad = rk.abnormal ? `零算力 <b class="bad">${rk.abnormal}</b> · ` : "";
+    const bad = rk.abnormal ? t("rack.zero_bad", { n: rk.abnormal }).replace(String(rk.abnormal), `<b class="bad">${rk.abnormal}</b>`) : "";
     return `<div class="rack"><div class="rack-head"><span class="name">${esc(rk.name)}.x</span>`
-      + `<span class="stat">在线 ${rk.online} · ${fmtHash(rk.hashrate)} · ${bad}离线 ${rk.offline} · 空 ${rk.empty}</span></div>`
+      + `<span class="stat">${t("rack.stat", { online: rk.online, hr: fmtHash(rk.hashrate), bad, offline: rk.offline, empty: rk.empty })}</span></div>`
       + `<div class="slots">${slots}</div></div>`;
   }).join("");
 }
@@ -466,30 +479,30 @@ async function refreshWorkers() {
     const d = await jget("/api/workers");
     $("workerList").innerHTML = (d.workers || []).map(w => {
       const models = Object.entries(w.models).sort((a, b) => b[1] - a[1])
-        .map(([m, c]) => `<div class="wmodel">└─ ${esc(m)}：<b>${c}</b> 台</div>`).join("");
+        .map(([m, c]) => `<div class="wmodel">${esc(t("worker.models", { m, c }).replace(String(c), "") )}<b>${c}</b></div>`).join("");
       return `<div class="worker"><div class="worker-head">`
         + `<span class="wname">${esc(w.worker)}</span>`
-        + `<span class="wstat">${w.total} 台 · ${fmtHash(w.hashrate)}</span></div>`
+        + `<span class="wstat">${t("worker.stat", { n: w.total, hr: fmtHash(w.hashrate) })}</span></div>`
         + `<div class="wmodels">${models}</div></div>`;
-    }).join("") || '<div class="muted">无数据</div>';
+    }).join("") || `<div class="muted">${esc(t("worker.none"))}</div>`;
   } else {
     const d = await jget(`/api/reports/customers?hours=${period}`);
     // 周期超过可用数据被截断时给出提示
     const note = d.truncated
-      ? `<div class="muted" style="margin-bottom:8px">⚠️ 数据实际仅覆盖近 ${(d.covered_hours / 24).toFixed(1)} 天（系统投运时间还不够长）</div>`
+      ? `<div class="muted" style="margin-bottom:8px">${esc(t("worker.cover_warn", { d: (d.covered_hours / 24).toFixed(1) }))}</div>`
       : "";
     $("workerList").innerHTML = note + ((d.customers || []).map(c => {
       const up = c.uptime_pct;
       const upCls = up >= 99 ? "res-ok" : up >= 95 ? "" : "res-fail";
       return `<div class="worker"><div class="worker-head">`
         + `<span class="wname">${esc(c.worker)}</span>`
-        + `<span class="wstat">${c.machines} 台</span></div>`
+        + `<span class="wstat">${t("worker.machines", { n: c.machines })}</span></div>`
         + `<div class="wmodels">`
-        + `可用率 <b class="${upCls}">${up}%</b><br>`
-        + `交付算力 <b>${fmtHashH(c.delivered_th_h)}</b><br>`
-        + `耗电 <b>${c.power_kwh.toLocaleString()}</b> kWh`
+        + `${esc(t("worker.uptime"))} <b class="${upCls}">${up}%</b><br>`
+        + `${esc(t("worker.delivered"))} <b>${fmtHashH(c.delivered_th_h)}</b><br>`
+        + `${esc(t("worker.kwh"))} <b>${c.power_kwh.toLocaleString()}</b> kWh`
         + `</div></div>`;
-    }).join("") || '<div class="muted">该周期无数据</div>');
+    }).join("") || `<div class="muted">${esc(t("worker.none_period"))}</div>`);
   }
 }
 
@@ -515,7 +528,7 @@ function updateProgress(p) {
     bar.classList.remove("hidden");
     const pct = p.total ? Math.floor(p.done / p.total * 100) : 0;
     $("progFill").style.width = pct + "%";
-    $("progText").textContent = `${KIND_LABEL[p.kind] || p.kind} 扫描中 ${p.done}/${p.total} (${pct}%)`;
+    $("progText").textContent = t("prog.scanning", { kind: KIND_LABEL[p.kind] || p.kind, done: p.done, total: p.total, pct });
     btnF.disabled = btnQ.disabled = true;
   } else {
     bar.classList.add("hidden");
@@ -543,8 +556,8 @@ async function openMiner(ip) {
   if (window.Chart) modalChart = new Chart($("mChart"), {
     type: "line",
     data: { datasets: [
-      { label: "算力 TH", data: hr, borderColor: "#1f6feb", yAxisID: "y", pointRadius: 0, tension: .3, spanGaps: false },
-      { label: "芯片温 ℃", data: temp, borderColor: "#f85149", yAxisID: "y1", pointRadius: 0, tension: .3, spanGaps: false } ] },
+      { label: t("chart.hr"), data: hr, borderColor: "#1f6feb", yAxisID: "y", pointRadius: 0, tension: .3, spanGaps: false },
+      { label: t("chart.temp"), data: temp, borderColor: "#f85149", yAxisID: "y1", pointRadius: 0, tension: .3, spanGaps: false } ] },
     options: {
       interaction: { mode: "index", intersect: false },
       scales: {
@@ -557,19 +570,19 @@ async function openMiner(ip) {
                  tooltip: { callbacks: { title: (items) => items.length ? new Date(items[0].parsed.x).toLocaleString("zh-CN", { hour12: false }) : "" } } } }
   });
   $("mInfo").innerHTML =
-    `固件：${esc(c.firmware) || "-"} ｜ 状态：${esc(c.status) || "-"} ｜ SN：${esc(c.sn) || "-"}<br>`
+    t("miner.detail_fw", { fw: esc(c.firmware) || "-", st: esc(c.status) || "-", sn: esc(c.sn) || "-" }) + "<br>"
     + `MAC：${esc(c.mac) || "-"}<br>`
-    + `实时算力：${c.hr_rt == null ? "无数据" : fmtHash(c.hr_rt)} ｜ 平均：${fmtHash(c.hr_avg)} ｜ 功耗：${safeVal(c.power)} W<br>`
-    + `能效：${safeVal(c.eff)} J/TH ｜ 芯片温：${safeVal(c.temp)}℃ ｜ 运行时长：${fmtUptime(c.uptime)}<br>`
-    + `矿工名：${esc(c.worker) || "-"} ｜ 接受/拒绝/陈旧：${safeVal(c.accepted)}/${safeVal(c.rejected)}/${safeVal(c.stale)}`
-    + (c.note ? `<br>备注：${esc(c.note)}` : "");
+    + t("miner.detail_hr", { hr: c.hr_rt == null ? t("td.no_hr") : fmtHash(c.hr_rt), avg: fmtHash(c.hr_avg), pw: safeVal(c.power) }) + "<br>"
+    + t("miner.detail_eff", { eff: safeVal(c.eff), temp: safeVal(c.temp), up: fmtUptime(c.uptime) }) + "<br>"
+    + t("miner.detail_worker", { w: esc(c.worker) || "-", a: safeVal(c.accepted), r: safeVal(c.rejected), s: safeVal(c.stale) })
+    + (c.note ? "<br>" + t("miner.detail_note", { n: esc(c.note) }) : "");
   $("modal").classList.remove("hidden");
 }
 
 async function triggerScan(kind) {
   try {
     const d = await jpost(`/api/scan?kind=${kind}`, {});
-    if (d && d.started === false) toast("已有扫描在进行中，请稍候");
+    if (d && d.started === false) toast(t("toast.scan_busy"));
   } catch (e) { return; }
   setTimeout(pollProgress, 500);
 }
@@ -589,13 +602,13 @@ async function refreshContainers() {
   const spMin = d.supply_pressure_min || 0, rpMin = d.return_pressure_min || 0;
   $("containerPanel").style.display = cs.length ? "" : "none";
   $("containerCount").textContent = `${cs.length}`
-    + (d.faulty ? ` · 故障 ${d.faulty}` : "") + (d.offline ? ` · 离线 ${d.offline}` : "");
+    + (d.faulty ? t("cbox.faulty", { n: d.faulty }) : "") + (d.offline ? t("cbox.offline", { n: d.offline }) : "");
   $("containerList").innerHTML = cs.map(c => {
     if (!c.online) {
       return `<div class="cbox offline" onclick="openContainer('${esc(c.ip)}')">`
         + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
-        + `<span class="fbadge crit">控制器离线</span></div>`
-        + `<div class="cbox-meta">最后进水 ${safeVal(c.supply_temp)}℃ / 出水 ${safeVal(c.return_temp)}℃</div></div>`;
+        + `<span class="fbadge crit">${esc(t("cbox.ctrl_off"))}</span></div>`
+        + `<div class="cbox-meta">${esc(t("cbox.last_temp", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp) }))}</div></div>`;
     }
     const dt = (c.supply_temp != null && c.return_temp != null) ? (c.return_temp - c.supply_temp).toFixed(1) : "-";
     const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `<span class="pump ${v ? "on" : ""}">${esc(k)}</span>`).join("");
@@ -620,7 +633,7 @@ async function refreshContainers() {
 async function openContainer(ip) {
   const d = await jget(`/api/container/${ip}`);
   const c = d.current || {};
-  $("mTitle").textContent = `🧊 集装箱 ${ip}`;
+  $("mTitle").textContent = t("cbox.title", { ip });
   const h = d.history || [];
   const labels = h.map(x => new Date(x.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }));
   if (modalChart) modalChart.destroy();
@@ -628,15 +641,15 @@ async function openContainer(ip) {
     type: "line",
     data: {
       labels, datasets: [
-        { label: "进水℃", data: h.map(x => x.supply_temp), borderColor: "#56d4dd", pointRadius: 0, tension: .3 },
-        { label: "出水℃", data: h.map(x => x.return_temp), borderColor: "#f0883e", pointRadius: 0, tension: .3 },
-        { label: "箱内℃", data: h.map(x => x.internal_temp), borderColor: "#3fb950", pointRadius: 0, tension: .3 }]
+        { label: t("chart.supply"), data: h.map(x => x.supply_temp), borderColor: "#56d4dd", pointRadius: 0, tension: .3 },
+        { label: t("chart.return"), data: h.map(x => x.return_temp), borderColor: "#f0883e", pointRadius: 0, tension: .3 },
+        { label: t("chart.internal"), data: h.map(x => x.internal_temp), borderColor: "#3fb950", pointRadius: 0, tension: .3 }]
     },
     options: { interaction: { mode: "index", intersect: false },
       scales: { x: { ticks: { color: "#6e7681", maxTicksLimit: 6 } }, y: { ticks: { color: "#6e7681" } } }, plugins: { legend: { labels: { color: "#adbac7" } } } }
   });
-  const faults = (c.faults || []).map(f => `<span class="fbadge ${esc(f.sev)}">${esc(f.label)}</span>`).join("") || "无";
-  const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${esc(k)}:${v ? "开" : "关"}`).join(" ｜ ");
+  const faults = (c.faults || []).map(f => `<span class="fbadge ${esc(f.sev)}">${esc(f.label)}</span>`).join("") || t("cbox.none_fault");
+  const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${esc(k)}:${v ? t("cmd.open") : t("cmd.close")}`).join(" ｜ ");
   $("mInfo").innerHTML =
     `进水 ${safeVal(c.supply_temp)}℃ ｜ 出水 ${safeVal(c.return_temp)}℃ ｜ 设定 ${safeVal(c.set_temp)}℃<br>`
     + `供/回压 ${safeVal(c.supply_pressure)}/${safeVal(c.return_pressure)} ｜ 流量 ${safeVal(c.flow)} ｜ 冷却塔进水 ${safeVal(c.tower_inlet_temp)}℃<br>`
@@ -670,11 +683,13 @@ $("cbAll").onclick = (e) => {
   refreshMiners();
 };
 
-const CMD_META = {
-  "locate-on":  { action: "locate", params: { on: true },  title: "💡 开启定位灯", short: "开定位灯", danger: false },
-  "locate-off": { action: "locate", params: { on: false }, title: "关闭定位灯", short: "关定位灯", danger: false },
-  "reboot":     { action: "reboot", params: {}, title: "⟳ 重启矿机", short: "重启", danger: true },
-};
+function CMD_META() {
+  return {
+    "locate-on":  { action: "locate", params: { on: true },  title: t("meta.locate_on"), short: t("meta.locate_on_s"), danger: false },
+    "locate-off": { action: "locate", params: { on: false }, title: t("meta.locate_off"), short: t("meta.locate_off_s"), danger: false },
+    "reboot":     { action: "reboot", params: {}, title: t("meta.reboot"), short: t("meta.reboot_s"), danger: true },
+  };
+}
 // 破坏性命令(重启)的「大批量」阈值。比 repair/remove 的 500 更低：重启让全场同时离线，
 // 误操作代价远高于标记维修，所以更早开始拦。换矿池面板入口已去掉(API 仍保留)。
 const DANGER_BULK = 200;
@@ -696,41 +711,41 @@ document.querySelector(".cmdbar").addEventListener("click", (e) => {
 });
 
 async function doMachineState(action) {
-  if (!selected.size) { toast("请先选择矿机"); return; }
+  if (!selected.size) { toast(t("toast.select_first")); return; }
   const ips = [...selected];
   // 单次上限 control.max_batch 是安全闸：超了直接提示分批，别在确认之后才被后端拒绝，
   // 也别在前端悄悄分批绕过它(下架 5000 台只需确认两次)
-  if (ips.length > maxBatch) { toast(`一次最多 ${maxBatch} 台（control.max_batch），请缩小选择范围分批操作`); return; }
+  if (ips.length > maxBatch) { toast(t("toast.batch_max", { n: maxBatch })); return; }
   // 维修/下架影响大(停告警/删名册)，二次确认把后果讲清；大批量再确认一次
-  if (action === "repair" && !confirm(`确认把 ${ips.length} 台标记「维修中」？\n期间这些机器掉线/零算力将不再报警、也不计入客户统计。`)) return;
-  if (action === "remove" && !confirm(`确认从名册「下架移除」${ips.length} 台？\n将不再探测/告警；若机器仍通电，下次扫描可能被重新收录。`)) return;
-  if (ips.length > 500 && !confirm(`⚠️ 本次将影响 ${ips.length} 台（数量很大），请再确认一次！`)) return;
+  if (action === "repair" && !confirm(t("confirm.repair", { n: ips.length }))) return;
+  if (action === "remove" && !confirm(t("confirm.remove", { n: ips.length }))) return;
+  if (ips.length > 500 && !confirm(t("confirm.bulk", { n: ips.length }))) return;
   try {
     const d = await jpost("/api/machine-state", { ips, action });
-    if (!d.ok) { toast("失败：" + (d.error || "")); return; }
-    toast(`${ { repair: "标记维修", active: "取消维修", remove: "下架移除" }[action] } ${d.count} 台`, "ok");
+    if (!d.ok) { toast(t("toast.fail", { msg: d.error || "" })); return; }
+    toast(`${t("action." + action)} ${d.count}`, "ok");
     selected.clear(); refreshMiners();
-  } catch (e) { if (!String(e.message).match(/^40[13]$/)) toast("请求失败(网络/服务异常)，请刷新后确认结果"); }
+  } catch (e) { if (!String(e.message).match(/^40[13]$/)) toast(t("req.error")); }
 }
 
 let maxBatch = 1000;        // 单次命令/维修/下架上限，登录后取服务端 control.max_batch
 let pendingCmd = null;
 let _cmdInFlight = false;   // 命令在途：禁止再开新命令弹窗，防两次执行的结果/按钮串台
 function openCmdDialog(cmd, includeHidden) {
-  if (_cmdInFlight) { toast("上一条命令还在执行，完成后会弹出结果，请稍候"); return; }
-  if (!selected.size) { toast("请先选择矿机"); return; }
-  const meta = CMD_META[cmd];
+  if (_cmdInFlight) { toast(t("toast.cmd_busy")); return; }
+  if (!selected.size) { toast(t("toast.select_first")); return; }
+  const meta = CMD_META()[cmd];
   // 勾选里"已不在当前列表"的机器(自动刷新后状态变了，比如按"离线"勾的已恢复在线在挖矿)：
   // 默认不对它们执行，醒目列出，要执行得自己勾上。以前照样下发且弹窗里毫无提示
   const visible = new Set(lastMiners.map(m => m.ip));
   const hiddenIps = [...selected].filter(ip => !visible.has(ip));
   const ips = includeHidden ? [...selected] : [...selected].filter(ip => visible.has(ip));
-  if (ips.length > maxBatch) { toast(`一次最多 ${maxBatch} 台（control.max_batch），请缩小选择范围分批操作`); return; }
+  if (ips.length > maxBatch) { toast(t("toast.batch_max", { n: maxBatch })); return; }
   // 目标在打开弹窗这一刻冻结：弹窗里列的就是确认后下发的，期间自动刷新不会改变目标
   pendingCmd = { action: meta.action, params: { ...meta.params }, danger: !!meta.danger,
                  short: meta.short || meta.title, ips };
   $("cmdTitle").textContent = meta.title;
-  let html = `对 <b>${ips.length}</b> 台矿机执行：<b>${esc(meta.title)}</b>`;
+  let html = t("cmd.dialog_run", { n: ips.length, act: esc(meta.title) });
   if (hiddenIps.length)
     html += `<div class="warn-box" style="border-width:2px">⚠️ 你勾选的机器里有 <b>${hiddenIps.length}</b> 台`
       + `已不在当前列表（勾选后状态变了，比如已恢复在线）：${hiddenIps.slice(0, 20).map(esc).join("、")}`
@@ -753,7 +768,7 @@ function openCmdDialog(cmd, includeHidden) {
   if ($("cmdIncHidden")) $("cmdIncHidden").onchange = (e) => openCmdDialog(cmd, e.target.checked);
   $("cmdConfirm").disabled = ips.length === 0;
   // 确认按钮上写清「几台 + 干什么」，避免用户凭肌肉记忆点掉一个通用的"确认执行"
-  $("cmdConfirm").textContent = `确认对 ${ips.length} 台执行【${meta.short || meta.title}】`;
+  $("cmdConfirm").textContent = t("cmd.confirm_n", { n: ips.length, act: meta.short || meta.title });
   $("cmdModal").classList.remove("hidden");
 }
 
@@ -763,33 +778,33 @@ $("cmdConfirm").onclick = async () => {
   const ips = cmd.ips;
   // 大批量破坏性命令再拦一道原生确认，和 repair/remove 的交互保持一致
   if (cmd.danger && ips.length > DANGER_BULK &&
-      !confirm(`⚠️ 即将对 ${ips.length} 台矿机执行【${cmd.short}】，数量很大且不可撤销。\n确定继续吗？`)) return;
+      !confirm(t("confirm.danger_bulk", { n: ips.length, act: cmd.short }))) return;
   const btnLabel = $("cmdConfirm").textContent;
   _cmdInFlight = true;
-  $("cmdConfirm").disabled = true; $("cmdConfirm").textContent = "执行中…";
-  $("cmdCancel").textContent = "后台执行，关闭窗口";
+  $("cmdConfirm").disabled = true; $("cmdConfirm").textContent = t("cmd.executing");
+  $("cmdCancel").textContent = t("cmd.bg_close");
   try {
     const body = { ips, action: cmd.action, params: cmd.params };
     // 后端对 reboot 强制校验 confirm===true，缺了直接 400
     if (NEED_CONFIRM_FLAG.has(cmd.action)) body.confirm = true;
     const d = await jpost("/api/command", body);
-    if (!d.ok) { toast("失败：" + (d.error || "")); }
+    if (!d.ok) { toast(t("toast.fail", { msg: d.error || "" })); }
     else if (d.async) {   // 分批重启：后台执行，轮询进度，界面不卡
-      const skipTip = d.skipped ? `（限流跳过 ${d.skipped} 台）` : "";
-      toast(`已开始分批重启 ${d.count} 台${skipTip}（打乱顺序，每批 ${d.batch} 台、间隔 ${d.delay}s，防变压器浪涌），后台执行中…`, "ok");
+      const skipTip = d.skipped ? t("cmd.skipped", { n: d.skipped }) : "";
+      toast(t("cmd.batch_started", { n: d.count, skip: skipTip, batch: d.batch, delay: d.delay }), "ok");
       pollCmdProgress();
       selected.clear(); updateSelCount(); refreshMiners();   // 勾选框和"已选 N 台"一起清掉
     } else {
       const fails = (d.results || []).filter(x => !x.ok);
-      let msg = `${cmd.action}：成功 ${d.success} / 失败 ${d.failed}`;
-      if (d.skipped) msg += `（限流跳过 ${d.skipped}）`;
+      let msg = t("cmd.result", { act: cmd.action, ok: d.success, fail: d.failed });
+      if (d.skipped) msg += t("cmd.skipped", { n: d.skipped });
       if (fails.length) msg += "\n" + fails.slice(0, 5).map(x => `${x.ip}: ${x.msg}`).join("\n");
       toast(msg, fails.length ? "fail" : "ok");
     }
   } catch (err) { /* 401/403 已在 jpost 里处理 */ }
   _cmdInFlight = false;
   $("cmdConfirm").disabled = false; $("cmdConfirm").textContent = btnLabel;
-  $("cmdCancel").textContent = "取消";
+  $("cmdCancel").textContent = t("cmd.cancel");
   if (pendingCmd === cmd) { $("cmdModal").classList.add("hidden"); pendingCmd = null; }
 };
 $("cmdCancel").onclick = $("cmdClose").onclick = () => {
@@ -806,12 +821,12 @@ async function pollCmdProgress(onlyIfRunning) {
     const p = await jget("/api/command/progress");
     if (onlyIfRunning && !p.running) return;   // 刷新页面时：没有在跑的就别弹旧结果
     if (p.running) {
-      document.title = `重启 ${p.done}/${p.total} · 矿机监控面板`;
+      document.title = t("cmd.reboot_title_prog", { done: p.done, total: p.total });
       _cmdPollTimer = setTimeout(pollCmdProgress, 3000);
     } else if (p.total) {
-      document.title = "矿机监控面板";
-      let msg = `分批重启完成：成功 ${p.success} / 失败 ${p.failed}（共 ${p.total} 台）`;
-      if (p.fail_ips && p.fail_ips.length) msg += "\n失败示例：" + p.fail_ips.slice(0, 8).join("、");
+      document.title = t("doc.title");
+      let msg = t("cmd.batch_done", { ok: p.success, fail: p.failed, total: p.total });
+      if (p.fail_ips && p.fail_ips.length) msg += t("cmd.fail_ips", { ips: p.fail_ips.slice(0, 8).join(", ") });
       toast(msg, p.failed ? "fail" : "ok");
       refreshMiners();
     }
@@ -851,7 +866,7 @@ async function openSeg() {
     $("cloudSiteId").textContent = s.site_id || "-";
   }
   $("cloudToken").type = "password";   // 每次打开都回到遮蔽态
-  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = "👁 显示";
+  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = t("seg.token_eye");
   $("segModal").classList.remove("hidden");
 }
 async function saveSeg(scan) {
@@ -862,7 +877,7 @@ async function saveSeg(scan) {
       host_start: parseInt($("segHs").value) || 1,
       host_end: parseInt($("segHe").value) || 254,
     });
-    if (!d.ok) { toast("保存失败：" + (d.error || "")); return; }
+    if (!d.ok) { toast(t("toast.save_fail", { msg: d.error || "" })); return; }
     // 数字框留空/填错时不提交该项(保留原值)，别悄悄存成 0 或默认值——ARP 限速存成 0 会让扫描几乎停摆
     const num = (id) => { const v = parseInt($(id).value); return Number.isFinite(v) ? v : undefined; };
     const body = {
@@ -879,10 +894,10 @@ async function saveSeg(scan) {
     if ($("setFullInterval")) body.full_interval = num("setFullInterval");
     Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
     const d2 = await jpost("/api/settings", body);
-    if (!d2.ok) { toast("保存失败：" + (d2.error || "")); return; }
+    if (!d2.ok) { toast(t("toast.save_fail", { msg: d2.error || "" })); return; }
     $("segModal").classList.add("hidden");
-    toast(`已保存 网段/扫描/云端上报设置` + ($("cloudEnabled").checked ? "（上报已启用，即时生效）" : ""), "ok");
-    if (scan) { await jpost("/api/scan?kind=full", {}); toast("已触发全网扫描", "ok"); setTimeout(pollProgress, 500); }
+    toast(t("toast.saved_settings") + ($("cloudEnabled").checked ? t("toast.cloud_on") : ""), "ok");
+    if (scan) { await jpost("/api/scan?kind=full", {}); toast(t("toast.full_triggered"), "ok"); setTimeout(pollProgress, 500); }
   } catch (e) {}
 }
 $("btnSeg").onclick = openSeg;
@@ -890,13 +905,13 @@ $("btnSeg").onclick = openSeg;
 if ($("cloudTokenEye")) $("cloudTokenEye").onclick = () => {
   const el = $("cloudToken"), show = el.type === "password";
   el.type = show ? "text" : "password";
-  $("cloudTokenEye").textContent = show ? "🙈 隐藏" : "👁 显示";
+  $("cloudTokenEye").textContent = show ? t("seg.token_hide") : t("seg.token_eye");
 };
 $("segClose").onclick = $("segCancel").onclick = () => {
   $("segModal").classList.add("hidden");
   const el = $("cloudToken");   // 关窗即复位成遮蔽态，别下次打开还明晃晃亮着
   if (el) el.type = "password";
-  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = "👁 显示";
+  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = t("seg.token_eye");
 };
 $("segSave").onclick = () => saveSeg(false);
 $("segSaveScan").onclick = () => saveSeg(true);
@@ -912,11 +927,11 @@ async function loadRebootSettings() {
   } catch (e) {}
 }
 async function saveRebootSettings() {
-  if (myRole !== "admin") { toast("仅 admin 可改重启设置"); return; }
+  if (myRole !== "admin") { toast(t("toast.admin_only_reboot")); return; }
   const delay = parseInt(($("rebootDelay") || {}).value);
   const conc = parseInt(($("rebootConc") || {}).value);
   if (!Number.isFinite(delay) || !Number.isFinite(conc)) {
-    toast("间隔/并发须为数字"); return;
+    toast(t("toast.need_numbers")); return;
   }
   try {
     const d = await jpost("/api/settings", {
@@ -924,13 +939,13 @@ async function saveRebootSettings() {
       reboot_delay_sec: delay,
       reboot_concurrency: conc,
     });
-    if (!d.ok) { toast("保存失败：" + (d.error || "")); return; }
+    if (!d.ok) { toast(t("toast.save_fail", { msg: d.error || "" })); return; }
     if ($("rebootDelay")) $("rebootDelay").value = d.reboot_delay_sec;
     if ($("rebootConc")) $("rebootConc").value = d.reboot_concurrency;
     if ($("rebootEnabled")) $("rebootEnabled").checked = !!d.reboot_enabled;
     toast(d.reboot_enabled
-      ? `已开启掉线自动重启（并发 ${d.reboot_concurrency}、批间隔 ${d.reboot_delay_sec}s；仍受限流）`
-      : `已关闭掉线自动重启（手动重启仍可用；并发 ${d.reboot_concurrency}、批间隔 ${d.reboot_delay_sec}s）`, "ok");
+      ? t("toast.reboot_on", { c: d.reboot_concurrency, d: d.reboot_delay_sec })
+      : t("toast.reboot_off", { c: d.reboot_concurrency, d: d.reboot_delay_sec }), "ok");
   } catch (e) {}
 }
 if ($("btnRebootSave")) $("btnRebootSave").onclick = saveRebootSettings;
@@ -944,10 +959,9 @@ $("btnTestVoice").onclick = () => {
     if (audioCtx.state === "suspended") audioCtx.resume();
   } catch (e) {}
   beep(880, 0.3); setTimeout(() => beep(660, 0.3), 350);
-  speak("测试，一台矿机掉线");
+  speak(t("speak.test"));
   const hasVoice = ("speechSynthesis" in window);
-  toast(hasVoice ? "已播放测试音。没声音的话：查电脑音量/静音、或浏览器是否给本页面静音了" :
-        "你的浏览器不支持语音播报，建议用 Chrome/Edge", hasVoice ? "ok" : "fail");
+  toast(hasVoice ? t("toast.voice_ok") : t("toast.voice_nosupport"), hasVoice ? "ok" : "fail");
 };
 setVoice(voiceOn, false);   // 仅刷新按钮文字，不播放（无手势）
 $("mClose").onclick = () => $("modal").classList.add("hidden");
@@ -1013,16 +1027,16 @@ function afterLogin(d) {
 }
 async function savePwd() {
   const old = $("pwdOld").value, nw = $("pwdNew").value;
-  if (nw !== $("pwdNew2").value) { $("pwdErr").textContent = "两次输入的新密码不一致"; return; }
+  if (nw !== $("pwdNew2").value) { $("pwdErr").textContent = t("toast.pwd_mismatch"); return; }
   let d;
   try { d = await jpost("/api/password", { old, new: nw }); } catch (e) { return; }
   if (!d.ok) {
-    $("pwdErr").textContent = d.error || "修改失败";
+    $("pwdErr").textContent = d.error || t("toast.pwd_fail");
     if (String(d.error || "").includes("已退出登录")) setTimeout(() => location.reload(), 1500);
     return;
   }
   closePwd();
-  toast("密码已修改", "ok");
+  toast(t("toast.pwd_ok"), "ok");
 }
 $("btnPwd").onclick = () => openPwd(false);
 $("pwdClose").onclick = () => { if (!_pwdForced) closePwd(); };
@@ -1056,7 +1070,7 @@ let _updForce = false;   // known_bad 时由用户明确点"仍然重试"
 
 function markUpdateBtn(d) {
   const n = (d && !d.error && !d.known_bad && d.behind) || 0;
-  $("btnUpdate").textContent = n ? `⬆ 有新版本(${n})` : "⬆ 版本";
+  $("btnUpdate").textContent = n ? t("upd.has_new", { n }) : t("header.update");
   $("btnUpdate").classList.toggle("has-update", !!n);
 }
 
@@ -1072,36 +1086,33 @@ async function checkUpdate(force) {
 function renderUpdate(d) {
   const b = $("updBody");
   $("updApply").disabled = true;
-  $("updApply").textContent = "立即更新并重启";
+  $("updApply").textContent = t("upd.apply");
   _updForce = false;
-  if (!d) { b.innerHTML = `<div class="upd-err">检查失败：连不上服务器</div>`; return; }
+  if (!d) { b.innerHTML = `<div class="upd-err">${esc(t("upd.check_fail_net"))}</div>`; return; }
   if (d.git === false) {
-    b.innerHTML = `<div class="upd-err">${esc(d.error || "本目录不是 git 仓库")}</div>
-      <div class="upd-note">网页更新需要用 git clone 方式部署。</div>`;
+    b.innerHTML = `<div class="upd-err">${esc(d.error || t("upd.not_git"))}</div>
+      <div class="upd-note">${esc(t("upd.need_git"))}</div>`;
     return;
   }
   if (d.error) {
-    b.innerHTML = `<div class="upd-err">检查失败：${esc(d.error)}</div>
-      <div class="upd-note">常见原因：服务器连不上 GitHub（外网/代理）、git 没装或不在 PATH。</div>`;
+    b.innerHTML = `<div class="upd-err">${esc(t("upd.check_fail", { msg: d.error }))}</div>
+      <div class="upd-note">${esc(t("upd.check_hint"))}</div>`;
     return;
   }
   const when = d.checked_ts ? new Date(d.checked_ts * 1000).toLocaleString() : "-";
-  let h = `<div>分支 <code>${esc(d.branch)}</code> · 当前版本 <code>${esc(d.local)}</code> · 最新 <code>${esc(d.remote)}</code></div>
-    <div class="muted">检查时间 ${esc(when)}</div>`;
+  let h = `<div>${t("upd.meta", { b: esc(d.branch), l: esc(d.local), r: esc(d.remote) })}</div>
+    <div class="muted">${esc(t("upd.checked_at", { when }))}</div>`;
   if (!d.behind) {
-    h += `<div class="upd-ok">✓ 已是最新版本</div>`;
+    h += `<div class="upd-ok">${esc(t("upd.latest"))}</div>`;
   } else if (d.known_bad) {
-    h += `<div class="upd-err">远端最新版本 <code>${esc(d.remote)}</code> 之前自检未通过（或启动失败）已自动回滚，
-      自动更新不会再拉取它。如果原因已排除（比如缺的依赖已经 pip install 好），可以点下面「仍然重试」。</div>`;
-    $("updApply").textContent = "仍然重试";
+    h += `<div class="upd-err">${t("upd.bad", { r: esc(d.remote) })}</div>`;
+    $("updApply").textContent = t("upd.retry");
     $("updApply").disabled = false;
     _updForce = true;
   } else {
-    h += `<div>有 <b>${d.behind}</b> 个新提交${d.behind > 10 ? "（下面只列最近 10 个）" : ""}：</div>
+    h += `<div>${t("upd.behind", { n: d.behind })}${d.behind > 10 ? t("upd.behind_more") : ""}：</div>
       <ul>${(d.changes || []).map(c => `<li>${esc(c)}</li>`).join("")}</ul>`;
-    h += `<div class="upd-note">更新流程：拉取新代码 → 自检（不通过自动回滚，不会重启）→ 重启服务。
-      重启约需十几秒，期间扫描暂停；重启后需要重新登录。配置和数据库不受影响。
-      ${d.restart_mode === "self" ? "<br>当前没有守护进程（run.bat / NSSM），会由程序自己重新拉起。" : ""}</div>`;
+    h += `<div class="upd-note">${esc(t("upd.flow"))}${d.restart_mode === "self" ? t("upd.self_restart") : ""}</div>`;
     $("updApply").disabled = false;
   }
   b.innerHTML = h;
@@ -1110,7 +1121,7 @@ function renderUpdate(d) {
 async function openUpdate() {
   $("updModal").classList.remove("hidden");
   if (_updating) return;
-  $("updBody").textContent = "检查中…（需要连 GitHub，可能要几秒）";
+  $("updBody").textContent = t("upd.checking_long");
   $("updApply").disabled = true;
   renderUpdate(await checkUpdate(true));
 }
@@ -1131,29 +1142,29 @@ async function waitRestart() {
     if (!up) { wentDown = true; continue; }
     if (wentDown || Date.now() - t0 > 20000) { location.reload(); return; }
   }
-  $("updBody").innerHTML = `<div class="upd-err">3 分钟了服务还没回来，请到服务器上检查程序窗口 / logs\\miner.log。</div>`;
+  $("updBody").innerHTML = `<div class="upd-err">${esc(t("upd.timeout"))}</div>`;
   _updating = false;
   startDashboard();   // 恢复轮询和失联检测：否则关掉弹窗后大屏是一张不更新、也不报警的静止画面
 }
 
 async function applyUpdate() {
   if (!_updInfo || !_updInfo.behind) return;
-  if (_updForce && !confirm("这个版本之前自检失败或启动崩溃过。确定原因已经排除、要再试一次吗？\n（再失败会自动回滚）")) return;
-  if (!confirm(`确认更新到最新版本（${_updInfo.behind} 个新提交）并重启服务？\n重启期间约十几秒不扫描，所有人需要重新登录。`)) return;
+  if (_updForce && !confirm(t("upd.retry_confirm"))) return;
+  if (!confirm(t("upd.apply_confirm", { n: _updInfo.behind }))) return;
   _updating = true;
   $("updApply").disabled = true; $("updRecheck").disabled = true;
-  $("updBody").textContent = "正在拉取新代码并自检，可能需要 1～2 分钟，请勿关闭页面…";
+  $("updBody").textContent = t("upd.applying");
   let r;
   try { r = await jpost("/api/update/apply", { force: _updForce }); } catch (e) { r = null; }
   $("updRecheck").disabled = false;
   if (!r || !r.ok) {
     _updating = false;
-    $("updBody").innerHTML = `<div class="upd-err">更新失败：${esc((r && (r.msg || r.error)) || "请求出错")}</div>
-      <div class="upd-note">自检不通过会自动回滚，服务仍在旧版本上正常运行。</div>`;
+    $("updBody").innerHTML = `<div class="upd-err">${esc(t("upd.apply_fail", { msg: (r && (r.msg || r.error)) || t("req.error") }))}</div>
+      <div class="upd-note">${esc(t("upd.rollback_note"))}</div>`;
     return;
   }
-  $("updBody").innerHTML = `<div class="upd-ok">✓ 已更新 ${esc(r.from)} → ${esc(r.to)}，正在重启服务…</div>
-    <div class="muted">服务回来后页面会自动刷新。</div>`;
+  $("updBody").innerHTML = `<div class="upd-ok">${esc(t("upd.ok_restarting", { from: r.from, to: r.to }))}</div>
+      <div class="muted">${esc(t("upd.refresh_soon"))}</div>`;
   stopDashboard();   // 重启期间别弹"监控失联"红条/重连风暴
   waitRestart();
 }
@@ -1191,7 +1202,7 @@ function connectWS() {
       _ws = null;
       if (ev && ev.code === 1008) { showLogin(); return; }
       if (ev && ev.code === 4403) {          // 访问地址/来源不被允许：别弹登录也别重连，靠 30 秒轮询
-        toast("实时推送连接被服务器拒绝(访问地址不在允许列表)，已改为每 30 秒刷新");
+        toast(t("toast.ws_denied"));
         return;
       }
       scheduleWS();
@@ -1231,7 +1242,7 @@ async function doLogin() {
     body: JSON.stringify({ username: $("loginUser").value, password: $("loginPass").value }),
   });
   const d = await r.json();
-  if (!d.ok) { $("loginErr").textContent = d.error || "登录失败"; return; }
+  if (!d.ok) { $("loginErr").textContent = d.error || t("toast.login_fail"); return; }
   $("loginOverlay").classList.add("hidden");
   myRole = d.role; myUser = d.user; applyRole(); startDashboard();
   afterLogin(d);
@@ -1245,7 +1256,7 @@ $("btnLogout").onclick = doLogout;
 $("btnScanContainers").onclick = async () => {
   try {
     await jpost("/api/containers/scan", {});
-    toast("已触发集装箱刷新", "ok");
+    toast(t("toast.container_refresh"), "ok");
     setTimeout(refreshContainers, 1500);
   } catch (e) {}
 };
@@ -1266,3 +1277,37 @@ async function init() {
   afterLogin(me);
 }
 init();
+
+
+/* ---- i18n boot ---- */
+(function bootI18n() {
+  function wireSelect(id) {
+    const sel = document.getElementById(id);
+    if (!sel || sel._i18nWired) return;
+    sel._i18nWired = true;
+    sel.addEventListener("change", () => {
+      I18N.setLang(sel.value, true);
+      const other = document.getElementById(id === "langSelect" ? "langSelectLogin" : "langSelect");
+      if (other) other.value = sel.value;
+    });
+  }
+  function syncSelects() {
+    const v = I18N.lang;
+    ["langSelect", "langSelectLogin"].forEach(id => {
+      const sel = document.getElementById(id);
+      if (sel) sel.value = v;
+    });
+  }
+  if (window.I18N) {
+    I18N.init();
+    wireSelect("langSelect");
+    wireSelect("langSelectLogin");
+    syncSelects();
+    document.addEventListener("i18n:change", () => {
+      syncSelects();
+      try { setVoice(voiceOn, false); } catch (e) {}
+      try { updateSelCount(); } catch (e) {}
+      try { refreshAlerts(); } catch (e) {}
+    });
+  }
+})();
