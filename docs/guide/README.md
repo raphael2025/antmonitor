@@ -1,6 +1,8 @@
-# AntMonitor guides
+# AntMonitor guides · 多语言简介 / 部署 / 使用
 
-| Language | Guide |
+选择语言 · Choose language:
+
+| | |
 |---|---|
 | 🇨🇳 中文 | [zh.md](zh.md) |
 | 🇬🇧 English | [en.md](en.md) |
@@ -9,10 +11,9 @@
 | 🇩🇪 Deutsch | [de.md](de.md) |
 | 🇸🇦 العربية | [ar.md](ar.md) |
 
-Each guide: **Intro · Deploy · How to use**.
+**开源仓库**
 
-| Site | Cloud |
-|---|---|
-| https://github.com/raphael2025/antmonitor | https://github.com/raphael2025/antmonitor-cloud |
+- 场地端 https://github.com/raphael2025/antmonitor
+- 云端 https://github.com/raphael2025/antmonitor-cloud
 
-Custom: WeChat **`raphael-2024`** · Telegram https://t.me/+W3J9yAypNgpjNTk9
+微信 `raphael-2024` · [Telegram](https://t.me/+W3J9yAypNgpjNTk9)
