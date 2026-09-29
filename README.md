@@ -1,33 +1,51 @@
-# 矿机监控系统 (Miner Monitor)
+# AntMonitor · 蚂蚁矿机监控
 
-扫描局域网矿机、自动识别固件、读取算力，提供 **Web 面板 + 定时巡检 + 主动告警**。
+**中文**：比特大陆蚂蚁矿机（ANTMINER）局域网批量监控与运维系统  
+**English**: Local bulk monitoring & ops for BITMAIN **ANTMINER** / **ANTBOX** farms
+
+局域网扫描矿机与水冷箱、自动识别固件、读算力，提供 **Web 面板 · 定时巡检 · 主动告警 · 远程重启**。  
+Scan LAN miners & hydro containers, auto-detect firmware, read hashrate — **Web dashboard · scheduled scans · alerts · remote reboot**.
+
 已提供 **Agent 公共 API**（`/api/public/*`，Token 鉴权、只读）供 hermes 等 AI agent 取数。
 
-| 仓库 | 地址 | 职责 |
-|---|---|---|
-| **本仓库（场地本地）** | https://github.com/raphael2025/miner-monitor | 内网扫描 / 运维面板 / 告警 / 远程命令 |
-| **云端总览（多场地）** | https://github.com/raphael2025/cloud-overview | 云服务器汇聚各场地摘要看板 |
+| | |
+|---|---|
+| 场地本地 Site ops | https://github.com/raphael2025/miner-monitor （本仓库） |
+| 云端总览 Multi-site | https://github.com/raphael2025/cloud-overview |
 
-> 📚 **文档**：[开发文档](docs/DEVELOPMENT.md) ｜ [内部API-矿机接口](docs/INTERNAL_API.md) ｜
-> [外部API-Agent取数接口](docs/EXTERNAL_API.md)（详细） ｜ **[运维安全手册](docs/SECURITY.md)（上线前必读）**
+> 📚 **文档 Docs**：[开发 DEVELOPMENT](docs/DEVELOPMENT.md) ｜ [内部API INTERNAL](docs/INTERNAL_API.md) ｜
+> [外部API EXTERNAL](docs/EXTERNAL_API.md) ｜ **[运维安全 SECURITY](docs/SECURITY.md)**
 
 > 算力按**千进制**显示：1000 TH = 1 PH，1000 PH = 1 EH（总算力/客户/趋势自动选单位；
 > 单机一般仍为 TH）。CSV/接口内部仍存原始 TH 数值。
 
-## 支持的设备 / 接口
+### 定制 / Custom
 
-| 设备 | 探测 | 数据来源 | 认证 |
+需要特殊功能（报表、对接矿池/电费、权限改造、多场地策略等）可联系定制：
+
+| 渠道 Channel | |
+|---|---|
+| 微信 WeChat | 搜索 **`raphael-2024`** |
+| Telegram | https://t.me/+W3J9yAypNgpjNTk9 |
+
+---
+
+## 支持的设备 / Supported devices
+
+官方命名对照（比特大陆 BITMAIN）：**蚂蚁矿机 ANTMINER** · 水冷箱 **ANTBOX**。
+
+| 设备 Device | 探测 Probe | 数据 Data | 认证 Auth |
 |---|---|---|---|
-| 原厂 Bitmain 矿机 | `GET http://IP:6060/get_sn`（明文 SN，快） | `GET /cgi-bin/stats.cgi` | Digest（默认 root/root，可配多组） |
-| 第三方 UniPlusOS 矿机 | `GET http://IP/api/v1/summary` | 同左 | 免认证 |
-| **AntBox 水冷集装箱** | `GET http://IP/cooler?operation=coolerState` | 同左 + `minerInfo` | 免认证 |
+| 原厂 ANTMINER（Bitmain stock） | `GET http://IP:6060/get_sn` | `GET /cgi-bin/stats.cgi` | Digest（默认 root/root） |
+| 第三方 UniPlusOS 固件 | `GET http://IP/api/v1/summary` | 同左 | 免认证 |
+| **ANTBOX** 水冷集装箱 | `GET http://IP/cooler?operation=coolerState` | 同左 + `minerInfo` | 免认证 |
 
 > 扫描时按 矿机→AntBox 顺序探测，与矿机**同网段自动发现**集装箱（控制器响应慢，给更宽超时）。
 > 集装箱**记忆持久化**（`containers` 表）+ **独立高频刷新**：全量扫描(每天)发现新箱；已知箱由专门的
 > 循环每 `schedule.container_interval`(默认10s)只打 `/cooler` 刷新（50箱@10s≈123kbps，带宽可忽略，
 > 与矿机5min巡检解耦）；离线超 `scan.container_offline_kick_sec`(默认24h) 自动踢除。
 
-## 集装箱 (AntBox) 监控
+## 集装箱 (ANTBOX) 监控
 
 读取每个水冷集装箱控制器：**进/出水温、ΔT、供回液压力、流量、箱内温湿度、冷却塔进水温、
 设定温度、总功耗(两路配电之和，卡片头部 ⚡ 显示 kW/MW)、泵/风扇状态、箱内矿机数/芯片温**。面板「🧊 集装箱」面板按箱卡片展示，

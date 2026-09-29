@@ -1,9 +1,9 @@
 # 开发文档（Development Guide）
 
-矿场监控系统（Miner Monitor）——给托管/包机场地用的矿机+水冷集装箱监控平台。
+**AntMonitor**（蚂蚁矿机监控）——给托管/包机场地用的 ANTMINER + ANTBOX 监控平台。
 本文面向**维护/二次开发**：架构、数据模型、控制流、线程模型、配置、约定与坑。
 
-- 用户/功能说明见 [../README.md](../README.md)
+- 用户/功能说明见 [../README.md](../README.md)（含中英简介与定制联系方式）
 - 矿机/设备接口（本系统调设备）见 [INTERNAL_API.md](INTERNAL_API.md)
 - 外部 Agent 取数接口（别人调本系统）见 [EXTERNAL_API.md](EXTERNAL_API.md)
 
