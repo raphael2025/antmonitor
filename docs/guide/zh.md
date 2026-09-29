@@ -23,7 +23,11 @@ AntMonitor 是矿场**局域网**批量监控与运维系统：看清全场算�
 
 **环境**：Python 3.8+；能访问矿机网段。
 
+**Ubuntu 一键（推荐）**：在仓库根目录执行 `sudo bash install.sh`  
+菜单可选语言，支持：首次安装 · 更新 · 修复 · 卸载 · 重置用户名和密码。默认目录 `/opt/antmonitor`，服务名 `antmonitor`。
+
 ```bash
+# 也可手动
 git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
@@ -31,7 +35,7 @@ cp config.example.yaml config.yaml    # 改网段、登录账号
 python server.py                      # http://<IP>:8800
 ```
 
-Windows 可用 `run.bat`。生产建议 systemd 常驻。安全清单：[SECURITY](../SECURITY.md)。
+Windows 可用 `run.bat`。安全清单：[SECURITY](../SECURITY.md)。
 
 打开面板后用 admin 配置网段并触发一次全网发现。
 
@@ -51,6 +55,8 @@ Windows 可用 `run.bat`。生产建议 systemd 常驻。安全清单：[SECURIT
 ---
 
 ## 定制
+
+项目持续迭代；欢迎提意见。规划中含 **多客户管理**、Agent Skill + MCP 等。
 
 微信 **`raphael-2024`** · Telegram https://t.me/+W3J9yAypNgpjNTk9
 

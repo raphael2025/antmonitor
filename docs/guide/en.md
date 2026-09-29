@@ -23,15 +23,19 @@ For hosting / colocation — one Windows or Ubuntu box on site.
 
 **Needs:** Python 3.8+, reachability to miner subnets.
 
+**Ubuntu one-click (recommended):** from the repo root run `sudo bash install.sh`  
+Pick a language, then: Install · Update · Repair · Uninstall · Reset username & password. Default path `/opt/antmonitor`, unit `antmonitor`.
+
 ```bash
+# manual
 git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp config.example.yaml config.yaml    # set segments & users
-python server.py                      # http://<IP>:8800
+cp config.example.yaml config.yaml
+python server.py
 ```
 
-Windows: `run.bat`. Production: systemd. Security: [SECURITY](../SECURITY.md).
+Windows: `run.bat`. Security: [SECURITY](../SECURITY.md).
 
 As admin, configure subnets and run a full discovery once.
 
@@ -51,6 +55,8 @@ Reboots are rate-limited per IP. Weak passwords only prompt a change.
 ---
 
 ## Custom
+
+We keep shipping updates — feedback welcome. Roadmap includes **multi-customer management**, Agent Skills + MCP, and more.
 
 WeChat **`raphael-2024`** · Telegram https://t.me/+W3J9yAypNgpjNTk9
 

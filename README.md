@@ -40,6 +40,22 @@
 
 ## Quick start
 
+### Ubuntu 一键管理（推荐）
+
+交互菜单：选语言 → **首次安装 / 更新 / 修复 / 卸载 / 重置用户名和密码**。
+
+```bash
+# 已有本仓库代码时（在仓库根目录）
+sudo bash install.sh
+
+# 或指定安装目录
+sudo ANTMONITOR_HOME=/opt/antmonitor bash install.sh
+```
+
+默认安装到 `/opt/antmonitor`，注册 systemd 服务 `antmonitor`。私有仓首次远程 clone 需本机已配置 GitHub 凭证；更稳妥是先把代码放到服务器再跑脚本。
+
+### 手动启动
+
 ```bash
 git clone https://github.com/raphael2025/antmonitor.git
 cd antmonitor
@@ -49,7 +65,7 @@ cp config.example.yaml config.yaml                   # 改网段、账号后启�
 python server.py                                     # → http://<本机或局域网IP>:8800
 ```
 
-Windows 可用 `run.bat`（崩溃自动拉起）。Ubuntu 建议 systemd 守护。
+Windows 可用 `run.bat`（崩溃自动拉起）。
 
 **选语言看完整「简介 · 部署 · 使用」→** [docs/guide/](docs/guide/README.md)
 
@@ -80,17 +96,24 @@ Windows 可用 `run.bat`（崩溃自动拉起）。Ubuntu 建议 systemd 守护�
 
 ---
 
-## Roadmap
+## Roadmap · 持续迭代
+
+本项目会**持续更新**。你在矿场踩过的坑、想要的功能，都欢迎提——好的意见会尽量排进版本。
+
+**近期规划（部分）：**
 
 1. **Agent Skill + MCP** — 智能化监控与管理（优先）
-2. 更细的访问控制与通道白名单
-3. 分组统计、趋势对比、导出报表
+2. **多客户管理** — 托管/包机场景下的客户隔离、权限、报表与对账增强
+3. 更细的访问控制与通知通道白名单
+4. 分组统计、趋势对比、导出报表
+
+有想法：开 Issue / PR，或微信 **`raphael-2024`** · Telegram https://t.me/+W3J9yAypNgpjNTk9
 
 ---
 
 ## Custom & contact
 
-报表对接、权限改造、多场地策略、Agent/MCP 落地等可定制：
+报表对接、权限改造、多场地策略、Agent/MCP 落地、多客户定制等：
 
 | | |
 |---|---|

@@ -19,6 +19,8 @@ AntMonitor es monitoreo y operación **en LAN**: visibilidad del parque, alertas
 
 ## Despliegue
 
+**Ubuntu:** `sudo bash install.sh`（安装/更新/修复/卸载/重置账号）
+
 ```bash
 git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
 python3 -m venv .venv && source .venv/bin/activate

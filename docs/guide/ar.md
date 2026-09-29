@@ -21,6 +21,8 @@ AntMonitor مراقبة وتشغيل **على الشبكة المحلية**: ر�
 
 ## النشر
 
+**Ubuntu:** `sudo bash install.sh` — تثبيت / تحديث / إصلاح / إزالة / إعادة تعيين المستخدم.
+
 ```bash
 git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
 python3 -m venv .venv && source .venv/bin/activate
