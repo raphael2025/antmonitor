@@ -307,5 +307,13 @@ I18N.register('zh', {
   "cbox.power_detail": "总功耗 {total}（配电1 {p1} + 配电2 {p2}）",
   "cbox.pumps": "泵/风扇：{p}",
   "cbox.faults": "故障：{f}",
-  "cbox.temps_line": "进水 {s}℃ ｜ 出水 {r}℃ ｜ 设定 {set}℃"
+  "cbox.temps_line": "进水 {s}℃ ｜ 出水 {r}℃ ｜ 设定 {set}℃",
+  "cbox.miners_line": "矿机 {n} 台",
+  "cbox.meta_env": "箱内 {t}℃ / {h}% ｜ 流量 {f} ｜ 压力",
+  "cbox.detail_temps": "进水 {s}℃ ｜ 出水 {r}℃ ｜ 设定 {set}℃",
+  "cbox.detail_press": "供/回压 {sp}/{rp} ｜ 流量 {f} ｜ 冷却塔进水 {ti}℃",
+  "cbox.detail_box": "箱内 {t}℃ / {h}% ｜ 矿机 {n} 台 ｜ 芯片最高 {chip}℃",
+  "cbox.detail_power": "总功耗 {total}（配电1 {p1} + 配电2 {p2}）",
+  "cbox.detail_pumps": "泵/风扇：{p}",
+  "cbox.detail_faults": "故障：{f}"
 });
