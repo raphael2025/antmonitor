@@ -211,3 +211,18 @@ footer { text-align: center; padding: 20px; }
 .upd-body .upd-note { background: #1c2128; border-left: 3px solid #d29922; padding: 6px 10px; border-radius: 5px; margin-top: 8px; font-size: 13px; }
 #pwdModal .seg-host input { width: 220px; }
 #pwdModal .seg-host { display: flex; justify-content: space-between; align-items: center; }
+
+
+/* ---- i18n / language ---- */
+.lang-select {
+  background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+  border-radius: 6px; padding: 4px 8px; font-size: 13px; cursor: pointer;
+}
+.lang-row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 10px; font-size: 13px; color: #8b949e; }
+[dir="rtl"] header, [dir="rtl"] .actions, [dir="rtl"] .filters, [dir="rtl"] .cmdbar, [dir="rtl"] .wbar {
+  direction: rtl;
+}
+[dir="rtl"] .actions, [dir="rtl"] .filters, [dir="rtl"] .cmdbar { flex-direction: row-reverse; flex-wrap: wrap; }
+[dir="rtl"] .cards, [dir="rtl"] .grid2 { direction: rtl; }
+[dir="rtl"] .tablewrap { direction: ltr; } /* keep IP columns LTR */
+[dir="rtl"] .lang-row { justify-content: flex-start; }

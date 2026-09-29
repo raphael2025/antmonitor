@@ -61,3 +61,8 @@ Windows 可用 `run.bat`。安全清单：[SECURITY](../SECURITY.md)。
 微信 **`raphael-2024`** · Telegram https://t.me/+W3J9yAypNgpjNTk9
 
 开发说明 [DEVELOPMENT](../DEVELOPMENT.md) · Agent 取数 [EXTERNAL_API](../EXTERNAL_API.md)
+
+## 面板语言 / Panel language
+
+登录页与顶栏可选语言；选择会保存在浏览器本地。
+
