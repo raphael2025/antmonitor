@@ -10,7 +10,7 @@ Scan LAN miners & hydro containers, auto-detect firmware, read hashrate — **We
 
 | | |
 |---|---|
-| 场地本地 Site ops | https://github.com/raphael2025/miner-monitor （本仓库） |
+| 场地本地 Site ops | https://github.com/raphael2025/antmonitor （本仓库） |
 | 云端总览 Multi-site | https://github.com/raphael2025/cloud-overview |
 
 > 📚 **文档 Docs**：[开发 DEVELOPMENT](docs/DEVELOPMENT.md) ｜ [内部API INTERNAL](docs/INTERNAL_API.md) ｜
@@ -324,11 +324,17 @@ cloud:
 - 语法错误的坏版本会被编译自检拦下并**自动回滚**；云端侧发布/场地接入见
   [cloud-overview/docs/DEPLOY.md](https://github.com/raphael2025/cloud-overview/blob/master/docs/DEPLOY.md)
 
-## 后续规划（功能定稿后再做）
+## 后续规划 / Roadmap
 
-1. **MCP server**：把 summary/top/bottom/miner/alerts 暴露成 tool，供 hermes/openclaw 调用。
-2. **访问控制**：API token + Telegram chat_id 白名单（算力/SN/拓扑属敏感数据）。
+1. **Agent Skill + MCP（智能化监控与管理）** — *下一步优先*  
+   - 提供 **MCP server**：把总览 / Top·Bottom / 单机 / 告警 / 网段 / 命令审计等做成 tool，供 Cursor、hermes、openclaw 等 Agent 调用。  
+   - 配套 **Agent Skill**：约定「怎么看场」「怎么排查掉线」「什么时候允许重启」等运维剧本，让 Agent 按规程做智能巡检与管理，而不是裸调 API。  
+   - 建立在现有 `/api/public/*` 只读公共 API 之上，写操作仍走角色鉴权 + 二次确认 + 重启限流。  
+   - English: next up — MCP tools + Agent Skills for intelligent farm monitoring & ops (read via public API; writes stay gated).
+2. **访问控制加强**：API token 粒度 + Telegram chat_id 白名单（算力/SN/拓扑属敏感数据）。
 3. 机型/网段分组统计、历史趋势对比、导出报表。
+
+需要上述能力的定制版，可微信搜索 **`raphael-2024`**，或加入 Telegram：https://t.me/+W3J9yAypNgpjNTk9
 
 ## 依赖
 
