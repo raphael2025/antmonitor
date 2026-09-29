@@ -320,16 +320,20 @@ function trendYScale(data) {
 
 async function refreshTrend() {
   const d = await jget("/api/trend?points=288");
-  const t = d.trend || [];
-  const labels = t.map(x => new Date(x.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }));
-  const raw = t.map(x => x.total_hr);
+  // 注意：不可用局部变量名 t —— 会遮蔽全局 i18n 的 t()，导致标题赋值抛错、整段趋势图画不出
+  const pts = d.trend || [];
+  const loc = (window.I18N && I18N.lang === "zh") ? "zh-CN" : undefined;
+  const labels = pts.map(x => new Date(x.ts * 1000).toLocaleTimeString(loc, { hour12: false }));
+  const raw = pts.map(x => x.total_hr);
   const { div, unit } = hashUnit(raw.length ? Math.max(...raw) : 0);
   const data = raw.map(v => v / div);
   const yScale = trendYScale(data);
   const tt = $("trendTitle"); if (tt) tt.textContent = t("trend.title_u", { unit });
-  if (!window.Chart) return;   // 无网/CDN 不可达时图表库缺失，不能让整个面板挂掉
+  if (!window.Chart) return;   // Chart.js 未加载时跳过，不拖垮整页
+  const canvas = $("trendChart");
+  if (!canvas) return;
   if (!trendChart) {
-    trendChart = new Chart($("trendChart"), {
+    trendChart = new Chart(canvas, {
       type: "line",
       data: { labels, datasets: [{ data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: .3, pointRadius: 0, borderWidth: 2 }] },
       options: {
@@ -619,11 +623,11 @@ async function refreshContainers() {
     const realFault = (c.faults || []).some(f => !ign.has(f.flag)) || spLow || rpLow;
     return `<div class="cbox ${realFault ? "fault" : ""}" onclick="openContainer('${esc(c.ip)}')">`
       + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
-      + `<span class="cbox-meta">矿机 ${safeVal(c.miner_num)} 台 ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span></div>`
-      + `<div class="cbox-temps"><div>进水 <span class="v in">${safeVal(c.supply_temp)}℃</span></div>`
-      + `<div>出水 <span class="v out">${safeVal(c.return_temp)}℃</span></div><div>ΔT <span class="v">${safeVal(dt)}℃</span></div></div>`
-      + `<div class="cbox-meta">箱内 ${safeVal(c.internal_temp)}℃ / ${safeVal(c.internal_humidity)}% ｜ 流量 ${safeVal(c.flow)} ｜ 压力 `
-      + `<span class="${spLow ? "res-fail" : ""}">${safeVal(c.supply_pressure)}</span>/<span class="${rpLow ? "res-fail" : ""}">${safeVal(c.return_pressure)}</span> ｜ 设定 ${safeVal(c.set_temp)}℃</div>`
+      + `<span class="cbox-meta">${esc(t("cbox.miners_line", { n: safeVal(c.miner_num) }))} ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span></div>`
+      + `<div class="cbox-temps"><div>${esc(t("cbox.supply"))} <span class="v in">${safeVal(c.supply_temp)}℃</span></div>`
+      + `<div>${esc(t("cbox.return"))} <span class="v out">${safeVal(c.return_temp)}℃</span></div><div>ΔT <span class="v">${safeVal(dt)}℃</span></div></div>`
+      + `<div class="cbox-meta">${esc(t("cbox.meta_env", { t: safeVal(c.internal_temp), h: safeVal(c.internal_humidity), f: safeVal(c.flow) }))} `
+      + `<span class="${spLow ? "res-fail" : ""}">${safeVal(c.supply_pressure)}</span>/<span class="${rpLow ? "res-fail" : ""}">${safeVal(c.return_pressure)}</span> ｜ ${esc(t("cbox.set_temp"))} ${safeVal(c.set_temp)}℃</div>`
       + `<div class="cbox-pumps">${pumps}</div>`
       + (faults ? `<div class="cbox-faults">${faults}</div>` : "")
       + `</div>`;
@@ -651,11 +655,11 @@ async function openContainer(ip) {
   const faults = (c.faults || []).map(f => `<span class="fbadge ${esc(f.sev)}">${esc(f.label)}</span>`).join("") || t("cbox.none_fault");
   const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${esc(k)}:${v ? t("cmd.open") : t("cmd.close")}`).join(" ｜ ");
   $("mInfo").innerHTML =
-    `进水 ${safeVal(c.supply_temp)}℃ ｜ 出水 ${safeVal(c.return_temp)}℃ ｜ 设定 ${safeVal(c.set_temp)}℃<br>`
-    + `供/回压 ${safeVal(c.supply_pressure)}/${safeVal(c.return_pressure)} ｜ 流量 ${safeVal(c.flow)} ｜ 冷却塔进水 ${safeVal(c.tower_inlet_temp)}℃<br>`
-    + `箱内 ${safeVal(c.internal_temp)}℃ / ${safeVal(c.internal_humidity)}% ｜ 矿机 ${safeVal(c.miner_num)} 台 ｜ 芯片最高 ${safeVal(c.chip_max_temp)}℃<br>`
-    + `总功耗 ${fmtPower(boxPower(c))}（配电1 ${fmtPower(c.power1)} + 配电2 ${fmtPower(c.power2)}）<br>`
-    + `泵/风扇：${pumps}<br>故障：${faults}`;
+    `${esc(t("cbox.detail_temps", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp), set: safeVal(c.set_temp) }))}<br>`
+    + `${esc(t("cbox.detail_press", { sp: safeVal(c.supply_pressure), rp: safeVal(c.return_pressure), f: safeVal(c.flow), ti: safeVal(c.tower_inlet_temp) }))}<br>`
+    + `${esc(t("cbox.detail_box", { t: safeVal(c.internal_temp), h: safeVal(c.internal_humidity), n: safeVal(c.miner_num), chip: safeVal(c.chip_max_temp) }))}<br>`
+    + `${esc(t("cbox.detail_power", { total: fmtPower(boxPower(c)), p1: fmtPower(c.power1), p2: fmtPower(c.power2) }))}<br>`
+    + `${esc(t("cbox.detail_pumps", { p: pumps }))}<br>${t("cbox.detail_faults", { f: faults })}`;
   $("modal").classList.remove("hidden");
 }
 
@@ -747,23 +751,21 @@ function openCmdDialog(cmd, includeHidden) {
   $("cmdTitle").textContent = meta.title;
   let html = t("cmd.dialog_run", { n: ips.length, act: esc(meta.title) });
   if (hiddenIps.length)
-    html += `<div class="warn-box" style="border-width:2px">⚠️ 你勾选的机器里有 <b>${hiddenIps.length}</b> 台`
-      + `已不在当前列表（勾选后状态变了，比如已恢复在线）：${hiddenIps.slice(0, 20).map(esc).join("、")}`
-      + `${hiddenIps.length > 20 ? " …" : ""}<br><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-top:6px">`
+    html += `<div class="warn-box" style="border-width:2px">${t("cmd.hidden_warn", { n: hiddenIps.length, ips: hiddenIps.slice(0, 20).map(esc).join(", ") + (hiddenIps.length > 20 ? " …" : "") })}`
+      + `<br><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-top:6px">`
       + `<input type="checkbox" id="cmdIncHidden" style="width:auto;margin:0"`
-      + `${includeHidden ? " checked" : ""}> 也对这 ${hiddenIps.length} 台执行</label>`
-      + `（默认不执行）</div>`;
+      + `${includeHidden ? " checked" : ""}> ${esc(t("cmd.also_run", { n: hiddenIps.length }))}</label>`
+      + `${esc(t("cmd.default_skip"))}</div>`;
   if (meta.danger)
-    html += `<div class="warn-box">⚠️ 这是破坏性操作，会立即影响矿机运行（重启会中断挖矿约数分钟）。请确认无误。</div>`;
+    html += `<div class="warn-box">${esc(t("cmd.danger_note"))}</div>`;
   // 规模分级提示：几台和几千台的后果完全不是一回事，弹窗里必须让人看清影响范围
   if (meta.danger && ips.length > DANGER_BULK)
     html += `<div class="warn-box" style="border-width:2px;font-weight:700;font-size:15px;line-height:1.7">`
-      + `🚨 即将对 <span style="font-size:19px">${ips.length}</span> 台矿机执行【${esc(meta.short || meta.title)}】<br>`
-      + `这会让这 ${ips.length} 台矿机同时离线数分钟（分批下发，仍有整片算力掉坑）。`
-      + `<br>这是破坏性操作，请再次确认选中范围无误！</div>`;
-  html += `<div class="muted" style="margin-top:8px">目标 ${ips.length} 台：</div>`
+      + t("cmd.bulk_danger", { n: ips.length, act: esc(meta.short || meta.title) })
+      + `</div>`;
+  html += `<div class="muted" style="margin-top:8px">${esc(t("cmd.targets", { n: ips.length }))}</div>`
     + `<div style="max-height:120px;overflow:auto;font-size:12px;line-height:1.6;border:1px solid #30363d;border-radius:6px;padding:6px;margin-top:4px">`
-    + ips.map(esc).join("、") + `</div>`;
+    + ips.map(esc).join(", ") + `</div>`;
   $("cmdBody").innerHTML = html;
   if ($("cmdIncHidden")) $("cmdIncHidden").onchange = (e) => openCmdDialog(cmd, e.target.checked);
   $("cmdConfirm").disabled = ips.length === 0;
@@ -1307,7 +1309,8 @@ init();
       syncSelects();
       try { setVoice(voiceOn, false); } catch (e) {}
       try { updateSelCount(); } catch (e) {}
-      try { refreshAlerts(); } catch (e) {}
+      // 动态渲染的列表/卡片/趋势不走 data-i18n，必须整页刷新文案
+      try { if (typeof refreshAll === "function") refreshAll(); } catch (e) {}
     });
   }
 })();
