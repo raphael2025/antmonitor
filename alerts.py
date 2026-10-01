@@ -318,17 +318,30 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
 # 漏液最长 30 分钟没有活跃告警；而 crit 又不受冷却(复发立刻重报)，消得太快会在接触不良时
 # 反复"报—消—报"刷屏。按时间而不是轮数：全网扫描和 10 秒刷新都会评估，轮数不等于时长
 COOLER_CLEAR_SEC = 300
+# 供/回液压力阈值告警：自动补水会让回液压瞬间掉一下(常见仅 1 个采样点)，
+# 立刻报 crit 又要等 5 分钟才消，夜班等于白挨一刀。压力是连续模拟量，不是漏液触点，
+# 持续偏低才报、恢复后较快消即可。
+COOLER_PRESSURE_CLEAR_SEC = 30
+# 软件压力阈值 + 箱体自带回液压低位：补水瞬时抖动也走同一套确认
+_PRESSURE_ALERT_TYPES = frozenset({
+    "cooler:supply_pressure_low",
+    "cooler:return_pressure_low_th",
+    "cooler:return_liquid_pressure_low",
+})
 _COOLER_STATE = {}
 
 
 def evaluate_containers(conn, containers, known_before, cfg, state=None):
-    """集装箱冷却告警：故障位 → 告警；箱体掉线 → 告警；连续 COOLER_CLEAR_ROUNDS 轮正常才消警。
+    """集装箱冷却告警：故障位 → 告警；箱体掉线 → 告警；连续正常满清警时长才消警。
     known_before: 本轮扫描前已记住的箱体 IP 集合（用于判定掉线）。
     state: 跨轮次状态(由 MonitorService 持有)；省略时用模块级默认。"""
     acfg = cfg.get("alerts", {})
     if not acfg.get("enabled", True):
         return []
-    clean = (state if state is not None else _COOLER_STATE).setdefault("cooler_clean", {})
+    st = state if state is not None else _COOLER_STATE
+    clean = st.setdefault("cooler_clean", {})
+    # 压力类条件首次成立时刻：满 hold 秒才真正 fire（防自动补水瞬时低压）
+    low_since = st.setdefault("cooler_pressure_low_since", {})
     now = int(time.time())
     cur = {c["ip"]: c for c in containers}
     b = _Batch(conn, acfg.get("cooldown", 1800), now)
@@ -336,6 +349,10 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
     ignore = set(acfg.get("container_faults_ignore", []))
     sp_min = acfg.get("container_supply_pressure_min", 0) or 0
     rp_min = acfg.get("container_return_pressure_min", 0) or 0
+    # 0=立即报(旧行为)；默认 60s 覆盖补水瞬时掉压
+    hold = int(acfg.get("container_pressure_hold_sec", 60) or 0)
+    press_clear = int(acfg.get("container_pressure_clear_sec", COOLER_PRESSURE_CLEAR_SEC)
+                      or COOLER_PRESSURE_CLEAR_SEC)
     existing = db.active_alerts_by_type(conn, like="cooler")
 
     for ip, c in cur.items():
@@ -349,6 +366,29 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
         if rp_min and isinstance(rp, (int, float)) and rp < rp_min:
             active["cooler:return_pressure_low_th"] = {"label": f"回液压力低 {rp}<{rp_min}MPa",
                                                        "sev": "crit"}
+        # 压力类：持续 hold 秒才进入 active；未满则本轮不报、也不打断已有告警的清警计时。
+        # 已在报警的压力条不再重新 hold（否则每轮 setdefault 会被清掉后又从 0 计）。
+        pending_pressure = {}
+        for type_ in list(active):
+            if type_ not in _PRESSURE_ALERT_TYPES:
+                continue
+            k = (ip, type_)
+            if not hold:
+                low_since.pop(k, None)
+                continue
+            already = any(a["ip"] == ip and a["type"] == type_ for a in existing)
+            if already:
+                low_since.pop(k, None)
+                continue
+            first = low_since.setdefault(k, now)
+            if now - first < hold:
+                pending_pressure[type_] = active.pop(type_)
+        # 条件已消失的压力确认计时清掉
+        for key in list(low_since):
+            if key[0] == ip and key[1] in _PRESSURE_ALERT_TYPES \
+                    and key[1] not in active and key[1] not in pending_pressure:
+                low_since.pop(key, None)
+
         for type_, f in active.items():
             clean.pop((ip, type_), None)
             # crit(漏液/断流/冻结…)不受冷却限制：真恢复后又复发必须立刻再报
@@ -360,9 +400,13 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
             if (a["type"] == "cooler:supply_pressure_low" and sp_min and sp is None) or \
                     (a["type"] == "cooler:return_pressure_low_th" and rp_min and rp is None):
                 continue
+            # 压力还在 hold 确认中：等同"条件仍可能成立"，不要提前消已有告警
+            if a["type"] in pending_pressure:
+                continue
             k = (ip, a["type"])
+            need = press_clear if a["type"] in _PRESSURE_ALERT_TYPES else COOLER_CLEAR_SEC
             first_ok = clean.setdefault(k, now)    # 从第一次读到正常开始计时
-            if now - first_ok >= COOLER_CLEAR_SEC:
+            if now - first_ok >= need:
                 clean.pop(k, None)
                 b.resolve(ip, a["type"])
         b.resolve(ip, "cooler_offline")   # 箱体恢复在线
