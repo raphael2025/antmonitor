@@ -156,35 +156,157 @@ class MonitorService:
             out.append(r)
         return out
 
+    def zero_reboot_candidates(self, records, now=None):
+        """持续零算力重启：首个合格零算力样本起等15分钟，每次尝试后等15分钟，最多4次。"""
+        now = int(time.time()) if now is None else int(now)
+        ctl = self.cfg.get("control") or {}
+        acfg = self.cfg.get("alerts") or {}
+        states = db.zero_reboot_states(self.conn)
+        repair = db.repair_ips(self.conn)
+        active_segments = {a["ip"][:-2] for a in db.active_alerts_by_type(self.conn, "segment_down")
+                           if a["ip"].endswith(".x")}
+        roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
+        clear = set(repair) | (set(states) - roster)
+        for r in records:
+            if r.get("status") == "online" and (r.get("hr_rt") or 0) > 0:
+                clear.add(r["ip"])
+        for ip in clear:
+            states.pop(ip, None)
+        db.clear_zero_reboot_states(self.conn, clear)
+
+        if not ctl.get("enabled") or not ctl.get("reboot_enabled"):
+            return []
+
+        grace = int(acfg.get("zero_grace_sec", 600) or 0)
+        starts = []
+        for r in records:
+            ip = r["ip"]
+            if r.get("status") != "online" or r.get("hr_rt") != 0:
+                continue
+            seg = ".".join(ip.split(".")[:3])
+            if ip in repair or seg in active_segments:
+                continue
+            # Start the 15-minute timer on the first zero sample. Startup grace is
+            # checked separately before sending, so it never delays the timer itself.
+            if ip not in states:
+                starts.append(ip)
+        db.start_zero_reboot_states(self.conn, starts, now)
+        states = db.zero_reboot_states(self.conn)
+
+        # 离线重启仍需避开维修中、整段掉线和重启静默期；这里仅复用其安全候选口径。
+        offline_allowed = {r["ip"] for r in self.offline_reboot_candidates(records)}
+        rebooting = self._alert_state.get("rebooting") or {}
+        rb_grace = int(ctl.get("reboot_grace_sec", 600) or 600)
+        targets = []
+        for r in records:
+            ip = r["ip"]
+            st = states.get(ip)
+            if not st or int(st.get("attempts") or 0) >= 4:
+                continue
+            status = r.get("status")
+            if status == "unknown":
+                continue
+            if status == "online":
+                if r.get("hr_rt") != 0:
+                    continue
+                uptime = r.get("uptime")
+                if grace and isinstance(uptime, (int, float)) and uptime < grace:
+                    continue
+                seg = ".".join(ip.split(".")[:3])
+                if ip in repair or seg in active_segments:
+                    continue
+            elif status == "offline":
+                if ip not in offline_allowed:
+                    continue
+            else:
+                continue
+            if now - int(rebooting.get(ip, 0) or 0) < rb_grace:
+                continue
+            last = st.get("last_attempt_at")
+            due = int(last) + 900 if last else int(st["started_at"]) + 900
+            if now >= due:
+                targets.append((ip, r.get("firmware") or ""))
+        return targets
+
     def _maybe_auto_reboot(self, records):
-        """扫描评估后：若开启掉线自动重启，对候选机限流过滤后异步下发。"""
+        """扫描后评估掉线与持续零算力自动重启；两路共用限流和互斥锁。"""
         import control  # 延迟导入：service 顶层不依赖 control，测扫描可不拉网络层
         ctl = self.cfg.get("control") or {}
+        zero_targets = self.zero_reboot_candidates(records)
         if not ctl.get("enabled") or not ctl.get("reboot_enabled"):
             return
-        cands = self.offline_reboot_candidates(records)
-        if not cands:
-            return
+
+        # 已进入零算力恢复流程的离线机由该流程按15分钟节奏处理，不能再被普通离线规则提前重启。
+        zero_ips = set(db.zero_reboot_states(self.conn))
+        cands = [r for r in self.offline_reboot_candidates(records) if r["ip"] not in zero_ips]
         targets = [(r["ip"], r.get("firmware") or "") for r in cands]
         allowed, skipped = control.filter_reboot_targets(self.conn, targets, self.cfg)
         user = "system@auto-reboot"
         if skipped:
             db.log_commands(self.conn, user, "reboot", skipped)
             log.info("自动重启限流跳过 %d 台", len(skipped))
+        if allowed:
+            if self._reboot_lock.acquire(blocking=False):
+                threading.Thread(target=self._run_auto_reboot, args=(allowed, user),
+                                 daemon=True, name="auto-reboot").start()
+            else:
+                log.info("自动重启跳过: 已有重启任务在执行(%d 台待重启)", len(allowed))
+        if zero_targets:
+            self._maybe_auto_reboot_zero(zero_targets)
+
+    def _maybe_auto_reboot_zero(self, targets):
+        import control
+        allowed, skipped = control.filter_reboot_targets(self.conn, targets, self.cfg)
+        user = "system@auto-zero-reboot"
+        if skipped:
+            db.log_commands(self.conn, user, "reboot", skipped)
+            log.info("零算力自动重启限流跳过 %d 台", len(skipped))
         if not allowed:
             return
         if not self._reboot_lock.acquire(blocking=False):
-            log.info("自动重启跳过: 已有重启任务在执行(%d 台待重启)", len(allowed))
+            log.info("零算力自动重启跳过: 已有重启任务在执行(%d 台待重启)", len(allowed))
             return
-        threading.Thread(target=self._run_auto_reboot, args=(allowed, user),
-                         daemon=True, name="auto-reboot").start()
+        threading.Thread(target=self._run_auto_zero_reboot, args=(allowed, user),
+                         daemon=True, name="auto-zero-reboot").start()
+
+    def _run_auto_zero_reboot(self, targets, user):
+        import control
+        try:
+            def after_group(group, results):
+                # Count each attempted command, including a definite device-side failure;
+                # otherwise a dead miner would be hammered on every 5-minute scan.
+                ips = [r["ip"] for r in results]
+                db.record_zero_reboot_attempts(self.conn, ips, int(time.time()))
+                self.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
+
+            results, err = control.run_batch(targets, "reboot", {}, self.cfg,
+                                             before_group=self.mark_rebooting,
+                                             after_group=after_group)
+            if err:
+                self.unmark_rebooting([ip for ip, _fw in targets])
+                log.warning("零算力自动重启批次错误: %s", err)
+            if results:
+                db.log_commands(self.conn, user, "reboot", results)
+                ok_n = sum(1 for r in results if r["ok"])
+                log.info("零算力自动重启完成: 尝试 %d 台，已下发 %d 台", len(results), ok_n)
+                try:
+                    alerts.push_text(
+                        self.cfg,
+                        f"⚙ {user} 自动重启 {len(results)} 台(成功 {ok_n})")
+                except Exception:  # noqa: BLE001
+                    log.exception("零算力自动重启推送失败")
+        except Exception as e:  # noqa: BLE001
+            log.exception("零算力自动重启异常: %s", e)
+        finally:
+            self._reboot_lock.release()
 
     def _run_auto_reboot(self, targets, user):
         import control
         try:
             ips = [t[0] for t in targets]
-            self.mark_rebooting(ips)
             log.info("自动重启下发 %d 台", len(ips))
+            # run_batch marks each group immediately before sending it. Do not mark
+            # the whole queue here: later groups may wait longer than reboot_grace_sec.
             results, err = control.run_batch(targets, "reboot", {}, self.cfg,
                                              before_group=self.mark_rebooting)
             fail = [r["ip"] for r in results if not r["ok"]] if not err else ips

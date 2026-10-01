@@ -173,6 +173,12 @@ CREATE TABLE IF NOT EXISTS command_log (
     ok     INTEGER,
     msg    TEXT
 );
+CREATE TABLE IF NOT EXISTS zero_reboot_state (
+    ip              TEXT PRIMARY KEY,
+    started_at      INTEGER NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER
+);
 -- 计费聚合：每小时每客户一行。明细快照按 retention_days(默认3天)清理，
 -- 但结算依据必须长期可查(月度对账)，故单独聚合保留 rollup_retention_days(默认400天)。
 CREATE TABLE IF NOT EXISTS worker_hourly (
@@ -715,6 +721,38 @@ def reboot_stats(conn, ips, window_sec=86400):
         for r in rows:
             out[r["ip"]] = {"count": int(r["c"] or 0), "last_ts": int(r["last_ts"] or 0)}
     return out
+
+
+def zero_reboot_states(conn):
+    """持续零算力自动重启状态，跨进程重启保存。"""
+    rows = _r(conn).execute(
+        "SELECT ip,started_at,attempts,last_attempt_at FROM zero_reboot_state").fetchall()
+    return {r["ip"]: dict(r) for r in rows}
+
+
+def start_zero_reboot_states(conn, ips, ts):
+    if not ips:
+        return
+    with _wlock, conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO zero_reboot_state(ip,started_at,attempts,last_attempt_at) "
+            "VALUES(?,?,0,NULL)", [(ip, int(ts)) for ip in ips])
+
+
+def record_zero_reboot_attempts(conn, ips, ts):
+    if not ips:
+        return
+    with _wlock, conn:
+        conn.executemany(
+            "UPDATE zero_reboot_state SET attempts=attempts+1,last_attempt_at=? WHERE ip=?",
+            [(int(ts), ip) for ip in ips])
+
+
+def clear_zero_reboot_states(conn, ips):
+    if not ips:
+        return
+    with _wlock, conn:
+        conn.executemany("DELETE FROM zero_reboot_state WHERE ip=?", [(ip,) for ip in ips])
 
 
 # ---- 计费聚合(rollup) ----

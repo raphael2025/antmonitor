@@ -69,6 +69,10 @@ DEFAULTS = {
         "container_faults_ignore": [],
         "container_supply_pressure_min": 0,
         "container_return_pressure_min": 0,
+        # 自动补水会瞬时拉低回液压：持续偏低满此秒数才报；0=立即报(旧行为)
+        "container_pressure_hold_sec": 60,
+        # 压力恢复后多久消警(秒)；漏液等触点故障仍用 alerts.COOLER_CLEAR_SEC=300
+        "container_pressure_clear_sec": 30,
     },
     "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
     "cloud": {
@@ -80,7 +84,7 @@ DEFAULTS = {
         "enabled": False, "uniplus_password": "", "timeout": 8, "max_batch": 1000,
         "reboot_concurrency": 30, "reboot_delay_sec": 8, "reboot_shuffle": True,
         "reboot_grace_sec": 600,
-        # 掉线自动重启：默认关。开后扫描评估到名册内掉线(非维修/非静默期/非整段掉线)会自动下发。
+        # 自动重启：默认关。掉线按扫描评估；零算力持续15分钟后重启，失败每15分钟重试，最多4次。
         # 手动与自动共用限流：滚动 24h 内每 IP 最多 reboot_max_per_day 次成功重启，
         # 且距上次成功至少 reboot_min_interval_sec 秒。
         "reboot_enabled": False,
@@ -188,6 +192,8 @@ def _validate(cfg):
     clamp("alerts", "segment_down_ratio", 0, 1)
     clamp("alerts", "reject_pct", 0, 100)
     clamp("alerts", "zero_grace_sec", 0, 86400, int)
+    clamp("alerts", "container_pressure_hold_sec", 0, 3600, int)
+    clamp("alerts", "container_pressure_clear_sec", 0, 3600, int)
 
     if cfg["scan"]["host_end"] < cfg["scan"]["host_start"]:
         warn.append("scan.host_end < host_start，已对调")

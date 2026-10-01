@@ -61,6 +61,9 @@ alerts:
   container_faults_ignore: ["supply_liquid_flow_low", "liquid_level_high", "supply_liquid_pressure_high"]
   container_supply_pressure_min: 0.2   # 供液压 < 此值(MPa) → 告警；0=关
   container_return_pressure_min: 0.05  # 回液压 < 此值(MPa) → 告警；0=关
+  # 自动补水时回液压常瞬间掉一下(1 个采样点)：持续偏低满 hold 秒才报，恢复后 clear 秒消警
+  container_pressure_hold_sec: 60
+  container_pressure_clear_sec: 30
 
 telegram:
   enabled: false        # 填好 token/chat_id 并改 true 才推送(推送走独立线程，不阻塞扫描)
@@ -91,7 +94,8 @@ control:
   reboot_concurrency: 30   # 每批同时重启多少台(网页顶部可改，写入 settings.json)
   reboot_delay_sec: 8      # 每批之间间隔秒数(让涌流回落、电压稳定；网页顶部可改)
   reboot_shuffle: true     # 打乱重启顺序(把同变压器的连号机器分散到不同批次，最关键)
-  reboot_enabled: false    # 掉线自动重启总开关(默认关；网页顶部可开)。只挡自动，手动仍可用
+  reboot_enabled: false    # 自动重启总开关(默认关；网页顶部可开)。控制手动命令的开关仍是 enabled
+  # 持续零算力满15分钟后重启；仍未恢复则每15分钟重试，最多4次；正算力恢复后计数清零
   reboot_max_per_day: 4    # 滚动 24h 内每 IP 最多成功重启次数(手动+自动共用；只计 ok=1)
   reboot_min_interval_sec: 900  # 同一 IP 两次成功重启最小间隔(秒)；默认 15 分钟
   # 矿池白名单(防偷算力)：API 换矿池只能换到这些主机名(及其子域名)；扫描时发现矿机上
