@@ -80,6 +80,7 @@ def test_crit_fault_recurring_within_cooldown_alerts_again(conn, cfg, clock):
 
 def test_missing_pressure_reading_keeps_the_pressure_alert(conn, cfg, clock):
     cfg["alerts"]["container_supply_pressure_min"] = 0.2
+    cfg["alerts"]["container_pressure_hold_sec"] = 0   # 本用例测"缺读数≠恢复"，关掉确认窗口
     st = {}
     run(conn, cfg, box(sp=0.1), st, clock)
     assert active(conn) == ["cooler:supply_pressure_low"]
@@ -95,3 +96,40 @@ def test_flaky_leak_contact_does_not_spam(conn, cfg, clock):
     for k in range(360):                                   # 1 小时，每 10 秒一轮
         run(conn, cfg, box(LEAK if k % 5 == 0 else ()), st, clock)
     assert len(db.list_alerts(conn, False, 1000)) == 1
+
+
+def test_brief_return_pressure_dip_during_refill_does_not_alert(conn, cfg, clock):
+    """自动补水瞬间回液压掉一下（常见仅 1 个 10s 采样），不应立刻报 crit。"""
+    cfg["alerts"]["container_return_pressure_min"] = 0.05
+    cfg["alerts"]["container_pressure_hold_sec"] = 60
+    st = {}
+    run(conn, cfg, box(sp=0.3, rp=0.04), st, clock)          # 掉压
+    assert active(conn) == []
+    for _ in range(4):                                         # 再抖几下，仍 < 60s
+        run(conn, cfg, box(sp=0.3, rp=0.03), st, clock)
+    assert active(conn) == []
+    run(conn, cfg, box(sp=0.38, rp=0.15), st, clock)           # 补水结束恢复
+    assert active(conn) == []
+
+
+def test_sustained_low_return_pressure_alerts_after_hold(conn, cfg, clock):
+    cfg["alerts"]["container_return_pressure_min"] = 0.05
+    cfg["alerts"]["container_pressure_hold_sec"] = 60
+    st = {}
+    run(conn, cfg, box(sp=0.3, rp=0.04), st, clock)
+    assert active(conn) == []
+    run(conn, cfg, box(sp=0.3, rp=0.04), st, clock, dt=60)     # 持续满 hold
+    assert active(conn) == ["cooler:return_pressure_low_th"]
+
+
+def test_pressure_alert_clears_faster_than_leak(conn, cfg, clock):
+    cfg["alerts"]["container_return_pressure_min"] = 0.05
+    cfg["alerts"]["container_pressure_hold_sec"] = 0            # 立即报，测清警
+    cfg["alerts"]["container_pressure_clear_sec"] = 30
+    st = {}
+    run(conn, cfg, box(sp=0.3, rp=0.02), st, clock)
+    assert active(conn) == ["cooler:return_pressure_low_th"]
+    run(conn, cfg, box(sp=0.38, rp=0.15), st, clock)           # 恢复开始计时
+    assert active(conn) == ["cooler:return_pressure_low_th"]
+    run(conn, cfg, box(sp=0.38, rp=0.15), st, clock, dt=30)
+    assert active(conn) == []
