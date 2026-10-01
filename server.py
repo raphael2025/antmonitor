@@ -178,12 +178,8 @@ def require(min_role):
             raise HTTPException(status_code=401, detail="未登录")
         if not auth.has_role(sess, min_role):
             raise HTTPException(status_code=403, detail="权限不足")
-        if sess.get("must_change") and min_role != "viewer":   # 弱口令会话：只能看，改完密码才能操作
-            if sess.get("weak_remote"):
-                raise HTTPException(status_code=403, detail=(
-                    "当前账号密码太弱，远程只能查看。请到监控电脑本机打开 "
-                    f"http://127.0.0.1:{CFG['server']['port']} 登录并修改密码"))
-            raise HTTPException(status_code=403, detail="当前密码太弱，请先修改密码(右上角 🔑)")
+        # 弱口令只提示改密，不锁写权限：Ubuntu 服务器/局域网部署时几乎都是远程登录，
+        # 以前把 must_change 当成只读会让首次登录直接没法运维。
         return sess
     return dep
 
@@ -896,11 +892,18 @@ def api_segments(_: dict = Depends(require_viewer)):
 
 @app.get("/api/settings")
 def api_settings_get(sess: dict = Depends(require_viewer)):
+    ctl = CFG.get("control") or {}
     out = {"scan_interval": CFG["schedule"].get("scan_interval", 300),
            "full_interval": CFG["schedule"].get("full_interval", 3600),
            "max_pps": CFG["scan"].get("max_pps", 100),
            "container_interval": CFG["schedule"].get("container_interval", 10),
-           "discovery_workers": CFG["scan"].get("discovery_workers", 300)}
+           "discovery_workers": CFG["scan"].get("discovery_workers", 300),
+           # 重启设置：viewer/ops 只读可见；admin 可 POST 改。开关只挡自动重启。
+           "reboot_enabled": bool(ctl.get("reboot_enabled")),
+           "reboot_concurrency": int(ctl.get("reboot_concurrency", 30) or 30),
+           "reboot_delay_sec": int(ctl.get("reboot_delay_sec", 8) or 8),
+           "reboot_max_per_day": int(ctl.get("reboot_max_per_day", 4) or 4),
+           "reboot_min_interval_sec": int(ctl.get("reboot_min_interval_sec", 900) or 900)}
     if auth.has_role(sess, "admin"):   # 云端上报配置含 token，只给 admin
         c = CFG.get("cloud") or {}
         out["cloud"] = {"enabled": bool(c.get("enabled")), "url": c.get("url") or "",
@@ -943,7 +946,11 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     # 巡检一轮要一个多小时，监控形同停摆却看不出来
     ranges = {"scan_interval": (30, 86400, "巡检间隔(秒)"), "full_interval": (60, 604800, "全网发现间隔(秒)"),
               "container_interval": (5, 3600, "集装箱刷新间隔(秒)"), "max_pps": (1, 500, "ARP限速 max_pps"),
-              "discovery_workers": (1, 500, "发现并发")}
+              "discovery_workers": (1, 500, "发现并发"),
+              "reboot_concurrency": (1, 1000, "重启并发"),
+              "reboot_delay_sec": (0, 3600, "重启批间隔(秒)"),
+              "reboot_max_per_day": (1, 100, "24h重启上限"),
+              "reboot_min_interval_sec": (0, 86400, "重启最小间隔(秒)")}
     for k, (lo, hi, name) in ranges.items():
         if k not in body:
             continue
@@ -955,6 +962,8 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
             return JSONResponse({"ok": False, "error": f"{name} 须在 {lo}~{hi} 之间"},
                                 status_code=400)
         s[k] = v
+    if "reboot_enabled" in body:
+        s["reboot_enabled"] = bool(body["reboot_enabled"])
     effective_scan = s.get("scan_interval", CFG["schedule"].get("scan_interval", 300))
     effective_full = s.get("full_interval", CFG["schedule"].get("full_interval", 3600))
     if effective_full < effective_scan:
@@ -965,8 +974,16 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     SVC.wake()                         # 唤醒调度循环立即按新间隔重排
     out = {"ok": True, **s}
     for k in ranges:                   # 回显实际生效的值
-        if k in s:
-            out[k] = CFG["schedule"].get(k) if k.endswith("interval") else CFG["scan"].get(k)
+        if k not in s:
+            continue
+        if k in ("scan_interval", "full_interval", "container_interval"):
+            out[k] = CFG["schedule"].get(k)
+        elif k in ("max_pps", "discovery_workers"):
+            out[k] = CFG["scan"].get(k)
+        else:   # reboot_*
+            out[k] = CFG["control"].get(k)
+    if "reboot_enabled" in s:
+        out["reboot_enabled"] = bool(CFG["control"].get("reboot_enabled"))
     if "cloud" in s:                   # 上报线程热重启(旧线程自动失效)
         _start_cloud_report()
         out["site_id"] = cloud_report.site_id(CFG)
@@ -1068,7 +1085,7 @@ def _audit_reject(user, action, reason):
 # 批量重启后台进度(分批+延迟会耗时，异步执行，前端轮询)
 CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
                 "success": 0, "failed": 0, "fail_ips": [], "user": ""}
-_cmd_lock = threading.Lock()
+# 重启互斥锁挂在 SVC 上(手动 API 与掉线自动重启共用)，见 MonitorService._reboot_lock
 
 
 def _pools_desc(params):
@@ -1096,7 +1113,7 @@ def _record_command(user, action, params, results):
             log.exception("命令推送失败")
 
 
-def _run_command_bg(targets, action, params, user):
+def _run_command_bg(targets, action, params, user, skipped=None):
     try:
         def prog(done, total):
             CMD_PROGRESS["done"] = done
@@ -1104,18 +1121,22 @@ def _run_command_bg(targets, action, params, user):
         results, _err = control.run_batch(targets, action, params, CFG, progress=prog,
                                           before_group=SVC.mark_rebooting)
         SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
-        _record_command(user, action, params, results)
+        all_results = list(skipped or []) + list(results)
+        _record_command(user, action, params, all_results)
         ok_n = sum(1 for r in results if r["ok"])
+        fail_n = len(results) - ok_n + len(skipped or [])
         CMD_PROGRESS["success"] = ok_n
-        CMD_PROGRESS["failed"] = len(results) - ok_n
-        CMD_PROGRESS["fail_ips"] = [r["ip"] for r in results if not r["ok"]][:100]
-        log.info("批量 %s 完成: 成功 %d / 失败 %d (发起人 %s)",
-                 action, ok_n, len(results) - ok_n, user)
+        CMD_PROGRESS["failed"] = fail_n
+        CMD_PROGRESS["fail_ips"] = (
+            [r["ip"] for r in (skipped or []) if not r["ok"]]
+            + [r["ip"] for r in results if not r["ok"]])[:100]
+        log.info("批量 %s 完成: 成功 %d / 失败 %d (发起人 %s, 限流跳过 %d)",
+                 action, ok_n, fail_n, user, len(skipped or []))
     except Exception as e:  # noqa: BLE001
         log.exception("async command error: %s", e)
     finally:
         CMD_PROGRESS["running"] = False
-        _cmd_lock.release()
+        SVC._reboot_lock.release()
 
 
 @app.get("/api/command/progress")
@@ -1212,27 +1233,37 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
     _, recs = _latest_records()
     fw_map = {r["ip"]: r["firmware"] for r in recs}
     targets = [(ip, fw_map.get(ip, "")) for ip in ips]
-    log.info("命令 %s: %d 台, 发起人 %s", action, len(targets), user)
+    skipped = []
+    if action == "reboot":
+        # 手动与自动共用 15min/24h 限流：超限 IP 跳过并记审计，不打断整批
+        targets, skipped = control.filter_reboot_targets(SVC.conn, targets, CFG)
+        ips = [t[0] for t in targets]
+        if not targets:
+            _record_command(user, action, params, skipped)
+            return {"ok": True, "action": action, "success": 0,
+                    "failed": len(skipped), "results": skipped, "skipped": len(skipped)}
+    log.info("命令 %s: %d 台(限流跳过 %d), 发起人 %s", action, len(targets), len(skipped), user)
     # 重启且开启分批(打乱+延迟会耗时) → 后台异步执行，前端轮询 /api/command/progress
     ctl = CFG.get("control", {})
     rb = int(ctl.get("reboot_concurrency", 0) or 0)
     if action == "reboot" and rb > 0 and len(targets) > rb:
-        if not _cmd_lock.acquire(blocking=False):
+        if not SVC._reboot_lock.acquire(blocking=False):
             _audit_reject(user, action, "已有批量命令在执行")
             return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
                                 status_code=409)
         SVC.mark_rebooting(ips)
         CMD_PROGRESS.update({"running": True, "action": action, "done": 0,
-                             "total": len(targets), "success": 0, "failed": 0,
+                             "total": len(targets) + len(skipped), "success": 0, "failed": 0,
                              "fail_ips": [], "user": user})
-        threading.Thread(target=_run_command_bg, args=(targets, action, params, user),
+        threading.Thread(target=_run_command_bg,
+                         args=(targets, action, params, user, skipped),
                          daemon=True).start()
         return {"ok": True, "async": True, "action": action, "count": len(targets),
-                "batch": rb, "delay": ctl.get("reboot_delay_sec", 0)}
+                "skipped": len(skipped), "batch": rb, "delay": ctl.get("reboot_delay_sec", 0)}
     if action == "reboot":
         # 小批量同步重启也要占锁：否则异步分批跑着时再提交几批 ≤reboot_concurrency 的，
-        # 会和当前批次同时上电，绕过防浪涌分批
-        if not _cmd_lock.acquire(blocking=False):
+        # 会和当前批次同时上电，绕过防浪涌分批；也挡住自动重启撞车
+        if not SVC._reboot_lock.acquire(blocking=False):
             _audit_reject(user, action, "已有批量命令在执行")
             return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
                                 status_code=409)
@@ -1242,9 +1273,16 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
                                              before_group=SVC.mark_rebooting)
             SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
         finally:
-            _cmd_lock.release()
-    else:
-        results, err = control.run_batch(targets, action, params, CFG)
+            SVC._reboot_lock.release()
+        if err:
+            return JSONResponse({"ok": False, "error": err}, status_code=400)
+        all_results = skipped + results
+        _record_command(user, action, params, all_results)
+        ok_n = sum(1 for r in results if r["ok"])
+        return {"ok": True, "action": action, "success": ok_n,
+                "failed": len(all_results) - ok_n, "results": all_results,
+                "skipped": len(skipped)}
+    results, err = control.run_batch(targets, action, params, CFG)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
     _record_command(user, action, params, results)

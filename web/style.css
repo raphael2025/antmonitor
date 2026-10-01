@@ -19,7 +19,14 @@ header {
 }
 h1 { font-size: 18px; margin: 0; }
 h2 { font-size: 14px; margin: 0 0 10px; color: #9aa4af; font-weight: 600; }
-.actions { display: flex; align-items: center; gap: 10px; }
+.actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.reboot-bar { display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px;
+  background: #161b22; border: 1px solid #30363d; border-radius: 8px; font-size: 12px; color: #adbac7; }
+.reboot-bar label { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.reboot-bar input[type=number] { width: 56px; background: #0d1117; border: 1px solid #30363d;
+  color: #e6e6e6; padding: 3px 6px; border-radius: 4px; }
+.reboot-bar input[type=checkbox] { width: auto; margin: 0; }
+body.viewer #rebootBar { display: none !important; }
 button {
   background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px;
   padding: 7px 14px; cursor: pointer; font-size: 13px;
@@ -204,3 +211,18 @@ footer { text-align: center; padding: 20px; }
 .upd-body .upd-note { background: #1c2128; border-left: 3px solid #d29922; padding: 6px 10px; border-radius: 5px; margin-top: 8px; font-size: 13px; }
 #pwdModal .seg-host input { width: 220px; }
 #pwdModal .seg-host { display: flex; justify-content: space-between; align-items: center; }
+
+
+/* ---- i18n / language ---- */
+.lang-select {
+  background: #21262d; color: #c9d1d9; border: 1px solid #30363d;
+  border-radius: 6px; padding: 4px 8px; font-size: 13px; cursor: pointer;
+}
+.lang-row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 10px; font-size: 13px; color: #8b949e; }
+[dir="rtl"] header, [dir="rtl"] .actions, [dir="rtl"] .filters, [dir="rtl"] .cmdbar, [dir="rtl"] .wbar {
+  direction: rtl;
+}
+[dir="rtl"] .actions, [dir="rtl"] .filters, [dir="rtl"] .cmdbar { flex-direction: row-reverse; flex-wrap: wrap; }
+[dir="rtl"] .cards, [dir="rtl"] .grid2 { direction: rtl; }
+[dir="rtl"] .tablewrap { direction: ltr; } /* keep IP columns LTR */
+[dir="rtl"] .lang-row { justify-content: flex-start; }

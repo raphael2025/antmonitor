@@ -173,6 +173,12 @@ CREATE TABLE IF NOT EXISTS command_log (
     ok     INTEGER,
     msg    TEXT
 );
+CREATE TABLE IF NOT EXISTS zero_reboot_state (
+    ip              TEXT PRIMARY KEY,
+    started_at      INTEGER NOT NULL,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at INTEGER
+);
 -- 计费聚合：每小时每客户一行。明细快照按 retention_days(默认3天)清理，
 -- 但结算依据必须长期可查(月度对账)，故单独聚合保留 rollup_retention_days(默认400天)。
 CREATE TABLE IF NOT EXISTS worker_hourly (
@@ -186,6 +192,8 @@ CREATE TABLE IF NOT EXISTS worker_hourly (
     PRIMARY KEY (hour, worker)
 );
 CREATE INDEX IF NOT EXISTS idx_wh_hour ON worker_hourly(hour);
+-- 重启限流按 action+ok+ip+ts 批量查 24h 成功次数；缺索引时勾选上千台会扫全表
+CREATE INDEX IF NOT EXISTS idx_cmd_reboot ON command_log(action, ok, ip, ts);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 """
 
@@ -215,6 +223,8 @@ def init_db(path):
         if cols and "ts" not in cols:
             conn.execute("DROP TABLE container_snaps")
             conn.executescript(SCHEMA)
+        # 旧库补重启限流索引(CREATE INDEX IF NOT EXISTS，重复执行无害)
+        _try(conn, "CREATE INDEX IF NOT EXISTS idx_cmd_reboot ON command_log(action, ok, ip, ts)")
     return conn
 
 
@@ -685,6 +695,64 @@ def list_commands(conn, limit=100):
     rows = _r(conn).execute("SELECT * FROM command_log ORDER BY id DESC LIMIT ?",
                             (limit,)).fetchall()
     return [dict(r) for r in rows]
+
+
+def reboot_stats(conn, ips, window_sec=86400):
+    """每 IP 在滚动 window_sec 内成功重启次数与最近一次成功时间。
+
+    只计 action='reboot' AND ok=1(手动+自动共用限流口径)。返回 {ip: {count, last_ts}}，
+    未出现过的 IP 也有条目(count=0, last_ts=0)，方便调用方直接取值。
+    """
+    if not ips:
+        return {}
+    now = int(time.time())
+    cut = now - int(window_sec or 86400)
+    out = {ip: {"count": 0, "last_ts": 0} for ip in ips}
+    # SQLite 变量上限约 999；分块避免大批量勾选时炸参数
+    chunk = 400
+    rc = _r(conn)
+    for i in range(0, len(ips), chunk):
+        part = list(ips[i:i + chunk])
+        qm = ",".join("?" * len(part))
+        rows = rc.execute(
+            f"SELECT ip, COUNT(*) AS c, MAX(ts) AS last_ts FROM command_log "
+            f"WHERE action='reboot' AND ok=1 AND ts>? AND ip IN ({qm}) GROUP BY ip",
+            (cut, *part)).fetchall()
+        for r in rows:
+            out[r["ip"]] = {"count": int(r["c"] or 0), "last_ts": int(r["last_ts"] or 0)}
+    return out
+
+
+def zero_reboot_states(conn):
+    """持续零算力自动重启状态，跨进程重启保存。"""
+    rows = _r(conn).execute(
+        "SELECT ip,started_at,attempts,last_attempt_at FROM zero_reboot_state").fetchall()
+    return {r["ip"]: dict(r) for r in rows}
+
+
+def start_zero_reboot_states(conn, ips, ts):
+    if not ips:
+        return
+    with _wlock, conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO zero_reboot_state(ip,started_at,attempts,last_attempt_at) "
+            "VALUES(?,?,0,NULL)", [(ip, int(ts)) for ip in ips])
+
+
+def record_zero_reboot_attempts(conn, ips, ts):
+    if not ips:
+        return
+    with _wlock, conn:
+        conn.executemany(
+            "UPDATE zero_reboot_state SET attempts=attempts+1,last_attempt_at=? WHERE ip=?",
+            [(int(ts), ip) for ip in ips])
+
+
+def clear_zero_reboot_states(conn, ips):
+    if not ips:
+        return
+    with _wlock, conn:
+        conn.executemany("DELETE FROM zero_reboot_state WHERE ip=?", [(ip,) for ip in ips])
 
 
 # ---- 计费聚合(rollup) ----

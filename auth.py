@@ -196,10 +196,10 @@ def login_ex(cfg, username, password, src=None, local=None):
             if len(good) < 50:
                 good.add(src)
     # 看"实际输入的口令"弱不弱，而不是存储格式：admin888/123456 这类局域网里谁都猜得到。
-    # 弱口令：本机登录后强制改；远程照常能登录、能看监控(不把远程运维的站点整个锁在外面)，
-    # 但只能看、也不能在远程改密码——猜中 admin888 的人不能借改密码把账号抢走
+    # 弱口令只打标给前端提示改密，不再锁写权限/禁止远程改密——服务器部署时首次登录
+    # 几乎都是局域网 IP，以前的"远程只读"会让人没法运维。
     must_change = bool(password_problem(uname, password))
-    weak_remote = must_change and not local
+    weak_remote = must_change and not local   # 仅作提示文案区分，不再剥夺权限
     token = secrets.token_hex(24)
     with _slock:
         # 顺手清理已过锁定期的陈旧限流项 + 过期会话，防内存无限增长
@@ -223,10 +223,6 @@ def change_password(cfg, username, old, new, keep_token=None, path=None):
     """改自己的密码：校验旧密码 → 写哈希进 config.yaml(原地、保留注释) → 内存立即生效 →
     踢掉该用户其它会话。返回 "" 或原因。"""
     import appconfig   # 延迟导入：auth 被很多地方 import，别把配置写回逻辑拖进来
-    with _slock:
-        sess = _sessions.get(keep_token) if keep_token else None
-    if sess and sess.get("weak_remote"):
-        return "这个账号的密码太弱，只能在监控电脑本机(打开 http://127.0.0.1:端口)登录后修改"
     u = _users(cfg).get(username)
     if not u or not _verify_password(u.get("password", ""), old):
         if keep_token:

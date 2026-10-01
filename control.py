@@ -23,6 +23,42 @@ import miner_core
 ACTIONS = {"reboot", "locate", "set_pools"}
 
 
+def filter_reboot_targets(conn, targets, cfg):
+    """按 control.reboot_max_per_day / reboot_min_interval_sec 过滤待重启目标。
+
+    targets: [(ip, firmware), ...]。返回 (allowed_targets, skipped_results)。
+    skipped_results 形如 {ip, ok:False, msg:...}，调用方应写入 command_log；
+    不抛错、不打断整批——超限的跳过，其余照常下发。手动与自动共用。
+    """
+    import db  # 延迟导入：避免 control↔db 顶层环依赖(测试里常单独 mock)
+    ctl = cfg.get("control") or {}
+    max_day = int(ctl.get("reboot_max_per_day", 4) or 4)
+    min_iv = int(ctl.get("reboot_min_interval_sec", 900) or 900)
+    ips = [t[0] for t in targets]
+    stats = db.reboot_stats(conn, ips, window_sec=86400)
+    now = int(time.time())
+    allowed, skipped = [], []
+    for ip, fw in targets:
+        st = stats.get(ip) or {"count": 0, "last_ts": 0}
+        cnt = int(st.get("count") or 0)
+        last = int(st.get("last_ts") or 0)
+        if cnt >= max_day:
+            skipped.append({
+                "ip": ip, "ok": False,
+                "msg": f"24h内已成功重启{cnt}次(上限{max_day})，跳过",
+            })
+            continue
+        if last and min_iv > 0 and now - last < min_iv:
+            left = min_iv - (now - last)
+            skipped.append({
+                "ip": ip, "ok": False,
+                "msg": f"距上次成功重启不足{max(1, min_iv // 60)}分钟(还需{left}s)，跳过",
+            })
+            continue
+        allowed.append((ip, fw))
+    return allowed, skipped
+
+
 # 只认严格的 stratum+tcp|ssl://host[:port][/]：host 只含字母数字.-，端口 1~5 位数字。
 # 不能"从一个怪地址里猜主机名"：cgminer/bmminer 按第一个 ':' 截主机、端口缓冲只有 5 位，
 # stratum+tcp://evil.com:03333@f2pool.com 在我们这边若按 '@' 取主机会看成 f2pool.com，
@@ -157,20 +193,27 @@ def normalize_ips(ips, max_batch, cfg=None):
     return out, ""
 
 
-def _sent_then_dropped(e):
-    """带认证的请求已送达、矿机在回响应前断开或不再回应——原厂 reboot.cgi 的常见表现
-    (系统已开始重启，web 服务先没了)。连不上(拒绝连接/连接超时)不算。
-    Digest 第一跳不带凭据，矿机不可能执行；web 卡死的机器正好会在这一跳超时，
-    必须算失败，否则"没重启"会被显示成成功还进了告警静默期。"""
+def _request_sent_then_dropped(e):
+    """Treat a response-side disconnect as a command being sent, but not connect failures.
+
+    ReadTimeout/ChunkedEncodingError happen after the HTTP request was submitted. A
+    urllib3 ProtocolError likewise means an established connection was dropped; a
+    ConnectTimeout is explicitly excluded because the device did not receive a request.
+    """
     if isinstance(e, requests.ConnectTimeout):
-        return False
-    req = getattr(e, "request", None)
-    if req is None or "Authorization" not in (req.headers or {}):
         return False
     if isinstance(e, (requests.ReadTimeout, requests.exceptions.ChunkedEncodingError)):
         return True
     return isinstance(e, requests.ConnectionError) and bool(e.args) \
         and isinstance(e.args[0], ProtocolError)
+
+
+def _sent_then_dropped(e):
+    """原厂 Digest 重启只有带认证的请求才可能被矿机执行；第一跳不算已下发。"""
+    req = getattr(e, "request", None)
+    if req is None or "Authorization" not in (req.headers or {}):
+        return False
+    return _request_sent_then_dropped(e)
 
 
 def _stock_reboot(s, ip, passwords, timeout):
@@ -257,7 +300,12 @@ def _uniplus(ip, action, params, uni_pw, timeout):
         if uni_pw:
             s.post(f"{base}/unlock", json={"pw": uni_pw}, timeout=timeout)
         if action == "reboot":
-            r = s.post(f"{base}/system/reboot", timeout=timeout)
+            try:
+                r = s.post(f"{base}/system/reboot", timeout=timeout)
+            except requests.RequestException as e:
+                if _request_sent_then_dropped(e):
+                    return True, "已下发(矿机未回响应即断开，通常表示已开始重启)"
+                return False, f"连不上矿机: {e}"
             if r.status_code == 401:
                 return False, "需要 uniplus 解锁密码"
             return r.status_code in (200, 204), "reboot ok"
@@ -314,11 +362,11 @@ def _run_group(group, action, params, cfg):
     return out
 
 
-def run_batch(targets, action, params, cfg, progress=None, before_group=None):
+def run_batch(targets, action, params, cfg, progress=None, before_group=None, after_group=None):
     """targets: [(ip, firmware), ...]；并发执行，返回结果列表。
     reboot 时按 control.reboot_* 打乱+分批+延迟，避免同变压器机器同时重启的浪涌跳闸。
     progress(done, total) 可选回调(后台异步执行时上报进度)。
-    before_group(ips) 可选回调：每组真正下发前调用(重启静默期按实际下发时间起算)。"""
+    before_group(ips) 在每组下发前调用；after_group(targets, results) 在一组完成后调用。"""
     if action not in ACTIONS:
         return [], "不支持的命令"
     ctl = cfg.get("control", {})
@@ -334,7 +382,10 @@ def run_batch(targets, action, params, cfg, progress=None, before_group=None):
         for gi, grp in enumerate(groups):
             if before_group:
                 before_group([ip for ip, _fw in grp])
-            out.extend(_run_group(grp, action, params, cfg))
+            group_results = _run_group(grp, action, params, cfg)
+            out.extend(group_results)
+            if after_group:
+                after_group(grp, group_results)
             if progress:
                 progress(len(out), len(targets))
             if delay and gi < len(groups) - 1:
@@ -343,6 +394,8 @@ def run_batch(targets, action, params, cfg, progress=None, before_group=None):
         if before_group:
             before_group([ip for ip, _fw in targets])
         out = _run_group(targets, action, params, cfg)
+        if after_group:
+            after_group(targets, out)
         if progress:
             progress(len(out), len(targets))
     out.sort(key=lambda r: tuple(int(x) for x in r["ip"].split(".")) if r["ip"].count(".") == 3 else (0,))

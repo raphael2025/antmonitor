@@ -1,11 +1,11 @@
 # 开发文档（Development Guide）
 
-矿场监控系统（Miner Monitor）——给托管/包机场地用的矿机+水冷集装箱监控平台。
-本文面向**维护/二次开发**：架构、数据模型、控制流、线程模型、配置、约定与坑。
+**AntMonitor** — 场地本地监控（私有仓库）。本文面向维护/二次开发：架构、数据模型、线程、配置与约定。
 
-- 用户/功能说明见 [../README.md](../README.md)
-- 矿机/设备接口（本系统调设备）见 [INTERNAL_API.md](INTERNAL_API.md)
-- 外部 Agent 取数接口（别人调本系统）见 [EXTERNAL_API.md](EXTERNAL_API.md)
+- 用户入门（多语言）：[guide/](guide/README.md)
+- 对外 Agent 取数：[EXTERNAL_API.md](EXTERNAL_API.md)
+- 设备固件侧协议：**不公开**，见 [INTERNAL_API.md](INTERNAL_API.md) 说明
+- 运维安全：[SECURITY.md](SECURITY.md)
 
 ---
 
@@ -172,7 +172,7 @@
 |---|---|---|
 | `config.yaml` | 覆盖项（缺的用 `appconfig.DEFAULTS` 补齐并校验） | 手工，启动加载 |
 | `segments.json` | 扫描网段 + 主机号范围 | 网页「⚙网段」(admin)，即时生效 |
-| 运行时 settings（`appconfig.load_settings`） | `scan_interval`/`full_interval`/`max_pps`/`container_interval`/`discovery_workers`/`cloud` | 网页「设置」，`apply_settings` 原地改 CFG + `SVC.wake()` 即时生效 |
+| 运行时 settings（`appconfig.load_settings`） | `scan_interval`/`full_interval`/`max_pps`/`container_interval`/`discovery_workers`/`reboot_enabled`/`reboot_concurrency`/`reboot_delay_sec`/`reboot_max_per_day`/`reboot_min_interval_sec`/`cloud` | 网页「设置」+ 顶部重启条，`apply_settings` 原地改 CFG + `SVC.wake()` 即时生效 |
 
 装载入口是 `appconfig.load_config()`：**深合并默认值 + 校验收敛**。
 所以代码里可以放心写 `CFG["db"]["retention_days"]`——配置少一整段也不会让后台线程
