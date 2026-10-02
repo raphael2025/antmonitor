@@ -118,9 +118,6 @@ class MonitorService:
         for r in records:
             if r.get("status") == "online" and (r.get("hr_rt") or 0) > 0:
                 clear.add(r["ip"])
-            elif r.get("status") == "offline":
-                # 掉线表示矿机不可达，不是零算力故障；下次上线后重新累计零算力时长。
-                clear.add(r["ip"])
         for ip in clear:
             states.pop(ip, None)
         db.clear_zero_reboot_states(self.conn, clear)
