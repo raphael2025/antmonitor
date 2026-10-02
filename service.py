@@ -115,9 +115,32 @@ class MonitorService:
                            if a["ip"].endswith(".x")}
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         clear = set(repair) | (set(states) - roster)
+        rebooting = self._alert_state.get("rebooting") or {}
+        rb_grace = int(ctl.get("reboot_grace_sec", 600) or 600)
+        # 旧版可能在离线期间保留了零算力计时。未下发过自动重启的机器，
+        # 若计时开始后曾确认离线，重新上线时必须从新的零算力样本重新计时。
+        for ip, state in states.items():
+            if int(state.get("attempts") or 0) > 0:
+                continue  # 已尝试的自动重启要保留次数，避免重启循环绕过上限。
+            marked_at = int(rebooting.get(ip, 0) or 0)
+            if now - marked_at < rb_grace:
+                continue  # 手动重启静默期内的离线是预期行为。
+            interrupted = self.conn.execute(
+                "SELECT 1 FROM snapshots s JOIN scans sc USING(scan_id) "
+                "WHERE s.ip=? AND s.status='offline' AND sc.ts>=? LIMIT 1",
+                (ip, int(state["started_at"])),
+            ).fetchone()
+            if interrupted:
+                clear.add(ip)
         for r in records:
             if r.get("status") == "online" and (r.get("hr_rt") or 0) > 0:
                 clear.add(r["ip"])
+            elif r.get("status") == "offline":
+                state = states.get(r["ip"])
+                marked_at = int(rebooting.get(r["ip"], 0) or 0)
+                if (state and int(state.get("attempts") or 0) == 0
+                        and now - marked_at >= rb_grace):
+                    clear.add(r["ip"])
         for ip in clear:
             states.pop(ip, None)
         db.clear_zero_reboot_states(self.conn, clear)
@@ -141,8 +164,6 @@ class MonitorService:
         db.start_zero_reboot_states(self.conn, starts, now)
         states = db.zero_reboot_states(self.conn)
 
-        rebooting = self._alert_state.get("rebooting") or {}
-        rb_grace = int(ctl.get("reboot_grace_sec", 600) or 600)
         targets = []
         for r in records:
             ip = r["ip"]

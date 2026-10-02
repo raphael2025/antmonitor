@@ -101,14 +101,16 @@ def test_auto_reboot_only_targets_online_zero_hashrate(conn, cfg):
     ip = "10.0.3.2"
     db.upsert_known_miners(conn, [rec(ip)], now)
 
-    # 在线且明确读到 0 算力才启动计时；掉线期间不会进入自动重启候选。
+    # 在线且明确读到 0 算力才启动计时；掉线期间清掉未尝试的计时且不重启。
     assert svc.zero_reboot_candidates([rec(ip, status="online", hr_rt=0)], now=now) == []
     assert svc.zero_reboot_candidates([rec(ip, status="offline")], now=now + 900) == []
-    assert ip in db.zero_reboot_states(conn)
+    assert ip not in db.zero_reboot_states(conn)
 
-    # 恢复在线仍为零算力，达到 15 分钟才进入候选。
+    # 恢复在线零算力后重新累计 15 分钟才进入候选。
+    assert svc.zero_reboot_candidates(
+        [rec(ip, status="online", hr_rt=0)], now=now + 900) == []
     candidates = svc.zero_reboot_candidates(
-        [rec(ip, status="online", hr_rt=0)], now=now + 900)
+        [rec(ip, status="online", hr_rt=0)], now=now + 1800)
     assert [target[0] for target in candidates] == [ip]
 
 
