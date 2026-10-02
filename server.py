@@ -1085,7 +1085,7 @@ def _audit_reject(user, action, reason):
 # 批量重启后台进度(分批+延迟会耗时，异步执行，前端轮询)
 CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
                 "success": 0, "failed": 0, "fail_ips": [], "user": ""}
-# 重启互斥锁挂在 SVC 上(手动 API 与掉线自动重启共用)，见 MonitorService._reboot_lock
+# 重启互斥锁挂在 SVC 上(手动 API 与零算力自动重启共用)，见 MonitorService._reboot_lock
 
 
 def _pools_desc(params):

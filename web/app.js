@@ -918,7 +918,7 @@ $("segClose").onclick = $("segCancel").onclick = () => {
 $("segSave").onclick = () => saveSeg(false);
 $("segSaveScan").onclick = () => saveSeg(true);
 
-/* ---------------- 顶部：掉线自动重启设置 ---------------- */
+/* ---------------- 顶部：零算力自动重启设置 ---------------- */
 async function loadRebootSettings() {
   if (!$("rebootBar") || myRole === "viewer") return;
   try {

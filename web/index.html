@@ -52,8 +52,8 @@
       <span id="lastScan" class="muted" data-i18n="header.last_scan_none">尚未扫描</span>
       <span id="userBadge" class="badge" data-i18n-title="header.role_title" title="当前角色"></span>
       <span id="rebootBar" class="reboot-bar" data-i18n-title="header.reboot_bar_title"
-            title="掉线自动重启：关则只手动；开则掉线后自动下发(受24h≤4次、间隔≥15分钟限流)">
-        <label class="reboot-tog"><input type="checkbox" id="rebootEnabled"> <span data-i18n="header.auto_reboot">掉线自动重启</span></label>
+            title="零算力自动重启：只处理在线且明确零算力的机器；掉线只告警">
+        <label class="reboot-tog"><input type="checkbox" id="rebootEnabled"> <span data-i18n="header.auto_reboot">零算力自动重启</span></label>
         <label><span data-i18n="header.delay_s">间隔s</span> <input id="rebootDelay" type="number" min="0" max="3600"></label>
         <label><span data-i18n="header.conc">并发</span> <input id="rebootConc" type="number" min="1" max="1000"></label>
         <button id="btnRebootSave" class="mini-btn" data-i18n="header.save" data-i18n-title="header.save_reboot_title" title="保存重启设置(admin)">保存</button>

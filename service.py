@@ -36,7 +36,7 @@ class MonitorService:
         # 集装箱单独一把锁：只保护"写集装箱 + 评估冷却告警"这一小段(全网扫描和 10 秒刷新
         # 都会做，并发会重复报)。以前共用 _scan_lock，一轮巡检一两分钟里漏液数据都不刷新
         self._container_lock = threading.Lock()
-        # 手动 API 与掉线自动重启共用：防浪涌分批期间禁止再开一批同时上电
+        # 手动 API 与零算力自动重启共用：防浪涌分批期间禁止再开一批同时上电
         self._reboot_lock = threading.Lock()
         # 世代号：每次强制恢复 +1。被判死的旧扫描线程杀不掉，但它醒来后会发现自己
         # 的世代已作废 → 丢弃结果不落库，避免把十几分钟前的探测当成"最新快照"
@@ -104,58 +104,6 @@ class MonitorService:
         for ip in ips:
             rb.pop(ip, None)
 
-    def offline_reboot_candidates(self, records):
-        """本轮可自动重启的掉线机：名册内、非维修、非重启静默期、非整段掉线。
-
-        口径与 alerts.evaluate 的单机 offline 告警一致，避免交换机故障时狂重启。
-        返回记录列表(含 firmware)，调用方再过限流。
-        """
-        ctl = self.cfg.get("control") or {}
-        acfg = self.cfg.get("alerts") or {}
-        now = int(time.time())
-        rb_grace = int(ctl.get("reboot_grace_sec", 600) or 600)
-        rebooting = self._alert_state.get("rebooting") or {}
-        rb_quiet = {ip for ip, t in rebooting.items() if now - t < rb_grace}
-        repair = db.repair_ips(self.conn)
-        roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
-        seg_ratio = float(acfg.get("segment_down_ratio", 0.6) or 0.6)
-        seg_min = int(acfg.get("segment_down_min", 5) or 5)
-        seg_total, seg_off = {}, {}
-        for r in records:
-            ip = r["ip"]
-            if ip not in roster or ip in rb_quiet or ip in repair:
-                continue
-            if r.get("status") == "unknown":
-                continue
-            seg = ".".join(ip.split(".")[:3])
-            seg_total[seg] = seg_total.get(seg, 0) + 1
-            if r.get("status") == "offline":
-                seg_off[seg] = seg_off.get(seg, 0) + 1
-        active_segs = {a["ip"][:-2] for a in db.active_alerts_by_type(self.conn, "segment_down")
-                       if a["ip"].endswith(".x")}
-        clear_ratio = seg_ratio * 0.75
-        down_segments = set()
-        for seg, off in seg_off.items():
-            tot = seg_total.get(seg, 0)
-            if seg in active_segs:
-                is_down = tot > 0 and off / tot >= clear_ratio
-            else:
-                is_down = off >= seg_min and tot > 0 and off / tot >= seg_ratio
-            if is_down:
-                down_segments.add(seg)
-        out = []
-        for r in records:
-            ip = r["ip"]
-            if r.get("status") != "offline":
-                continue
-            if ip not in roster or ip in repair or ip in rb_quiet:
-                continue
-            seg = ".".join(ip.split(".")[:3])
-            if seg in down_segments:
-                continue
-            out.append(r)
-        return out
-
     def zero_reboot_candidates(self, records, now=None):
         """持续零算力重启：首个合格零算力样本起等15分钟，每次尝试后等15分钟，最多4次。"""
         now = int(time.time()) if now is None else int(now)
@@ -169,6 +117,9 @@ class MonitorService:
         clear = set(repair) | (set(states) - roster)
         for r in records:
             if r.get("status") == "online" and (r.get("hr_rt") or 0) > 0:
+                clear.add(r["ip"])
+            elif r.get("status") == "offline":
+                # 掉线表示矿机不可达，不是零算力故障；下次上线后重新累计零算力时长。
                 clear.add(r["ip"])
         for ip in clear:
             states.pop(ip, None)
@@ -193,8 +144,6 @@ class MonitorService:
         db.start_zero_reboot_states(self.conn, starts, now)
         states = db.zero_reboot_states(self.conn)
 
-        # 离线重启仍需避开维修中、整段掉线和重启静默期；这里仅复用其安全候选口径。
-        offline_allowed = {r["ip"] for r in self.offline_reboot_candidates(records)}
         rebooting = self._alert_state.get("rebooting") or {}
         rb_grace = int(ctl.get("reboot_grace_sec", 600) or 600)
         targets = []
@@ -215,10 +164,8 @@ class MonitorService:
                 seg = ".".join(ip.split(".")[:3])
                 if ip in repair or seg in active_segments:
                     continue
-            elif status == "offline":
-                if ip not in offline_allowed:
-                    continue
             else:
+                # 自动重启只处理在线且明确读到 0 算力的机器。
                 continue
             if now - int(rebooting.get(ip, 0) or 0) < rb_grace:
                 continue
@@ -229,28 +176,11 @@ class MonitorService:
         return targets
 
     def _maybe_auto_reboot(self, records):
-        """扫描后评估掉线与持续零算力自动重启；两路共用限流和互斥锁。"""
-        import control  # 延迟导入：service 顶层不依赖 control，测扫描可不拉网络层
+        """扫描后只对持续零算力机器评估自动重启。"""
         ctl = self.cfg.get("control") or {}
         zero_targets = self.zero_reboot_candidates(records)
         if not ctl.get("enabled") or not ctl.get("reboot_enabled"):
             return
-
-        # 已进入零算力恢复流程的离线机由该流程按15分钟节奏处理，不能再被普通离线规则提前重启。
-        zero_ips = set(db.zero_reboot_states(self.conn))
-        cands = [r for r in self.offline_reboot_candidates(records) if r["ip"] not in zero_ips]
-        targets = [(r["ip"], r.get("firmware") or "") for r in cands]
-        allowed, skipped = control.filter_reboot_targets(self.conn, targets, self.cfg)
-        user = "system@auto-reboot"
-        if skipped:
-            db.log_commands(self.conn, user, "reboot", skipped)
-            log.info("自动重启限流跳过 %d 台", len(skipped))
-        if allowed:
-            if self._reboot_lock.acquire(blocking=False):
-                threading.Thread(target=self._run_auto_reboot, args=(allowed, user),
-                                 daemon=True, name="auto-reboot").start()
-            else:
-                log.info("自动重启跳过: 已有重启任务在执行(%d 台待重启)", len(allowed))
         if zero_targets:
             self._maybe_auto_reboot_zero(zero_targets)
 
@@ -297,34 +227,6 @@ class MonitorService:
                     log.exception("零算力自动重启推送失败")
         except Exception as e:  # noqa: BLE001
             log.exception("零算力自动重启异常: %s", e)
-        finally:
-            self._reboot_lock.release()
-
-    def _run_auto_reboot(self, targets, user):
-        import control
-        try:
-            ips = [t[0] for t in targets]
-            log.info("自动重启下发 %d 台", len(ips))
-            # run_batch marks each group immediately before sending it. Do not mark
-            # the whole queue here: later groups may wait longer than reboot_grace_sec.
-            results, err = control.run_batch(targets, "reboot", {}, self.cfg,
-                                             before_group=self.mark_rebooting)
-            fail = [r["ip"] for r in results if not r["ok"]] if not err else ips
-            self.unmark_rebooting(fail)
-            if results:
-                db.log_commands(self.conn, user, "reboot", results)
-                ok_n = sum(1 for r in results if r["ok"])
-                log.info("自动重启完成: 成功 %d / 失败 %d", ok_n, len(results) - ok_n)
-                try:
-                    alerts.push_text(
-                        self.cfg,
-                        f"⚙ {user} 自动重启 {len(results)} 台(成功 {ok_n})")
-                except Exception:  # noqa: BLE001
-                    log.exception("自动重启推送失败")
-            if err:
-                log.warning("自动重启批次错误: %s", err)
-        except Exception as e:  # noqa: BLE001
-            log.exception("自动重启异常: %s", e)
         finally:
             self._reboot_lock.release()
 
@@ -622,7 +524,7 @@ class MonitorService:
                                         state=self._alert_state)
             except Exception as e:  # noqa: BLE001
                 log.exception("alerts.evaluate error: %s", e)
-            try:   # 与告警同轮：掉线自动重启(开关关则 no-op；限流后异步下发)
+            try:   # 与告警同轮：持续零算力自动重启(开关关则 no-op；限流后异步下发)
                 self._maybe_auto_reboot(kept)
             except Exception as e:  # noqa: BLE001
                 log.exception("auto-reboot error: %s", e)

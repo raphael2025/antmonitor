@@ -409,7 +409,7 @@ def _atomic_json(path, data):
 
 _INT_SETTINGS = ("scan_interval", "full_interval", "container_interval",
                  "max_pps", "discovery_workers")
-# 网页可热改的 control 整数项(掉线自动重启相关)；与 _INT_SETTINGS 分开，避免误写到 scan/schedule
+# 网页可热改的 control 整数项(自动重启相关)；与 _INT_SETTINGS 分开，避免误写到 scan/schedule
 _CONTROL_INT_SETTINGS = ("reboot_concurrency", "reboot_delay_sec",
                          "reboot_max_per_day", "reboot_min_interval_sec")
 
