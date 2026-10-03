@@ -28,9 +28,52 @@ function shortWorkerName(name) {
 }
 
 function alertDetail(x) {
-  // Alert details are persisted in Chinese. Translate zero alerts, the UI
-  // symptom reported by the operator, while retaining other diagnostic text.
+  // Alert details are stored as Chinese prose. Rebuild them from the alert type
+  // and the diagnostic values so active and historical rows use the UI locale.
+  const d = String(x.detail || "");
+  const value = (pattern) => d.match(pattern);
+  if (x.type === "offline") {
+    const m = value(/重启后\s*(\d+)\s*分钟/);
+    return m ? t("alert.offline_reboot", { minutes: m[1] }) : t("alert.offline");
+  }
   if (x.type === "zero") return t("alert.zero");
+  if (x.type === "reject") {
+    const m = value(/拒绝率\s*([\d.]+)%\s*≥\s*([\d.]+)%/);
+    return m ? t("alert.reject", { rate: m[1], threshold: m[2] }) : t("alert.reject_short");
+  }
+  if (x.type === "low_hashrate") {
+    const m = value(/算力\s*([\d.]+)\s*TH.*?中位数\s*([\d.]+)\s*TH.*?(\d+)%/);
+    return m ? t("alert.low_hashrate", { rate: m[1], median: m[2], ratio: m[3] })
+      : t("alert.low_hashrate_short");
+  }
+  if (x.type === "overheat") {
+    const m = value(/芯片温\s*([\d.]+)℃\s*≥\s*([\d.]+)℃/);
+    return m ? t("alert.overheat", { temp: m[1], threshold: m[2] }) : t("alert.overheat_short");
+  }
+  if (x.type === "pool_hijack") {
+    const pools = d.match(/偷算力\):\s*(.*)$/);
+    return pools ? t("alert.pool_hijack", { pools: pools[1] }) : t("alert.pool_hijack_short");
+  }
+  if (x.type === "segment_down") {
+    const m = value(/大面积掉线\s*(\d+)\/(\d+)/);
+    return m ? t("alert.segment_down", { offline: m[1], total: m[2] })
+      : t("alert.segment_down_short");
+  }
+  if (x.type === "stalled") {
+    const m = value(/已\s*(\d+)\s*分钟/);
+    return m ? t("alert.stalled", { minutes: m[1] }) : t("alert.stalled_short");
+  }
+  if (x.type === "cooler_offline") return t("alert.cooler_offline");
+  if (x.type && x.type.startsWith("cooler:")) {
+    const flag = x.type.slice("cooler:".length);
+    const fault = flag.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    if (["supply_pressure_low", "return_pressure_low_th", "return_liquid_pressure_low"].includes(flag)) {
+      const m = value(/([\d.]+)\s*<\s*([\d.]+)\s*MPa/i);
+      return m ? t("alert.cooler_pressure", { fault, value: m[1], threshold: m[2] })
+        : t("alert.cooler_pressure_short", { fault });
+    }
+    return t("alert.cooler_fault", { fault });
+  }
   return x.detail || "";
 }
 
