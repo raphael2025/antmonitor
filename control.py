@@ -323,10 +323,12 @@ def run_one(ip, firmware, action, params, cfg):
     ctl = cfg.get("control", {})
     if not ctl.get("enabled", False):
         return {"ip": ip, "ok": False, "msg": "控制功能未启用"}
-    if action == "set_pools":   # 纵深防御：无论谁调到这里，白名单外的矿池一律不下发
+    if action == "set_pools":   # 纵深防御：无论谁调到这里，白名单外/格式异常的矿池一律不下发
         pools = (params or {}).get("pools") or []
-        if not pools or not all(pool_allowed(p.get("url"), ctl.get("pool_allowlist"))
-                                for p in pools if isinstance(p, dict)):
+        if (not isinstance(pools, list) or not pools
+                or not all(isinstance(p, dict)
+                           and pool_allowed(p.get("url"), ctl.get("pool_allowlist"))
+                           for p in pools)):
             return {"ip": ip, "ok": False, "msg": "矿池不在白名单，拒绝下发"}
     timeout = ctl.get("timeout", 8)
     passwords = [tuple(p) for p in cfg["scan"].get("passwords", [["root", "root"]])]

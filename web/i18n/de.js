@@ -187,6 +187,8 @@ I18N.register('de', {
   "toast.remove_fail": "Entfernen fehlgeschlagen: {msg}",
   "toast.removed": "Entfernt {ip}",
   "alert.more": "…zeige {shown} von {total}",
+  "alert.zero": "Null-Hashrate",
+  "alert.worker": "Worker",
   "alert.remove_title": "Aus Roster entfernen",
   "alert.remove_btn": "Entfernen",
   "voice.pool_hijack": "Pool manipuliert auf {n} — prüfen",

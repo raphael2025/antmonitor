@@ -187,6 +187,8 @@ I18N.register('es', {
   "toast.remove_fail": "Error al quitar: {msg}",
   "toast.removed": "Quitado {ip}",
   "alert.more": "…mostrando {shown} de {total}",
+  "alert.zero": "Hashrate cero",
+  "alert.worker": "Miner",
   "alert.remove_title": "Quitar del roster",
   "alert.remove_btn": "Quitar",
   "voice.pool_hijack": "Pool alterado en {n} — revisar",

@@ -187,6 +187,8 @@ I18N.register('zh', {
   "toast.remove_fail": "下架失败：{msg}",
   "toast.removed": "已下架 {ip}",
   "alert.more": "…仅显示前 {shown} 条，共 {total} 条活跃告警",
+  "alert.zero": "零算力",
+  "alert.worker": "矿工名",
   "alert.remove_title": "从名册下架移除该机器",
   "alert.remove_btn": "下架",
   "voice.pool_hijack": "矿池被篡改 {n} 台，请立即核查",

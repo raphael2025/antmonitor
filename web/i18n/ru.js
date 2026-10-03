@@ -187,6 +187,8 @@ I18N.register('ru', {
   "toast.remove_fail": "Не снято: {msg}",
   "toast.removed": "Снят {ip}",
   "alert.more": "…показано {shown} из {total}",
+  "alert.zero": "Нулевой хешрейт",
+  "alert.worker": "Имя майнера",
   "alert.remove_title": "Снять с учёта",
   "alert.remove_btn": "Снять",
   "voice.pool_hijack": "Пул изменён на {n} — проверьте",

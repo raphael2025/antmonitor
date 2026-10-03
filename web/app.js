@@ -15,6 +15,24 @@ function statusLabel(s) {
   if (s === "unknown") return t("status.unknown");
   return s || "";
 }
+function uiLocale() {
+  const lang = window.I18N && I18N.lang;
+  return lang === "zh" ? "zh-CN" : (lang || undefined);
+}
+
+function shortWorkerName(name) {
+  const chars = [...String(name || "")];
+  return chars.length > 11
+    ? `${chars.slice(0, 5).join("")}…${chars.slice(-5).join("")}`
+    : chars.join("");
+}
+
+function alertDetail(x) {
+  // Alert details are persisted in Chinese. Translate zero alerts, the UI
+  // symptom reported by the operator, while retaining other diagnostic text.
+  if (x.type === "zero") return t("alert.zero");
+  return x.detail || "";
+}
 
 // 转义设备/矿池返回的不可信字符串，防止 innerHTML 注入(XSS)
 function esc(s) {
@@ -98,7 +116,7 @@ function hashUnit(maxTh) {
 
 function fmtTime(ts) {
   if (!ts) return t("header.last_scan_none");
-  return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
+  return new Date(ts * 1000).toLocaleString(uiLocale(), { hour12: false });
 }
 function ago(ts) {
   if (!ts) return "";
@@ -118,7 +136,7 @@ function boxPower(c) {   // 集装箱总功耗 = 两路配电之和(W)
 }
 function fmtDT(ts) {   // 告警时间戳: MM-DD HH:MM
   if (!ts) return "";
-  return new Date(ts * 1000).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+  return new Date(ts * 1000).toLocaleString(uiLocale(), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 function fmtUptime(sec) {
   if (sec == null) return "-";
@@ -192,6 +210,9 @@ async function refreshAlerts() {
     const click = alertClick(x);
     const isCooler = x.type && x.type.startsWith("cooler");
     const isMiner = x.ip && x.ip.split(".").length === 4 && !x.ip.endsWith(".x");  // 单台矿机
+    const worker = isMiner && x.worker
+      ? `<span class="aworker" title="${esc(x.worker)}"><b>${esc(t("alert.worker"))}:</b> ${esc(shortWorkerName(x.worker))}</span>`
+      : "";
     let tail = "";
     if (!isCooler) {   // 集装箱告警不给按钮(修好自动消失)
       tail = x.ack_by ? `<span class="acked">${esc(t("ack.done", { user: x.ack_by }))}</span>`
@@ -200,7 +221,7 @@ async function refreshAlerts() {
     }
     return `<div class="a ${esc(x.severity)}${x.ack_by ? " is-ack" : ""}"><span class="atime">${fmtDT(x.ts)} · ${ago(x.ts)}</span>`
       + `<span class="ip"${click ? ` onclick="${click}"` : ""}>${esc(x.ip)}</span>`
-      + `<span class="adetail">${esc(x.detail)}</span>${tail}</div>`;
+      + worker + `<span class="adetail">${esc(alertDetail(x))}</span>${tail}</div>`;
   }).join("") : `<div class="muted">${esc(t("alerts.none"))}</div>`)
     + (total > a.length ? `<div class="muted" style="text-align:center;padding:6px">${esc(t("alert.more", { shown: a.length, total }))}</div>` : "");
   document.title = total ? t("doc.title_alert", { n: total }) : t("doc.title");
@@ -322,7 +343,7 @@ async function refreshTrend() {
   const d = await jget("/api/trend?points=288");
   // 注意：不可用局部变量名 t —— 会遮蔽全局 i18n 的 t()，导致标题赋值抛错、整段趋势图画不出
   const pts = d.trend || [];
-  const loc = (window.I18N && I18N.lang === "zh") ? "zh-CN" : undefined;
+  const loc = uiLocale();
   const labels = pts.map(x => new Date(x.ts * 1000).toLocaleTimeString(loc, { hour12: false }));
   const raw = pts.map(x => x.total_hr);
   const { div, unit } = hashUnit(raw.length ? Math.max(...raw) : 0);
@@ -569,9 +590,9 @@ async function openMiner(ip) {
         y1: { position: "right", ticks: { color: "#6e7681" }, grid: { drawOnChartArea: false } },
         x: { type: "linear",
              ticks: { color: "#6e7681", maxTicksLimit: 7,
-                      callback: (v) => new Date(v).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" }) } } },
+                      callback: (v) => new Date(v).toLocaleTimeString(uiLocale(), { hour12: false, hour: "2-digit", minute: "2-digit" }) } } },
       plugins: { legend: { labels: { color: "#adbac7" } },
-                 tooltip: { callbacks: { title: (items) => items.length ? new Date(items[0].parsed.x).toLocaleString("zh-CN", { hour12: false }) : "" } } } }
+                 tooltip: { callbacks: { title: (items) => items.length ? new Date(items[0].parsed.x).toLocaleString(uiLocale(), { hour12: false }) : "" } } } }
   });
   $("mInfo").innerHTML =
     t("miner.detail_fw", { fw: esc(c.firmware) || "-", st: esc(c.status) || "-", sn: esc(c.sn) || "-" }) + "<br>"
@@ -639,7 +660,7 @@ async function openContainer(ip) {
   const c = d.current || {};
   $("mTitle").textContent = t("cbox.title", { ip });
   const h = d.history || [];
-  const labels = h.map(x => new Date(x.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }));
+  const labels = h.map(x => new Date(x.ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false }));
   if (modalChart) modalChart.destroy();
   if (window.Chart) modalChart = new Chart($("mChart"), {
     type: "line",

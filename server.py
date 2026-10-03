@@ -14,6 +14,7 @@ if __name__ == "__main__":
 
 import asyncio
 import contextlib
+import html
 import hmac as _hmac
 import ipaddress
 import os
@@ -918,7 +919,10 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     s = {}
     if isinstance(body.get("cloud"), dict):   # 云端上报(网页配置, 存 settings.json, 即时生效)
         c = body["cloud"]
-        cl = {"enabled": bool(c.get("enabled")),
+        if "enabled" in c and not isinstance(c["enabled"], bool):
+            return JSONResponse({"ok": False, "error": "cloud.enabled 须为布尔值"},
+                                status_code=400)
+        cl = {"enabled": c.get("enabled", False),
               "url": str(c.get("url") or "").strip().rstrip("/"),
               "token": str(c.get("token") or "").strip(),
               "site_name": str(c.get("site_name") or "").strip()[:64],
@@ -963,7 +967,10 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
                                 status_code=400)
         s[k] = v
     if "reboot_enabled" in body:
-        s["reboot_enabled"] = bool(body["reboot_enabled"])
+        if not isinstance(body["reboot_enabled"], bool):
+            return JSONResponse({"ok": False, "error": "reboot_enabled 须为布尔值"},
+                                status_code=400)
+        s["reboot_enabled"] = body["reboot_enabled"]
     effective_scan = s.get("scan_interval", CFG["schedule"].get("scan_interval", 300))
     effective_full = s.get("full_interval", CFG["schedule"].get("full_interval", 3600))
     if effective_full < effective_scan:
@@ -1104,9 +1111,9 @@ def _record_command(user, action, params, results):
     if action in DESTRUCTIVE_ACTIONS and results:
         ok_n = sum(1 for r in results if r["ok"])
         name = {"reboot": "重启", "set_pools": "换矿池"}[action]
-        text = f"⚙ {user} {name} {len(results)} 台(成功 {ok_n})"
+        text = f"⚙ {html.escape(str(user))} {name} {len(results)} 台(成功 {ok_n})"
         if action == "set_pools":
-            text += f"\n矿池: {_pools_desc(params)}"
+            text += f"\n矿池: {html.escape(_pools_desc(params))}"
         try:
             alerts.push_text(CFG, text)
         except Exception:  # noqa: BLE001
@@ -1222,8 +1229,8 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
             _audit_reject(user, action, f"矿池不在白名单: {', '.join(bad)[:300]}")
             log.warning("换矿池被拒(不在白名单): %s 发起人 %s", bad, user)
             try:
-                alerts.push_text(CFG, f"🔴 {user} 试图把矿机换到白名单外的矿池，已拒绝: "
-                                      f"{', '.join(bad)[:300]}")
+                alerts.push_text(CFG, f"🔴 {html.escape(str(user))} 试图把矿机换到白名单外的矿池，已拒绝: "
+                                      f"{html.escape(', '.join(bad)[:300])}")
             except Exception:  # noqa: BLE001
                 pass
             return JSONResponse({"ok": False, "error":

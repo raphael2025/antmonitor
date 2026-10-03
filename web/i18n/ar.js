@@ -187,6 +187,8 @@ I18N.register('ar', {
   "toast.remove_fail": "فشل الإزالة: {msg}",
   "toast.removed": "أُزيل {ip}",
   "alert.more": "…عرض {shown} من {total}",
+  "alert.zero": "هاشريت صفر",
+  "alert.worker": "اسم العامل",
   "alert.remove_title": "إزالة من السجل",
   "alert.remove_btn": "إزالة",
   "voice.pool_hijack": "تم التلاعب بالمجمع على {n} — تحقق",

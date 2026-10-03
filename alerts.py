@@ -9,6 +9,7 @@
 
 推送走独立线程队列：Telegram 超时 10s，绝不能卡在扫描落库路径上。
 """
+import html
 import queue
 import threading
 import time
@@ -425,7 +426,7 @@ def _push_batch(tg_cfg, fired):
     icons = {"crit": "🔴", "warn": "🟠", "info": "🟢"}
     lines = ["<b>⛏ 矿机告警</b>"]
     for ip, type_, sev, detail in fired[:30]:
-        lines.append(f"{icons.get(sev, '•')} {detail}")
+        lines.append(f"{icons.get(sev, '•')} {html.escape(str(detail))}")
     if len(fired) > 30:
         lines.append(f"... 另有 {len(fired) - 30} 条")
     _enqueue(tg_cfg, "\n".join(lines))

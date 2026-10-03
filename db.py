@@ -636,10 +636,13 @@ def ack_alert(conn, alert_id, user):
 
 
 def list_alerts(conn, active_only=True, limit=200):
-    q = "SELECT * FROM alerts"
+    # Keep the last known worker name beside miner alerts so the UI can identify
+    # an abnormal machine even after it has gone offline.
+    q = "SELECT alerts.*, known_miners.worker AS worker FROM alerts " \
+        "LEFT JOIN known_miners ON known_miners.ip=alerts.ip"
     if active_only:
-        q += " WHERE resolved=0"
-    q += " ORDER BY id DESC LIMIT ?"
+        q += " WHERE alerts.resolved=0"
+    q += " ORDER BY alerts.id DESC LIMIT ?"
     return [dict(r) for r in _r(conn).execute(q, (limit,)).fetchall()]
 
 
