@@ -14,16 +14,16 @@ cd /d "%~dp0" || goto directory_error
 set "PYTHONUTF8=1"
 
 if not exist ".venv\Scripts\python.exe" goto find_python
-".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1
 if not errorlevel 1 goto start_venv
 
 :find_python
-py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1
 if not errorlevel 1 goto start_py
-python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1
 if not errorlevel 1 goto start_python
 
-echo Python 3.10 or newer was not found.
+echo Python 3.8 or newer was not found.
 echo Install it from https://www.python.org/downloads/windows/
 echo Enable "Add python.exe to PATH", then double-click run.bat again.
 goto failed

@@ -37,7 +37,7 @@ python server.py                      # http://<IP>:8800
 
 **Windows**：
 
-1. 安装 [Python 3.10 或更新版本](https://www.python.org/downloads/windows/)，勾选 `Add python.exe to PATH`。
+1. 安装 [Python](https://www.python.org/downloads/windows/)（支持 3.8+，建议 3.10+），勾选 `Add python.exe to PATH`。
 2. 将项目 ZIP 完整解压到本地可写目录（也可 `git clone`），双击 `run.bat`。
 3. 首次启动自动创建 `.venv`、安装 `requirements.txt` 中全部依赖、生成配置，按提示设置 admin 密码。
 4. 登录面板并配置矿机网段；已有的配置和密码不会被覆盖。

@@ -13,7 +13,7 @@ import sys
 import time
 
 BASE = Path(__file__).resolve().parent
-MIN_PYTHON = (3, 10)
+MIN_PYTHON = (3, 8)
 MAX_FAILURES = 5
 MIN_UPTIME = 30
 RESTART_DELAY = 3
@@ -32,7 +32,7 @@ def prepare_environment(base):
         print("Creating the project Python environment...", flush=True)
         run_checked([sys.executable, "-m", "venv", venv], base)
     run_checked([python, "-c",
-                 "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"], base)
+                 "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)"], base)
     requirements = base / "requirements.txt"
     stamp = venv / ".antmonitor-requirements.sha256"
     fingerprint = hashlib.sha256(requirements.read_bytes()).hexdigest()
@@ -123,7 +123,7 @@ def supervise(base):
 def main():
     try:
         if sys.version_info < MIN_PYTHON:
-            raise RuntimeError("Install Python 3.10 or newer from https://www.python.org/downloads/windows/")
+            raise RuntimeError("Install Python 3.8 or newer from https://www.python.org/downloads/windows/")
         return supervise(BASE)
     except KeyboardInterrupt:
         return 0
