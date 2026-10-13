@@ -9,7 +9,10 @@ jobs:
   startup:
     runs-on: windows-latest
     timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
     strategy:
+      fail-fast: false
       matrix:
         python: ['3.10', '3.12']
     steps:
