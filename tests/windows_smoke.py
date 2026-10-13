@@ -19,6 +19,11 @@ def main():
         base = Path(folder) / "project"
         shutil.copytree(root, base, ignore=shutil.ignore_patterns(
             ".git", ".venv", "__pycache__", ".pytest_cache", "logs"))
+        batch = base / "run.bat"
+        checkout_bytes = batch.read_bytes()
+        # GitHub source ZIPs contain repository blobs, whose text is LF even
+        # though .gitattributes makes a Git checkout use CRLF on Windows.
+        batch.write_bytes(checkout_bytes.replace(b"\r\n", b"\n"))
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -27,6 +32,8 @@ def main():
             "schedule:\n  enabled: false\n"
             "public_api:\n  token: windows-smoke-token\n".format(port), encoding="utf-8")
         for offline in (False, True):
+            if offline:
+                batch.write_bytes(checkout_bytes)
             env = dict(os.environ, MINER_NO_PAUSE="1", PYTHONUTF8="1",
                        PY_PYTHON3="{}.{}".format(*sys.version_info[:2]))
             if offline:
