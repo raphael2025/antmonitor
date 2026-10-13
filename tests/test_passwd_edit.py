@@ -69,6 +69,9 @@ def test_file_permissions_are_preserved(tmp_path):
     import stat
     p = _write(tmp_path, FLOW)
     os.chmod(p, 0o600)
+    # Windows chmod only supports the read-only flag, not POSIX permission bits.
+    # Assert that the platform's actual mode survives the replacement and backup.
+    original_mode = stat.S_IMODE(os.stat(p).st_mode)
     assert appconfig.set_user_password("ops", "pbkdf2$1$ab$cd", str(p)) == ""
-    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
-    assert stat.S_IMODE(os.stat(str(p) + ".bak").st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(p).st_mode) == original_mode
+    assert stat.S_IMODE(os.stat(str(p) + ".bak").st_mode) == original_mode
