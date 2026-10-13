@@ -35,7 +35,19 @@ cp config.example.yaml config.yaml    # 改网段、登录账号
 python server.py                      # http://<IP>:8800
 ```
 
-Windows 可用 `run.bat`。安全清单：[SECURITY](../SECURITY.md)。
+**Windows**：
+
+1. 安装 [Python 3.10 或更新版本](https://www.python.org/downloads/windows/)，勾选 `Add python.exe to PATH`。
+2. 将项目 ZIP 完整解压到本地可写目录（也可 `git clone`），双击 `run.bat`。
+3. 首次启动自动创建 `.venv`、安装 `requirements.txt` 中全部依赖、生成配置，按提示设置 admin 密码。
+4. 登录面板并配置矿机网段；已有的配置和密码不会被覆盖。
+
+首次安装、依赖变化或依赖损坏时需要联网；正常重复启动不会每次下载依赖。
+启动失败时窗口保留报错，修复后再次双击即可。按 Ctrl+C 停止服务，不会触发自动重启。
+需要手动设置密码时，在项目目录的 CMD 执行 `.venv\Scripts\python.exe auth.py passwd admin`。
+ZIP 部署支持本地监控；网页更新需要 Git 和 git clone 的工作目录。
+Windows 启动守护代码更新后，关闭旧启动窗口再双击即可使用新的守护逻辑。
+安全清单：[SECURITY](../SECURITY.md)。
 
 打开面板后用 admin 配置网段并触发一次全网发现。
 
@@ -65,4 +77,3 @@ Windows 可用 `run.bat`。安全清单：[SECURITY](../SECURITY.md)。
 ## 面板语言 / Panel language
 
 登录页与顶栏可选语言；选择会保存在浏览器本地。
-

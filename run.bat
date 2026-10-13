@@ -1,72 +1,48 @@
 @echo off
-rem Guardian loop: restart server.py after it exits (incl. exit 42 = updater self-restart).
-rem NSSM as a Windows service is preferred in production; this script suits quick deploy/debug.
-rem
-rem Circuit breaker: MAXFAILS consecutive "died within MINUP seconds" runs stop the loop,
-rem so a broken build can no longer cause an endless crash-3s-crash restart storm.
-rem   - exit code 42 = updater restarting on purpose: never counted, resets the counter
-rem   - a run lasting MINUP seconds or more: the service was really up, resets the counter
-rem
-rem KEEP THIS FILE ASCII-ONLY AND CRLF. Non-ASCII text or LF-only line endings make cmd
-rem mis-parse the set /a lines and the goto labels (verified: the loop then breaks apart).
-setlocal
-cd /d %~dp0
+goto bootstrap
+rem AntMonitor Windows launcher. Keep this file ASCII and CRLF.
+rem Legacy guardians resume at byte 1050 after python server.py exits.
+rem Keep the handoff below at that offset so running old versions can update.
+rem The Python guardian does not depend on batch read offsets for new updates.
+rem -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+rem Legacy update handoff: start the new bootstrap in this same console.
+goto bootstrap
 
-set MAXFAILS=5
-set MINUP=30
-set DELAY=3
-set FAILS=0
+:bootstrap
+setlocal EnableExtensions DisableDelayedExpansion
+cd /d "%~dp0" || goto directory_error
+set "PYTHONUTF8=1"
 
-:loop
-set RUN=0
-set "T=%TIME: =0%"
-set MINER_GUARDIAN=1& rem guardian flag for updater.py; next: 1hh-100 avoids 08/09 octal    
-set /a T1=(1%T:~0,2%-100)*3600+(1%T:~3,2%-100)*60+(1%T:~6,2%-100)
+if not exist ".venv\Scripts\python.exe" goto find_python
+".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if not errorlevel 1 goto start_venv
 
-python server.py
-set EC=%ERRORLEVEL%
-rem ---- EVERYTHING ABOVE "python server.py" MUST KEEP ITS EXACT BYTE LENGTH (1050) ----
-rem updater.py replaces this file while the loop is running; cmd resumes reading the new
-rem file at the old byte offset. Only change lines below this point, or change a line above
-rem to one of exactly the same length. Line above python: MINER_GUARDIAN tells updater.py a
-rem guardian is present (it is inside the loop so an already-running old copy picks it up).
-rem only the first launch opens the browser; guardian restarts (incl. updates) stay quiet
-set MINER_NO_BROWSER=1
+:find_python
+py -3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if not errorlevel 1 goto start_py
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>&1
+if not errorlevel 1 goto start_python
 
-set "T=%TIME: =0%"
-set /a T2=(1%T:~0,2%-100)*3600+(1%T:~3,2%-100)*60+(1%T:~6,2%-100)
-set /a RUN=T2-T1
-if %RUN% lss 0 set /a RUN=RUN+86400
+echo Python 3.10 or newer was not found.
+echo Install it from https://www.python.org/downloads/windows/
+echo Enable "Add python.exe to PATH", then double-click run.bat again.
+goto failed
 
-if "%EC%"=="42" goto healthy
-if %RUN% geq %MINUP% goto healthy
+:directory_error
+echo Cannot open the AntMonitor folder. Extract the ZIP to a local writable folder.
+goto failed
 
-set /a FAILS=FAILS+1
-echo [%DATE% %TIME%] server exited (code=%EC%) after only %RUN%s - quick failure %FAILS%/%MAXFAILS%
-if %FAILS% geq %MAXFAILS% goto circuit_break
-echo     restarting in %DELAY%s...
-call :sleep
-goto loop
+rem Keep each launch and exit on ONE parsed line. An update may replace run.bat
+rem while Python runs; CMD must not read a changed file when the guardian exits.
+:start_venv
+".venv\Scripts\python.exe" "windows_launcher.py" & exit /b
 
-:healthy
-set FAILS=0
-echo [%DATE% %TIME%] server exited (code=%EC%) after %RUN%s, restarting in %DELAY%s...
-call :sleep
-goto loop
+:start_py
+py -3 "windows_launcher.py" & exit /b
 
-:sleep
-rem timeout needs a real console (fails under NSSM/redirected stdin); ping is the fallback
-timeout /t %DELAY% /nobreak >nul 2>&1 || ping -n %DELAY% 127.0.0.1 >nul 2>&1
-goto :eof
+:start_python
+python "windows_launcher.py" & exit /b
 
-:circuit_break
-echo.
-echo ============================================================
-echo  server crashed %MAXFAILS% times in a row, each within %MINUP%s.
-echo  AUTO-RESTART STOPPED - manual check required, do not just relaunch:
-echo    1) read the traceback above and logs\miner.log
-echo    2) python updater.py check     (which version is deployed / just updated?)
-echo    3) if a bad update caused it:  git reset --hard ^<previous-commit^>
-echo ============================================================
-echo.
+:failed
+if not defined MINER_NO_PAUSE pause
 exit /b 1

@@ -77,7 +77,13 @@ cp config.example.yaml config.yaml   # 填网段与账号
 python server.py                     # 浏览器打开 :8800
 ```
 
-Windows 用 `run.bat` 即可。
+**Windows**：安装 [Python 3.10+](https://www.python.org/downloads/windows/)（勾选
+`Add python.exe to PATH`），把项目解压到本地可写目录，双击 `run.bat`。
+首次启动会自动创建 `.venv`、安装全部依赖、生成 `config.yaml`，并提示设置 admin 密码。
+安装依赖需要联网；之后依赖没有变化时可离线启动。已有配置和密码会保留。
+启动后在面板配置矿机网段。遇到错误会保留窗口显示原因；按 Ctrl+C 可停止服务。
+
+ZIP 下载可直接运行；网页更新功能需要通过 `git clone` 部署并安装 Git。
 
 完整「简介 · 部署 · 使用」→ [选语言阅读](docs/guide/README.md)
 
