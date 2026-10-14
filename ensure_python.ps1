@@ -63,6 +63,9 @@ function Install-ProjectPython($RuntimeDirectory) {
         Write-Host "No usable Python found. Downloading Python $PythonVersion from python.org..."
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $installer -TimeoutSec 120
+        # A parent PowerShell 7 can leave its module paths in the environment;
+        # Windows PowerShell 5.1 must load its own signature-checking module.
+        Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1')
         $signature = Get-AuthenticodeSignature -LiteralPath $installer
         if ($signature.Status -ne 'Valid' -or
             $signature.SignerCertificate.Subject -notmatch '(^|,\s*)(CN|O)=Python Software Foundation(,|$)') {
