@@ -15,6 +15,7 @@ def main():
         raise SystemExit("This smoke test requires Windows CMD.")
     root = Path(__file__).resolve().parent.parent
     without_python = '--without-python' in sys.argv
+    unsupported_python = '--unsupported-python' in sys.argv
     # Exercise quoting and Unicode too; no Git checkout or preinstalled venv.
     with tempfile.TemporaryDirectory(prefix="AntMonitor Windows & 测试 ") as folder:
         base = Path(folder) / "project"
@@ -25,6 +26,10 @@ def main():
         # GitHub source ZIPs contain repository blobs, whose text is LF even
         # though .gitattributes makes a Git checkout use CRLF on Windows.
         batch.write_bytes(checkout_bytes.replace(b"\r\n", b"\n"))
+        if unsupported_python:
+            assert sys.version_info[:2] == (3, 15)
+            subprocess.run([sys.executable, '-m', 'venv', str(base / '.venv')], check=True)
+            (base / '.venv/notes.txt').write_text('original incomplete Python 3.15 environment')
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -73,8 +78,15 @@ def main():
                         [str(base / ".venv/Scripts/python.exe"), "-c",
                          "import sys; print('{}.{}'.format(*sys.version_info[:2]))"],
                         text=True).strip()
-                    expected = '3.13' if without_python else "{}.{}".format(*sys.version_info[:2])
-                    assert actual == expected, actual
+                    if unsupported_python:
+                        assert (3, 8) <= tuple(map(int, actual.split('.'))) < (3, 14), actual
+                        backups = list(base.glob('.venv.incompatible-*'))
+                        assert len(backups) == 1
+                        assert (backups[0] / 'notes.txt').read_text() == 'original incomplete Python 3.15 environment'
+                        print('PASS: rejected Python 3.15 and recovered its incomplete venv with Python ' + actual)
+                    else:
+                        expected = '3.13' if without_python else "{}.{}".format(*sys.version_info[:2])
+                        assert actual == expected, actual
                     if without_python:
                         assert (Path(env['MINER_PYTHON_DIR']) / 'python.exe').is_file()
                     assert (base / ".venv/.antmonitor-requirements.sha256").is_file()

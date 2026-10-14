@@ -48,6 +48,7 @@ apply_result.txt
 __pycache__/
 *.py[cod]
 .venv/
+.venv.incompatible-*/
 venv/
 *.egg-info/
 

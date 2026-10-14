@@ -14,7 +14,7 @@ cd /d "%~dp0" || goto directory_error
 set "PYTHONUTF8=1"
 
 if not exist ".venv\Scripts\python.exe" goto find_python
-".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)" >nul 2>&1
+".venv\Scripts\python.exe" "windows_launcher.py" --check-runtime >nul 2>&1
 if not errorlevel 1 goto start_venv
 
 :find_python

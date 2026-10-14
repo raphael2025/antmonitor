@@ -2,12 +2,12 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $PythonVersion = '3.13.16'
-$VersionCheck = 'import sys, venv, ensurepip; sys.exit(0 if sys.version_info >= (3, 8) else 1)'
+$RuntimeCheck = Join-Path $PSScriptRoot 'windows_launcher.py'
 
 function Test-Python($Executable, $Prefix = @()) {
     if (-not (Test-Path -LiteralPath $Executable -PathType Leaf)) { return $false }
     try {
-        & $Executable @Prefix -c $VersionCheck 1>$null 2>$null
+        & $Executable @Prefix $RuntimeCheck --check-runtime 1>$null 2>$null
         return $LASTEXITCODE -eq 0
     } catch { return $false }
 }
@@ -16,10 +16,16 @@ function Find-SystemPython {
     foreach ($name in @('py.exe', 'python.exe')) {
         $command = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue
         if (-not $command -or $command.Source -like '*\WindowsApps\*') { continue }
-        $prefix = @()
-        if ($name -eq 'py.exe') { $prefix = @('-3') }
-        if (Test-Python $command.Source $prefix) {
-            return @{ Executable = $command.Source; Prefix = $prefix }
+        if ($name -eq 'py.exe') {
+            # Try the configured default first, then supported minors if the
+            # default is a new runtime (e.g. 3.15) without dependency wheels.
+            foreach ($tag in @('-3', '-3.13', '-3.12', '-3.11', '-3.10', '-3.9', '-3.8')) {
+                if (Test-Python $command.Source @($tag)) {
+                    return @{ Executable = $command.Source; Prefix = @($tag) }
+                }
+            }
+        } elseif (Test-Python $command.Source) {
+            return @{ Executable = $command.Source; Prefix = @() }
         }
     }
     # An installed Python may be absent from PATH, or hidden by a Store alias.
@@ -60,7 +66,7 @@ function Install-ProjectPython($RuntimeDirectory) {
     $installer = Join-Path $temporary 'python-installer.exe'
     $log = Join-Path $parent 'python-install.log'
     try {
-        Write-Host "No usable Python found. Downloading Python $PythonVersion from python.org..."
+        Write-Host "No compatible Python 3.8-3.13 found. Downloading Python $PythonVersion from python.org..."
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $installer -TimeoutSec 120
         # A parent PowerShell 7 can leave its module paths in the environment;

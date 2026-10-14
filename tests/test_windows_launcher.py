@@ -30,6 +30,7 @@ def test_first_install_then_offline_restart_and_changed_requirements(tmp_path, m
     installs = lambda: [c for c in calls if "install" in c]
     assert len(installs()) == 1
     assert installs()[0][:4] == [str(python), "-m", "pip", "install"]
+    assert "--only-binary=:all:" in installs()[0]
     launcher.prepare_environment(tmp_path)
     assert len(installs()) == 1
     (tmp_path / "requirements.txt").write_text("fastapi>=0.110\n")
@@ -66,6 +67,48 @@ def test_failed_install_not_marked_successful(tmp_path, monkeypatch):
     with pytest.raises(subprocess.CalledProcessError):
         launcher.prepare_environment(tmp_path)
     assert not (tmp_path / ".venv/.antmonitor-requirements.sha256").exists()
+
+
+@pytest.mark.parametrize("version,accepted", [
+    ((3, 7), False), ((3, 8), True), ((3, 9), True), ((3, 10), True),
+    ((3, 11), True), ((3, 12), True), ((3, 13), True), ((3, 14), False),
+    ((3, 15), False),
+])
+def test_runtime_requires_validated_minor(version, accepted):
+    assert launcher.runtime_supported(version, gil_disabled=False) is accepted
+
+
+def test_free_threaded_runtime_is_not_selected():
+    assert launcher.runtime_supported((3, 13), gil_disabled=True) is False
+
+
+def test_incompatible_venv_rebuilt_without_deleting_old_files_or_config(tmp_path, monkeypatch):
+    python = environment(tmp_path)
+    notes = tmp_path / ".venv/notes.txt"
+    notes.write_text("old environment files")
+    config = tmp_path / "config.yaml"
+    config.write_text("existing user configuration")
+    database = tmp_path / "miner_monitor.db"
+    database.write_bytes(b"existing database")
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[-1] == "--check-runtime":
+            return subprocess.CompletedProcess(args, 1)  # old Python 3.15
+        if "venv" in args:
+            python.parent.mkdir(parents=True)
+            python.touch()
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    assert launcher.prepare_environment(tmp_path) == python
+    backups = list(tmp_path.glob(".venv.incompatible-*"))
+    assert len(backups) == 1 and (backups[0] / "notes.txt").read_text() == "old environment files"
+    assert config.read_text() == "existing user configuration"
+    assert database.read_bytes() == b"existing database"
+    assert any("venv" in c for c in calls)
+    assert any("--only-binary=:all:" in c for c in calls)
 
 
 def test_existing_configuration_preserved(tmp_path, monkeypatch):
@@ -156,8 +199,10 @@ def test_batch_legacy_handoff_and_update_safe_launch_lines():
     assert batch.isascii() and b"\n" not in batch.replace(b"\r\n", b"")
     assert batch[1050:].startswith(b"rem Legacy update handoff:")
     assert b'cd /d "%~dp0"' in batch
-    launch_lines = [line for line in batch.splitlines() if b'"windows_launcher.py"' in line]
+    launch_lines = [line for line in batch.splitlines() if
+                    b'"windows_launcher.py"' in line and b"--check-runtime" not in line]
     assert len(launch_lines) == 1
     assert all(line.endswith(b" & exit /b") for line in launch_lines)
     powershell = [line for line in batch.splitlines() if b'".\\ensure_python.ps1"' in line]
     assert len(powershell) == 1 and powershell[0].endswith(b" & exit /b")
+    assert b'"windows_launcher.py" --check-runtime' in batch
