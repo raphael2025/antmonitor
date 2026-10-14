@@ -71,7 +71,7 @@ def test_failed_install_not_marked_successful(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("version,accepted", [
     ((3, 7), False), ((3, 8), True), ((3, 9), True), ((3, 10), True),
-    ((3, 11), True), ((3, 12), True), ((3, 13), True), ((3, 14), False),
+    ((3, 11), True), ((3, 12), True), ((3, 13), True), ((3, 14), True),
     ((3, 15), False),
 ])
 def test_runtime_requires_validated_minor(version, accepted):

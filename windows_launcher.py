@@ -16,7 +16,7 @@ import uuid
 
 BASE = Path(__file__).resolve().parent
 MIN_PYTHON = (3, 8)
-MAX_PYTHON = (3, 14)  # exclusive: newer minors need Windows wheel validation first
+MAX_PYTHON = (3, 15)  # exclusive: newer minors need Windows wheel validation first
 MAX_FAILURES = 5
 MIN_UPTIME = 30
 RESTART_DELAY = 3
@@ -146,7 +146,7 @@ def supervise(base):
 def main():
     try:
         if not runtime_supported():
-            raise RuntimeError("Use run.bat to select standard Python 3.8-3.13; "
+            raise RuntimeError("Use run.bat to select standard Python 3.8-3.14; "
                                "newer/free-threaded runtimes are not supported yet.")
         return supervise(BASE)
     except KeyboardInterrupt:

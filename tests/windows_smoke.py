@@ -79,7 +79,7 @@ def main():
                          "import sys; print('{}.{}'.format(*sys.version_info[:2]))"],
                         text=True).strip()
                     if unsupported_python:
-                        assert (3, 8) <= tuple(map(int, actual.split('.'))) < (3, 14), actual
+                        assert (3, 8) <= tuple(map(int, actual.split('.'))) < (3, 15), actual
                         backups = list(base.glob('.venv.incompatible-*'))
                         assert len(backups) == 1
                         assert (backups[0] / 'notes.txt').read_text() == 'original incomplete Python 3.15 environment'

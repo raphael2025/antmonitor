@@ -19,7 +19,7 @@ function Find-SystemPython {
         if ($name -eq 'py.exe') {
             # Try the configured default first, then supported minors if the
             # default is a new runtime (e.g. 3.15) without dependency wheels.
-            foreach ($tag in @('-3', '-3.13', '-3.12', '-3.11', '-3.10', '-3.9', '-3.8')) {
+            foreach ($tag in @('-3', '-3.14', '-3.13', '-3.12', '-3.11', '-3.10', '-3.9', '-3.8')) {
                 if (Test-Python $command.Source @($tag)) {
                     return @{ Executable = $command.Source; Prefix = @($tag) }
                 }
@@ -66,7 +66,7 @@ function Install-ProjectPython($RuntimeDirectory) {
     $installer = Join-Path $temporary 'python-installer.exe'
     $log = Join-Path $parent 'python-install.log'
     try {
-        Write-Host "No compatible Python 3.8-3.13 found. Downloading Python $PythonVersion from python.org..."
+        Write-Host "No compatible Python 3.8-3.14 found. Downloading Python $PythonVersion from python.org..."
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $installer -TimeoutSec 120
         # A parent PowerShell 7 can leave its module paths in the environment;
