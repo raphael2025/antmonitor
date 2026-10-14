@@ -77,10 +77,12 @@ cp config.example.yaml config.yaml   # 填网段与账号
 python server.py                     # 浏览器打开 :8800
 ```
 
-**Windows**：安装 [Python](https://www.python.org/downloads/windows/)（支持 3.8+，建议 3.10+，勾选
-`Add python.exe to PATH`），把项目解压到本地可写目录，双击 `run.bat`。
-首次启动会自动创建 `.venv`、安装全部依赖、生成 `config.yaml`，并提示设置 admin 密码。
-安装依赖需要联网；之后依赖没有变化时可离线启动。已有配置和密码会保留。
+**Windows 10 / 11**：把项目解压到本地可写目录，双击 `run.bat`。
+没有 Python 时会自动从 python.org 下载并验证官方签名，安装到当前用户的
+`%LOCALAPPDATA%\AntMonitor\Python313`，不需要管理员权限或手动配置 PATH。
+已有可用的 Python 3.8+ 会直接复用。
+随后自动创建 `.venv`、安装全部依赖、生成 `config.yaml`，并提示设置 admin 密码。
+首次安装需要联网；之后依赖没有变化时可离线启动。已有配置和密码会保留。
 启动后在面板配置矿机网段。遇到错误会保留窗口显示原因；按 Ctrl+C 可停止服务。
 
 ZIP 下载可直接运行；网页更新功能需要通过 `git clone` 部署并安装 Git。

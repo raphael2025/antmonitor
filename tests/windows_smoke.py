@@ -14,6 +14,7 @@ def main():
     if os.name != "nt":
         raise SystemExit("This smoke test requires Windows CMD.")
     root = Path(__file__).resolve().parent.parent
+    without_python = '--without-python' in sys.argv
     # Exercise quoting and Unicode too; no Git checkout or preinstalled venv.
     with tempfile.TemporaryDirectory(prefix="AntMonitor Windows & 测试 ") as folder:
         base = Path(folder) / "project"
@@ -36,6 +37,15 @@ def main():
                 batch.write_bytes(checkout_bytes)
             env = dict(os.environ, MINER_NO_PAUSE="1", PYTHONUTF8="1",
                        PY_PYTHON3="{}.{}".format(*sys.version_info[:2]))
+            if without_python:
+                # Keep the controller interpreter outside the child's PATH.
+                # An explicit private runtime bypasses the runner's preinstalled
+                # Python registry entries and exercises the real installer.
+                windows = Path(os.environ['WINDIR'])
+                env['PATH'] = os.pathsep.join(str(p) for p in (
+                    windows / 'System32', windows,
+                    windows / 'System32/WindowsPowerShell/v1.0'))
+                env['MINER_PYTHON_DIR'] = str(Path(folder) / 'Python313')
             if offline:
                 env["PIP_NO_INDEX"] = "1"
             log = base / ("offline.log" if offline else "first-start.log")
@@ -63,10 +73,15 @@ def main():
                         [str(base / ".venv/Scripts/python.exe"), "-c",
                          "import sys; print('{}.{}'.format(*sys.version_info[:2]))"],
                         text=True).strip()
-                    assert actual == "{}.{}".format(*sys.version_info[:2]), actual
+                    expected = '3.13' if without_python else "{}.{}".format(*sys.version_info[:2])
+                    assert actual == expected, actual
+                    if without_python:
+                        assert (Path(env['MINER_PYTHON_DIR']) / 'python.exe').is_file()
                     assert (base / ".venv/.antmonitor-requirements.sha256").is_file()
                     print("PASS: {} launch through native CMD".format(
                         "offline repeat" if offline else "first clean"))
+                    if without_python and not offline:
+                        print('PASS: Python downloaded and installed with no Python on child PATH')
                 finally:
                     subprocess.run(["taskkill", "/F", "/T", "/PID", str(child.pid)],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

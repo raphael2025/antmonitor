@@ -6,6 +6,18 @@ on:
   pull_request:
 
 jobs:
+  no-python:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download and install Python, then launch with no Python on PATH
+        run: python tests/windows_smoke.py --without-python
   startup:
     runs-on: windows-latest
     timeout-minutes: 15
