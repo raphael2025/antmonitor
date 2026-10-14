@@ -157,5 +157,7 @@ def test_batch_legacy_handoff_and_update_safe_launch_lines():
     assert batch[1050:].startswith(b"rem Legacy update handoff:")
     assert b'cd /d "%~dp0"' in batch
     launch_lines = [line for line in batch.splitlines() if b'"windows_launcher.py"' in line]
-    assert len(launch_lines) == 3
+    assert len(launch_lines) == 1
     assert all(line.endswith(b" & exit /b") for line in launch_lines)
+    powershell = [line for line in batch.splitlines() if b'".\\ensure_python.ps1"' in line]
+    assert len(powershell) == 1 and powershell[0].endswith(b" & exit /b")
