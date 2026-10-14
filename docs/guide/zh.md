@@ -40,11 +40,13 @@ python server.py                      # http://<IP>:8800
 1. 在 Windows 10 / 11 将项目 ZIP 完整解压到本地可写目录（也可 `git clone`），双击 `run.bat`。
 2. 没有可用 Python 时，自动从 python.org 下载并验证官方安装包的签名，按当前用户安装到
    `%LOCALAPPDATA%\AntMonitor\Python313`。不需要管理员权限，也不用修改 PATH 或重新打开窗口。
-   已有可用的 Python 3.8+ 会复用；没有加进 PATH 的常规 Python 安装也会通过注册表检测。
+   已有可用的标准 Python 3.8–3.14 会复用；没有加进 PATH 的常规 Python 安装也会通过注册表检测。
 3. 自动创建 `.venv`、安装 `requirements.txt` 中全部依赖、生成配置，按提示设置 admin 密码。
 4. 登录面板并配置矿机网段；已有的配置和密码不会被覆盖。
 
 首次安装、依赖变化或依赖损坏时需要联网；正常重复启动不会每次下载依赖。
+暂不使用 Python 3.15+ 或自由线程版，依赖只安装预编译 wheel，避免要求用户安装 C++ 编译工具。
+曾使用不兼容版本的 `.venv` 会自动保留到 `.venv.incompatible-*` 并重新创建；配置、密码和数据库不会被覆盖。
 启动失败时窗口保留报错，修复后再次双击即可。按 Ctrl+C 停止服务，不会触发自动重启。
 Python 安装失败时，可查看 `%LOCALAPPDATA%\AntMonitor\python-install.log`；网络无法访问
 python.org 或 PyPI 时需要恢复网络再试，或手动安装 Python 和依赖。

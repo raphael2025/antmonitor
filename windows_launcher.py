@@ -10,10 +10,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import sysconfig
 import time
+import uuid
 
 BASE = Path(__file__).resolve().parent
 MIN_PYTHON = (3, 8)
+MAX_PYTHON = (3, 15)  # exclusive: newer minors need Windows wheel validation first
 MAX_FAILURES = 5
 MIN_UPTIME = 30
 RESTART_DELAY = 3
@@ -24,15 +27,35 @@ def run_checked(args, base):
     subprocess.run([str(arg) for arg in args], cwd=str(base), check=True)
 
 
+def runtime_supported(version=None, gil_disabled=None):
+    version = sys.version_info if version is None else version
+    if gil_disabled is None:
+        gil_disabled = sysconfig.get_config_var("Py_GIL_DISABLED")
+    return MIN_PYTHON <= tuple(version[:2]) < MAX_PYTHON and not gil_disabled
+
+
 def prepare_environment(base):
     """Use a private venv; install on first use, changed requirements or damage."""
     venv = base / ".venv"
     python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if venv.exists():
+        compatible = False
+        if python.is_file():
+            try:
+                check = subprocess.run([str(python), str(base / "windows_launcher.py"),
+                                        "--check-runtime"], cwd=str(base),
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                compatible = check.returncode == 0
+            except OSError:
+                pass
+        if not compatible:
+            backup = base / (".venv.incompatible-" + uuid.uuid4().hex[:12])
+            venv.rename(backup)
+            print("Incompatible/broken Python environment saved as {}. Rebuilding...".format(
+                backup.name), flush=True)
     if not python.is_file():
         print("Creating the project Python environment...", flush=True)
         run_checked([sys.executable, "-m", "venv", venv], base)
-    run_checked([python, "-c",
-                 "import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)"], base)
     requirements = base / "requirements.txt"
     stamp = venv / ".antmonitor-requirements.sha256"
     fingerprint = hashlib.sha256(requirements.read_bytes()).hexdigest()
@@ -46,7 +69,7 @@ def prepare_environment(base):
         if pip.returncode:
             run_checked([python, "-m", "ensurepip", "--upgrade"], base)
         install = [python, "-m", "pip", "install", "--disable-pip-version-check",
-                   "-r", requirements]
+                   "--only-binary=:all:", "-r", requirements]
         if installed == fingerprint and probe.returncode:
             # Metadata can survive missing/damaged package files; a plain pip
             # install would report "already satisfied" and leave them broken.
@@ -122,8 +145,9 @@ def supervise(base):
 
 def main():
     try:
-        if sys.version_info < MIN_PYTHON:
-            raise RuntimeError("Install Python 3.8 or newer from https://www.python.org/downloads/windows/")
+        if not runtime_supported():
+            raise RuntimeError("Use run.bat to select standard Python 3.8-3.14; "
+                               "newer/free-threaded runtimes are not supported yet.")
         return supervise(BASE)
     except KeyboardInterrupt:
         return 0
@@ -139,4 +163,11 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--check-runtime"]:
+        try:
+            import venv
+            import ensurepip
+            sys.exit(0 if runtime_supported() else 1)
+        except ImportError:
+            sys.exit(1)
     sys.exit(main())
