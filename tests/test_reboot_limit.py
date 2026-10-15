@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""重启限流(15min/24h) + 掉线自动重启候选过滤。"""
+"""重启限流(15min/24h) + 零算力自动重启候选过滤。"""
 import threading
 import time
 
@@ -93,32 +93,25 @@ def test_auto_reboot_off_is_noop(conn, cfg, monkeypatch):
     assert called == []
 
 
-def test_auto_reboot_skips_repair_and_segment_down(conn, cfg):
+def test_auto_reboot_only_targets_online_zero_hashrate(conn, cfg):
     cfg["control"]["enabled"] = True
     cfg["control"]["reboot_enabled"] = True
-    cfg["alerts"]["segment_down_ratio"] = 0.6
-    cfg["alerts"]["segment_down_min"] = 5
     svc = _svc(conn, cfg)
     now = int(time.time())
-    # 10 台同段：先全上线入册，再全掉线 → 整段掉线，不应进自动列表
-    ips = [f"10.0.2.{i}" for i in range(1, 11)]
-    db.upsert_known_miners(conn, [rec(ip) for ip in ips], now)
-    offline = [rec(ip, status="offline") for ip in ips]
-    assert svc.offline_reboot_candidates(offline) == []
+    ip = "10.0.3.2"
+    db.upsert_known_miners(conn, [rec(ip)], now)
 
-    # 单机掉线 + 维修中 → 不进
-    db.upsert_known_miners(conn, [rec("10.0.3.1")], now)
-    db.set_machine_state(conn, ["10.0.3.1"], "repair")
-    assert svc.offline_reboot_candidates([rec("10.0.3.1", status="offline")]) == []
+    # 在线且明确读到 0 算力才启动计时；掉线期间清掉未尝试的计时且不重启。
+    assert svc.zero_reboot_candidates([rec(ip, status="online", hr_rt=0)], now=now) == []
+    assert svc.zero_reboot_candidates([rec(ip, status="offline")], now=now + 900) == []
+    assert ip not in db.zero_reboot_states(conn)
 
-    # 单机掉线正常 → 进候选
-    db.upsert_known_miners(conn, [rec("10.0.3.2")], now)
-    cands = svc.offline_reboot_candidates([rec("10.0.3.2", status="offline")])
-    assert [r["ip"] for r in cands] == ["10.0.3.2"]
-
-    # 重启静默期内 → 不进
-    svc.mark_rebooting(["10.0.3.2"])
-    assert svc.offline_reboot_candidates([rec("10.0.3.2", status="offline")]) == []
+    # 恢复在线零算力后重新累计 15 分钟才进入候选。
+    assert svc.zero_reboot_candidates(
+        [rec(ip, status="online", hr_rt=0)], now=now + 900) == []
+    candidates = svc.zero_reboot_candidates(
+        [rec(ip, status="online", hr_rt=0)], now=now + 1800)
+    assert [target[0] for target in candidates] == [ip]
 
 
 def test_apply_settings_reboot_keys(cfg):

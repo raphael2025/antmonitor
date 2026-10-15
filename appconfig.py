@@ -69,6 +69,10 @@ DEFAULTS = {
         "container_faults_ignore": [],
         "container_supply_pressure_min": 0,
         "container_return_pressure_min": 0,
+        # 自动补水会瞬时拉低回液压：持续偏低满此秒数才报；0=立即报(旧行为)
+        "container_pressure_hold_sec": 60,
+        # 压力恢复后多久消警(秒)；漏液等触点故障仍用 alerts.COOLER_CLEAR_SEC=300
+        "container_pressure_clear_sec": 30,
     },
     "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
     "cloud": {
@@ -80,7 +84,7 @@ DEFAULTS = {
         "enabled": False, "uniplus_password": "", "timeout": 8, "max_batch": 1000,
         "reboot_concurrency": 30, "reboot_delay_sec": 8, "reboot_shuffle": True,
         "reboot_grace_sec": 600,
-        # 掉线自动重启：默认关。开后扫描评估到名册内掉线(非维修/非静默期/非整段掉线)会自动下发。
+        # 自动重启：默认关。掉线按扫描评估；零算力持续15分钟后重启，失败每15分钟重试，最多4次。
         # 手动与自动共用限流：滚动 24h 内每 IP 最多 reboot_max_per_day 次成功重启，
         # 且距上次成功至少 reboot_min_interval_sec 秒。
         "reboot_enabled": False,
@@ -115,6 +119,32 @@ DEFAULTS = {
     "logging": {"level": "INFO", "file": "", "max_mb": 20, "backups": 5},
 }
 
+_BOOL_FIELDS = {
+    "schedule": ("enabled",),
+    "scan": ("liveness_gate", "reconfirm_enabled", "fetch_worker"),
+    "alerts": ("enabled",),
+    "telegram": ("enabled",),
+    "cloud": ("enabled",),
+    "control": ("enabled", "reboot_enabled"),
+    "auth": ("enabled", "secure_cookie"),
+    "update": ("auto",),
+}
+
+
+def _parse_bool(value):
+    """Parse explicit boolean spellings; never treat a nonempty string as True."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in ("true", "yes", "on", "1"):
+            return True
+        if s in ("false", "no", "off", "0"):
+            return False
+    return None
+
 
 def _merge(defaults, override):
     """深合并：override 缺失的键用 defaults 补齐(只对 dict 递归，list/标量整体覆盖)。"""
@@ -132,6 +162,17 @@ def _merge(defaults, override):
 def _validate(cfg):
     """把明显不合法的值纠正到安全范围并记日志(宁可跑起来也不要静默跑歪)。"""
     warn = []
+
+    # YAML/JSON strings such as "false" are truthy in Python. Normalize every
+    # boolean setting explicitly so a quoting typo cannot enable controls or
+    # disable alerts.
+    for section, keys in _BOOL_FIELDS.items():
+        for key in keys:
+            parsed = _parse_bool(cfg[section].get(key))
+            if parsed is None:
+                warn.append(f"{section}.{key} 非布尔值，回退默认 {DEFAULTS[section][key]}")
+                parsed = DEFAULTS[section][key]
+            cfg[section][key] = parsed
 
     def clamp(section, key, lo, hi, cast=float):
         try:
@@ -178,8 +219,6 @@ def _validate(cfg):
     clamp("control", "reboot_grace_sec", 0, 86400, int)
     clamp("control", "reboot_max_per_day", 1, 100, int)
     clamp("control", "reboot_min_interval_sec", 0, 86400, int)
-    # reboot_enabled 是 bool；yaml/json 里可能写成 0/1，归一成真正布尔
-    cfg["control"]["reboot_enabled"] = bool(cfg["control"].get("reboot_enabled"))
     # 告警阈值：0 在这几项里是"关闭该告警"的约定语义，故下限取 0 而非正数；
     # 比例类限制在 0~1，百分比类限制在 0~100，温度取物理上可能的范围。
     clamp("alerts", "overheat_c", 0, 200)
@@ -188,6 +227,8 @@ def _validate(cfg):
     clamp("alerts", "segment_down_ratio", 0, 1)
     clamp("alerts", "reject_pct", 0, 100)
     clamp("alerts", "zero_grace_sec", 0, 86400, int)
+    clamp("alerts", "container_pressure_hold_sec", 0, 3600, int)
+    clamp("alerts", "container_pressure_clear_sec", 0, 3600, int)
 
     if cfg["scan"]["host_end"] < cfg["scan"]["host_start"]:
         warn.append("scan.host_end < host_start，已对调")
@@ -403,7 +444,7 @@ def _atomic_json(path, data):
 
 _INT_SETTINGS = ("scan_interval", "full_interval", "container_interval",
                  "max_pps", "discovery_workers")
-# 网页可热改的 control 整数项(掉线自动重启相关)；与 _INT_SETTINGS 分开，避免误写到 scan/schedule
+# 网页可热改的 control 整数项(自动重启相关)；与 _INT_SETTINGS 分开，避免误写到 scan/schedule
 _CONTROL_INT_SETTINGS = ("reboot_concurrency", "reboot_delay_sec",
                          "reboot_max_per_day", "reboot_min_interval_sec")
 
@@ -427,7 +468,7 @@ def apply_settings(cfg, s):
                 cfg["scan"][k] = v
     ctl = cfg.setdefault("control", {})
     if "reboot_enabled" in s:
-        ctl["reboot_enabled"] = bool(s["reboot_enabled"])
+        ctl["reboot_enabled"] = s["reboot_enabled"]
     for k in _CONTROL_INT_SETTINGS:
         if k not in s:
             continue

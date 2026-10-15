@@ -15,6 +15,67 @@ function statusLabel(s) {
   if (s === "unknown") return t("status.unknown");
   return s || "";
 }
+function uiLocale() {
+  const lang = window.I18N && I18N.lang;
+  return lang === "zh" ? "zh-CN" : (lang || undefined);
+}
+
+function shortWorkerName(name) {
+  const chars = [...String(name || "")];
+  return chars.length > 11
+    ? `${chars.slice(0, 5).join("")}…${chars.slice(-5).join("")}`
+    : chars.join("");
+}
+
+function alertDetail(x) {
+  // Alert details are stored as Chinese prose. Rebuild them from the alert type
+  // and the diagnostic values so active and historical rows use the UI locale.
+  const d = String(x.detail || "");
+  const value = (pattern) => d.match(pattern);
+  if (x.type === "offline") {
+    const m = value(/重启后\s*(\d+)\s*分钟/);
+    return m ? t("alert.offline_reboot", { minutes: m[1] }) : t("alert.offline");
+  }
+  if (x.type === "zero") return t("alert.zero");
+  if (x.type === "reject") {
+    const m = value(/拒绝率\s*([\d.]+)%\s*≥\s*([\d.]+)%/);
+    return m ? t("alert.reject", { rate: m[1], threshold: m[2] }) : t("alert.reject_short");
+  }
+  if (x.type === "low_hashrate") {
+    const m = value(/算力\s*([\d.]+)\s*TH.*?中位数\s*([\d.]+)\s*TH.*?(\d+)%/);
+    return m ? t("alert.low_hashrate", { rate: m[1], median: m[2], ratio: m[3] })
+      : t("alert.low_hashrate_short");
+  }
+  if (x.type === "overheat") {
+    const m = value(/芯片温\s*([\d.]+)℃\s*≥\s*([\d.]+)℃/);
+    return m ? t("alert.overheat", { temp: m[1], threshold: m[2] }) : t("alert.overheat_short");
+  }
+  if (x.type === "pool_hijack") {
+    const pools = d.match(/偷算力\):\s*(.*)$/);
+    return pools ? t("alert.pool_hijack", { pools: pools[1] }) : t("alert.pool_hijack_short");
+  }
+  if (x.type === "segment_down") {
+    const m = value(/大面积掉线\s*(\d+)\/(\d+)/);
+    return m ? t("alert.segment_down", { offline: m[1], total: m[2] })
+      : t("alert.segment_down_short");
+  }
+  if (x.type === "stalled") {
+    const m = value(/已\s*(\d+)\s*分钟/);
+    return m ? t("alert.stalled", { minutes: m[1] }) : t("alert.stalled_short");
+  }
+  if (x.type === "cooler_offline") return t("alert.cooler_offline");
+  if (x.type && x.type.startsWith("cooler:")) {
+    const flag = x.type.slice("cooler:".length);
+    const fault = flag.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    if (["supply_pressure_low", "return_pressure_low_th", "return_liquid_pressure_low"].includes(flag)) {
+      const m = value(/([\d.]+)\s*<\s*([\d.]+)\s*MPa/i);
+      return m ? t("alert.cooler_pressure", { fault, value: m[1], threshold: m[2] })
+        : t("alert.cooler_pressure_short", { fault });
+    }
+    return t("alert.cooler_fault", { fault });
+  }
+  return x.detail || "";
+}
 
 // 转义设备/矿池返回的不可信字符串，防止 innerHTML 注入(XSS)
 function esc(s) {
@@ -98,7 +159,7 @@ function hashUnit(maxTh) {
 
 function fmtTime(ts) {
   if (!ts) return t("header.last_scan_none");
-  return new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false });
+  return new Date(ts * 1000).toLocaleString(uiLocale(), { hour12: false });
 }
 function ago(ts) {
   if (!ts) return "";
@@ -118,7 +179,7 @@ function boxPower(c) {   // 集装箱总功耗 = 两路配电之和(W)
 }
 function fmtDT(ts) {   // 告警时间戳: MM-DD HH:MM
   if (!ts) return "";
-  return new Date(ts * 1000).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+  return new Date(ts * 1000).toLocaleString(uiLocale(), { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
 }
 function fmtUptime(sec) {
   if (sec == null) return "-";
@@ -192,6 +253,9 @@ async function refreshAlerts() {
     const click = alertClick(x);
     const isCooler = x.type && x.type.startsWith("cooler");
     const isMiner = x.ip && x.ip.split(".").length === 4 && !x.ip.endsWith(".x");  // 单台矿机
+    const worker = isMiner && x.worker
+      ? `<span class="aworker" title="${esc(x.worker)}"><b>${esc(t("alert.worker"))}:</b> ${esc(shortWorkerName(x.worker))}</span>`
+      : "";
     let tail = "";
     if (!isCooler) {   // 集装箱告警不给按钮(修好自动消失)
       tail = x.ack_by ? `<span class="acked">${esc(t("ack.done", { user: x.ack_by }))}</span>`
@@ -200,7 +264,7 @@ async function refreshAlerts() {
     }
     return `<div class="a ${esc(x.severity)}${x.ack_by ? " is-ack" : ""}"><span class="atime">${fmtDT(x.ts)} · ${ago(x.ts)}</span>`
       + `<span class="ip"${click ? ` onclick="${click}"` : ""}>${esc(x.ip)}</span>`
-      + `<span class="adetail">${esc(x.detail)}</span>${tail}</div>`;
+      + worker + `<span class="adetail">${esc(alertDetail(x))}</span>${tail}</div>`;
   }).join("") : `<div class="muted">${esc(t("alerts.none"))}</div>`)
     + (total > a.length ? `<div class="muted" style="text-align:center;padding:6px">${esc(t("alert.more", { shown: a.length, total }))}</div>` : "");
   document.title = total ? t("doc.title_alert", { n: total }) : t("doc.title");
@@ -322,7 +386,7 @@ async function refreshTrend() {
   const d = await jget("/api/trend?points=288");
   // 注意：不可用局部变量名 t —— 会遮蔽全局 i18n 的 t()，导致标题赋值抛错、整段趋势图画不出
   const pts = d.trend || [];
-  const loc = (window.I18N && I18N.lang === "zh") ? "zh-CN" : undefined;
+  const loc = uiLocale();
   const labels = pts.map(x => new Date(x.ts * 1000).toLocaleTimeString(loc, { hour12: false }));
   const raw = pts.map(x => x.total_hr);
   const { div, unit } = hashUnit(raw.length ? Math.max(...raw) : 0);
@@ -569,13 +633,13 @@ async function openMiner(ip) {
         y1: { position: "right", ticks: { color: "#6e7681" }, grid: { drawOnChartArea: false } },
         x: { type: "linear",
              ticks: { color: "#6e7681", maxTicksLimit: 7,
-                      callback: (v) => new Date(v).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" }) } } },
+                      callback: (v) => new Date(v).toLocaleTimeString(uiLocale(), { hour12: false, hour: "2-digit", minute: "2-digit" }) } } },
       plugins: { legend: { labels: { color: "#adbac7" } },
-                 tooltip: { callbacks: { title: (items) => items.length ? new Date(items[0].parsed.x).toLocaleString("zh-CN", { hour12: false }) : "" } } } }
+                 tooltip: { callbacks: { title: (items) => items.length ? new Date(items[0].parsed.x).toLocaleString(uiLocale(), { hour12: false }) : "" } } } }
   });
   $("mInfo").innerHTML =
     t("miner.detail_fw", { fw: esc(c.firmware) || "-", st: esc(c.status) || "-", sn: esc(c.sn) || "-" }) + "<br>"
-    + `MAC：${esc(c.mac) || "-"}<br>`
+    + t("miner.detail_mac", { mac: esc(c.mac) || "-" }) + "<br>"
     + t("miner.detail_hr", { hr: c.hr_rt == null ? t("td.no_hr") : fmtHash(c.hr_rt), avg: fmtHash(c.hr_avg), pw: safeVal(c.power) }) + "<br>"
     + t("miner.detail_eff", { eff: safeVal(c.eff), temp: safeVal(c.temp), up: fmtUptime(c.uptime) }) + "<br>"
     + t("miner.detail_worker", { w: esc(c.worker) || "-", a: safeVal(c.accepted), r: safeVal(c.rejected), s: safeVal(c.stale) })
@@ -599,6 +663,28 @@ async function pollProgress() {
 }
 
 /* ---------------- 集装箱 (AntBox) ---------------- */
+const CBOX_PUMP_KEYS = {
+  "循环泵": "cbox.pump_circulating", "喷淋泵": "cbox.pump_spray",
+  "风扇1": "cbox.pump_fan1", "风扇2": "cbox.pump_fan2",
+  "塔风扇1": "cbox.pump_tower_fan1", "塔风扇2": "cbox.pump_tower_fan2",
+  "塔风扇3": "cbox.pump_tower_fan3",
+};
+
+function containerPumpLabel(name) {
+  const key = CBOX_PUMP_KEYS[name];
+  if (key) return t(key);
+  return /[\u3400-\u9fff]/.test(name) ? t("cbox.unknown_device") : name;
+}
+
+function containerFaultLabel(fault) {
+  const key = `cbox.fault.${fault.flag}`;
+  const translated = t(key);
+  if (translated !== key) return translated;
+  const readable = String(fault.flag || "fault").replace(/_/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return t("cbox.fault_generic", { fault: readable });
+}
+
 async function refreshContainers() {
   const d = await jget("/api/containers");
   const cs = d.containers || [];
@@ -615,9 +701,9 @@ async function refreshContainers() {
         + `<div class="cbox-meta">${esc(t("cbox.last_temp", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp) }))}</div></div>`;
     }
     const dt = (c.supply_temp != null && c.return_temp != null) ? (c.return_temp - c.supply_temp).toFixed(1) : "-";
-    const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `<span class="pump ${v ? "on" : ""}">${esc(k)}</span>`).join("");
+    const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `<span class="pump ${v ? "on" : ""}">${esc(containerPumpLabel(k))}</span>`).join("");
     // 忽略列表内的故障置灰(info)，其余按严重级；按阈值标红低压力
-    const faults = (c.faults || []).map(f => `<span class="fbadge ${ign.has(f.flag) ? "info" : esc(f.sev)}">${esc(f.label)}</span>`).join("");
+    const faults = (c.faults || []).map(f => `<span class="fbadge ${ign.has(f.flag) ? "info" : esc(f.sev)}">${esc(containerFaultLabel(f))}</span>`).join("");
     const spLow = spMin && c.supply_pressure != null && c.supply_pressure < spMin;
     const rpLow = rpMin && c.return_pressure != null && c.return_pressure < rpMin;
     const realFault = (c.faults || []).some(f => !ign.has(f.flag)) || spLow || rpLow;
@@ -639,7 +725,7 @@ async function openContainer(ip) {
   const c = d.current || {};
   $("mTitle").textContent = t("cbox.title", { ip });
   const h = d.history || [];
-  const labels = h.map(x => new Date(x.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }));
+  const labels = h.map(x => new Date(x.ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false }));
   if (modalChart) modalChart.destroy();
   if (window.Chart) modalChart = new Chart($("mChart"), {
     type: "line",
@@ -652,8 +738,8 @@ async function openContainer(ip) {
     options: { interaction: { mode: "index", intersect: false },
       scales: { x: { ticks: { color: "#6e7681", maxTicksLimit: 6 } }, y: { ticks: { color: "#6e7681" } } }, plugins: { legend: { labels: { color: "#adbac7" } } } }
   });
-  const faults = (c.faults || []).map(f => `<span class="fbadge ${esc(f.sev)}">${esc(f.label)}</span>`).join("") || t("cbox.none_fault");
-  const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${esc(k)}:${v ? t("cmd.open") : t("cmd.close")}`).join(" ｜ ");
+  const faults = (c.faults || []).map(f => `<span class="fbadge ${esc(f.sev)}">${esc(containerFaultLabel(f))}</span>`).join("") || t("cbox.none_fault");
+  const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${esc(containerPumpLabel(k))}:${v ? t("cmd.open") : t("cmd.close")}`).join(" ｜ ");
   $("mInfo").innerHTML =
     `${esc(t("cbox.detail_temps", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp), set: safeVal(c.set_temp) }))}<br>`
     + `${esc(t("cbox.detail_press", { sp: safeVal(c.supply_pressure), rp: safeVal(c.return_pressure), f: safeVal(c.flow), ti: safeVal(c.tower_inlet_temp) }))}<br>`
@@ -918,7 +1004,7 @@ $("segClose").onclick = $("segCancel").onclick = () => {
 $("segSave").onclick = () => saveSeg(false);
 $("segSaveScan").onclick = () => saveSeg(true);
 
-/* ---------------- 顶部：掉线自动重启设置 ---------------- */
+/* ---------------- 顶部：零算力自动重启设置 ---------------- */
 async function loadRebootSettings() {
   if (!$("rebootBar") || myRole === "viewer") return;
   try {

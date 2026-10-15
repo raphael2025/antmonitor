@@ -60,6 +60,8 @@ section.panel { margin: 0 22px 22px; }
 .a.warn { border-left: 3px solid #f0883e; }
 .a.info { border-left: 3px solid #3fb950; }
 .a .ip { color: #58a6ff; cursor: pointer; }
+.a .aworker { color: #c9d1d9; font-size: 12px; white-space: nowrap; }
+.a .aworker b { color: #8b949e; font-weight: 600; }
 .a .atime { color: #6e7681; font-size: 11px; min-width: 128px; }
 .a .adetail { flex: 1; }
 .a.is-ack { opacity: .55; }
