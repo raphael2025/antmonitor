@@ -8,7 +8,8 @@ APP_NAME="AntMonitor"
 INSTALL_DIR="${ANTMONITOR_HOME:-/opt/antmonitor}"
 SERVICE_NAME="antmonitor"
 REPO_URL="${ANTMONITOR_REPO:-https://github.com/raphael2025/antmonitor.git}"
-BRANCH="${ANTMONITOR_BRANCH:-dev}"
+# 生产默认跟踪 main(dev 是开发分支，未经验证)。已安装的现场更新时沿用当前分支，见 sync_code
+BRANCH="${ANTMONITOR_BRANCH:-main}"
 PY_MIN="3.8"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -178,17 +179,24 @@ sync_code() {
       --exclude 'miner_monitor.db*' --exclude 'logs/' \
       --exclude 'settings.json' --exclude 'segments.json' \
       --exclude 'config.yaml' --exclude 'config.yaml.bak' \
-      --exclude 'cloud_site_id.txt' \
+      --exclude 'cloud_site_id.txt' --exclude 'backups/' --exclude 'certs/' \
+      --exclude '.update_state.json' \
       "$LOCAL_SRC"/ "$INSTALL_DIR"/
     # 保留 .git 便于日后 update（若目标尚无）
     if [[ -d "$LOCAL_SRC/.git" && ! -d "$INSTALL_DIR/.git" ]]; then
       rsync -a "$LOCAL_SRC/.git"/ "$INSTALL_DIR/.git"/
     fi
   elif [[ -d "$INSTALL_DIR/.git" ]]; then
-    info "git pull ($BRANCH)"
+    # 沿用现场当前分支(网页更新也是跟它)；只有显式设了 ANTMONITOR_BRANCH 才切换分支
+    local br
+    br="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    if [[ -n "${ANTMONITOR_BRANCH:-}" || "$br" == "HEAD" ]]; then
+      br="$BRANCH"
+    fi
+    info "git pull ($br)"
     git -C "$INSTALL_DIR" fetch --all --prune
-    git -C "$INSTALL_DIR" checkout "$BRANCH"
-    git -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH" || \
+    git -C "$INSTALL_DIR" checkout "$br"
+    git -C "$INSTALL_DIR" pull --ff-only origin "$br" || \
       warn "pull 失败（私有仓需部署密钥/Token）。可在有代码的机器上再跑本脚本。"
   else
     info "git clone $REPO_URL"
@@ -249,7 +257,8 @@ do_update() {
   echo
   info "$(msg m2)"
   [[ -d "$INSTALL_DIR" ]] || die "未安装: $INSTALL_DIR"
-  systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+  # 先在服务运行中拉代码、装依赖，全部成功后再重启：以前先 stop，断网等任一步失败
+  # (set -e 立即退出) 服务就一直停着，监控停摆没人知道
   sync_code
   setup_venv
   write_systemd

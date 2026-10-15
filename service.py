@@ -255,6 +255,8 @@ class MonitorService:
                 ips = [r["ip"] for r in results]
                 db.record_zero_reboot_attempts(self.conn, ips, int(time.time()))
                 self.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
+                # 逐批写审计：中途进程退出(更新重启)也不丢已下发的记录，限流照样有效
+                db.log_commands(self.conn, user, "reboot", results)
 
             results, err = control.run_batch(targets, "reboot", {}, self.cfg,
                                              before_group=self.mark_rebooting,
@@ -263,7 +265,6 @@ class MonitorService:
                 self.unmark_rebooting([ip for ip, _fw in targets])
                 log.warning("零算力自动重启批次错误: %s", err)
             if results:
-                db.log_commands(self.conn, user, "reboot", results)
                 ok_n = sum(1 for r in results if r["ok"])
                 log.info("零算力自动重启完成: 尝试 %d 台，已下发 %d 台", len(results), ok_n)
                 try:

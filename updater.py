@@ -44,6 +44,13 @@ HEALTHY_AFTER_SEC = 60
 # 同一份工作区(TOCTOU)，自检结果不可信。取不到锁就直接拒绝，绝不排队等待。
 _apply_lock = threading.Lock()
 
+# 由 server 注册：返回非空字符串 = 现在不宜更新(例如分批重启正在执行)，本次更新推迟。
+# 更新会重启进程，分批重启跑到一半被打断，后面几批就不执行了
+BUSY_CHECK = None
+
+# 依赖安装超时(秒)：矿场网络慢，给足时间；超时按安装失败处理，交给自检判断能否继续
+PIP_TIMEOUT = 600
+
 # 自检子进程超时(秒)。冷启动 import fastapi 一套在忙碌的 Windows 机器上可能要十几秒，
 # 留足余量：超时会被判定为自检失败并回滚，宁可宽松也别误伤好版本。
 SELFCHECK_TIMEOUT = 60
@@ -281,6 +288,31 @@ def _selfcheck():
     return _import_check()
 
 
+def _install_requirements(prev):
+    """requirements.txt 在 prev..HEAD 之间有变化时，用当前解释器(项目 venv)装依赖。
+    装失败只记日志：已装的旧依赖可能够用，由随后的自检(子进程 import server)最终判断。"""
+    req = os.path.join(BASE, "requirements.txt")
+    try:
+        if not os.path.exists(req) or not _git("diff", "--name-only", prev, "HEAD",
+                                               "--", "requirements.txt"):
+            return
+    except Exception as e:  # noqa: BLE001
+        log.warning("无法判断依赖是否变化: %s", e)
+        return
+    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", req]
+    if os.name == "nt":   # 与 windows_launcher 一致：Windows 上只装预编译包，避免现场编译
+        cmd.insert(-2, "--only-binary=:all:")
+    log.info("依赖有变化，安装中: %s", " ".join(cmd[3:]))
+    try:
+        r = subprocess.run(cmd, cwd=BASE, capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=PIP_TIMEOUT)
+        if r.returncode:
+            log.warning("依赖安装失败(退出码 %d): %s", r.returncode,
+                        ((r.stderr or "") + (r.stdout or "")).strip()[-500:])
+    except Exception as e:  # noqa: BLE001
+        log.warning("依赖安装失败: %s", e)
+
+
 def apply(branch=None, restart=True, force=False):
     """更新到远端最新(带互斥锁，同一时刻只允许一个更新任务)。
     force=True：人工手动更新，忽略"之前自检/启动失败"的坏版本记录再试一次(比如装好缺的依赖后)；
@@ -307,6 +339,9 @@ def _apply(branch=None, restart=True, force=False):
         return {"ok": False, "msg": f"无法检查工作区状态: {e}"}
     if dirty:
         return {"ok": False, "msg": "工作区有未提交改动，已拒绝自动更新；请先提交或妥善保存改动"}
+    busy = BUSY_CHECK() if BUSY_CHECK else ""
+    if busy:
+        return {"ok": False, "msg": f"{busy}，本次更新推迟，稍后再试"}
     st = check(branch)
     if st.get("error") or not st.get("behind"):
         return {"ok": False, "msg": st.get("error") or "已是最新版本", "check": st}
@@ -322,6 +357,7 @@ def _apply(branch=None, restart=True, force=False):
         _git("merge", "--ff-only", f"origin/{st['branch']}")
     except Exception as e:
         return {"ok": False, "msg": f"合并失败(本地有改动或分叉?): {e}"}
+    _install_requirements(prev)   # 新版本加了依赖：先装上，否则自检 import 必然失败、永远更新不上去
     err = _selfcheck()   # 自检不过就立刻回滚，绝不带病重启
     if err:
         _mark_bad(st.get("remote_full") or "")

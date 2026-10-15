@@ -1095,19 +1095,36 @@ CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
 # 重启互斥锁挂在 SVC 上(手动 API 与零算力自动重启共用)，见 MonitorService._reboot_lock
 
 
+def _update_busy():
+    """更新会重启进程：重启/批量命令执行中时推迟更新(手动和自动更新都走这里)。"""
+    if SVC._reboot_lock.locked() or CMD_PROGRESS.get("running"):
+        return "正在执行重启/批量命令"
+    return ""
+
+
+updater.BUSY_CHECK = _update_busy
+
+
 def _pools_desc(params):
     return "; ".join(f'{p.get("url")} {p.get("user")}' for p in
                      (params or {}).get("pools") or [] if isinstance(p, dict))[:300]
 
 
-def _record_command(user, action, params, results):
-    """审计 + 推送。换矿池把完整矿池地址/矿工名写进每条审计(以前只记 "pools updated"，
-    事后查不出被换到了哪个池)；重启/换矿池都推一条 Telegram，值班群里有人知道谁干了什么。"""
+def _audit_command(user, action, params, results):
+    """写审计。换矿池把完整矿池地址/矿工名写进每条审计(以前只记 "pools updated"，
+    事后查不出被换到了哪个池)。"""
     if action == "set_pools":
         desc = _pools_desc(params)
         for r in results:
             r["msg"] = f'{r["msg"]} | {desc}'[:500]
     db.log_commands(SVC.conn, user, action, results)
+
+
+def _record_command(user, action, params, results, audited=False):
+    """审计 + 推送：重启/换矿池都推一条 Telegram，值班群里有人知道谁干了什么。
+    audited=True：结果已逐批写过审计(异步分批)，这里只推送。"""
+    if not audited:
+        _audit_command(user, action, params, results)
     if action in DESTRUCTIVE_ACTIONS and results:
         ok_n = sum(1 for r in results if r["ok"])
         name = {"reboot": "重启", "set_pools": "换矿池"}[action]
@@ -1125,11 +1142,19 @@ def _run_command_bg(targets, action, params, user, skipped=None):
         def prog(done, total):
             CMD_PROGRESS["done"] = done
             CMD_PROGRESS["total"] = total
+        def after_group(_grp, group_results):
+            # 逐批写审计：分批重启要跑好几分钟，等全部跑完才记的话，中途进程退出(更新重启/
+            # 断电)会丢掉已重启机器的记录，24h 次数上限和 15 分钟间隔对它们就失效了
+            SVC.unmark_rebooting([r["ip"] for r in group_results if not r["ok"]])
+            _audit_command(user, action, params, group_results)
+
+        if skipped:
+            _audit_command(user, action, params, skipped)
         results, _err = control.run_batch(targets, action, params, CFG, progress=prog,
-                                          before_group=SVC.mark_rebooting)
-        SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
+                                          before_group=SVC.mark_rebooting,
+                                          after_group=after_group)
         all_results = list(skipped or []) + list(results)
-        _record_command(user, action, params, all_results)
+        _record_command(user, action, params, all_results, audited=True)
         ok_n = sum(1 for r in results if r["ok"])
         fail_n = len(results) - ok_n + len(skipped or [])
         CMD_PROGRESS["success"] = ok_n
