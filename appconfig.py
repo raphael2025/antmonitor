@@ -86,10 +86,6 @@ DEFAULTS = {
         "reboot_enabled": False,
         "reboot_max_per_day": 4,
         "reboot_min_interval_sec": 900,
-        # 自动重启防误判：连续 N 轮扫描确认离线才重启(服务刚启动第一轮不会重启)；
-        # 同一轮新掉线超过 reboot_auto_max 台视为扫描误判/网络故障，熔断这批不自动重启
-        "reboot_offline_rounds": 2,
-        "reboot_auto_max": 50,
         # 允许换到的矿池主机名(含子域名)。只能在 config.yaml 配置，网页改不了。
         # 为空 = 禁止网页换矿池、也不做矿池篡改告警
         "pool_allowlist": [],   # 下发重启后这么久内掉线不报警；过了仍不在线报"重启后未上线"
@@ -182,8 +178,6 @@ def _validate(cfg):
     clamp("control", "reboot_grace_sec", 0, 86400, int)
     clamp("control", "reboot_max_per_day", 1, 100, int)
     clamp("control", "reboot_min_interval_sec", 0, 86400, int)
-    clamp("control", "reboot_offline_rounds", 1, 20, int)
-    clamp("control", "reboot_auto_max", 1, 100000, int)
     # reboot_enabled 是 bool；yaml/json 里可能写成 0/1，归一成真正布尔
     cfg["control"]["reboot_enabled"] = bool(cfg["control"].get("reboot_enabled"))
     # 告警阈值：0 在这几项里是"关闭该告警"的约定语义，故下限取 0 而非正数；

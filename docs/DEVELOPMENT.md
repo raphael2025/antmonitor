@@ -183,7 +183,6 @@
 - `schedule`：`scan_interval`(巡检300)/`full_interval`(发现3600)/`container_interval`(10)/`watchdog_minutes`。
 - `alerts`：`cooldown`/`zero_grace_sec`/`reject_pct`/`segment_down_ratio/min`/`low_hashrate_*`/`overheat_*`/`container_faults_ignore`/压力阈值。
 - `control`：`enabled`(总开关)/`uniplus_password`/`timeout`/`max_batch`(批量上限)/`reboot_*`(浪涌保护)。
-- `control.reboot_offline_rounds`(默认2)/`reboot_auto_max`(默认50)：掉线自动重启防误判——连续 N 轮确认离线才重启(计数在内存，服务启动后第一轮不重启)；一轮“新掉线”超过上限即熔断，这批挂起到恢复在线为止并推送。
 - `auth`：`enabled`/`secure_cookie`/`users`(password 用 `python auth.py 新密码` 生成的 pbkdf2$ 哈希)。
 - `db`：`path`/`retention_days`(明细3天)/`rollup_retention_days`(计费400天)/`checkpoint_minutes`/`vacuum_hour`。
 - `server`：`host`/`port`/`trusted_proxies`(空=不信任 X-Forwarded-For，直连部署的正确选择)。

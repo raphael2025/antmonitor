@@ -156,63 +156,15 @@ class MonitorService:
             out.append(r)
         return out
 
-    def _update_offline_streak(self, records):
-        """记每台机"连续确认离线"的轮数(内存，重启服务即清零)。
-
-        只有 offline 才累加；online/unknown(本轮没探到，不算确认离线)/本轮不在样本里都清零。
-        自动重启要求连续 N 轮离线：单轮误判(全网发现拥堵、判活超时、上一轮没扫全导致
-        二次确认没覆盖到)不会直接触发重启。服务刚启动的第一轮计数都是 1，天然不会重启。"""
-        st = self._alert_state.setdefault("offline_streak", {})
-        hold = self._alert_state.setdefault("auto_reboot_hold", set())
-        seen = set()
-        for r in records:
-            ip = r["ip"]
-            seen.add(ip)
-            if r.get("status") == "offline":
-                st[ip] = st.get(ip, 0) + 1
-            else:
-                st.pop(ip, None)
-                hold.discard(ip)
-        for ip in list(st):
-            if ip not in seen:
-                st.pop(ip, None)
-                hold.discard(ip)
-        return st
-
     def _maybe_auto_reboot(self, records):
         """扫描评估后：若开启掉线自动重启，对候选机限流过滤后异步下发。"""
         import control  # 延迟导入：service 顶层不依赖 control，测扫描可不拉网络层
         ctl = self.cfg.get("control") or {}
-        # 开关关着也要计数：刚打开开关时，已连续掉线的机器不必再等 N 轮
-        streak = self._update_offline_streak(records)
         if not ctl.get("enabled") or not ctl.get("reboot_enabled"):
             return
-        need = max(1, int(ctl.get("reboot_offline_rounds", 2) or 1))
-        hold = self._alert_state.setdefault("auto_reboot_hold", set())
-        cands = [r for r in self.offline_reboot_candidates(records)
-                 if streak.get(r["ip"], 0) >= need and r["ip"] not in hold]
+        cands = self.offline_reboot_candidates(records)
         if not cands:
             return
-        # 熔断：短时间内大量机器同时"刚掉线"，多半是扫描拥堵/网络抖动造成的误判(二次确认
-        # 在 >reconfirm_max 台同时掉线时还会整体跳过)，而不是这么多机器同时死机。
-        # 长期掉线(连续轮数早超过 N)的死机不计入，否则大矿场常年几十台坏机会让熔断一直开着。
-        # 熔断的这批机器一直挂起不自动重启，直到它们恢复在线/未探测，交人工核实。
-        cap = int(ctl.get("reboot_auto_max", 50) or 50)
-        fresh = [r["ip"] for r in cands if streak.get(r["ip"], 0) <= need]
-        if len(fresh) > cap:
-            hold.update(fresh)
-            log.warning("自动重启熔断: %d 台同时新掉线超过上限 %d，疑似扫描误判/网络故障，"
-                        "本批不自动重启(交人工核实)", len(fresh), cap)
-            try:
-                alerts.push_text(
-                    self.cfg,
-                    f"⚠ 自动重启熔断：{len(fresh)} 台同时新掉线(上限 {cap})，"
-                    f"疑似扫描误判或网络故障，已暂停对这批机器自动重启，请人工核实")
-            except Exception:  # noqa: BLE001
-                log.exception("自动重启熔断推送失败")
-            cands = [r for r in cands if r["ip"] not in hold]
-            if not cands:
-                return
         targets = [(r["ip"], r.get("firmware") or "") for r in cands]
         allowed, skipped = control.filter_reboot_targets(self.conn, targets, self.cfg)
         user = "system@auto-reboot"
