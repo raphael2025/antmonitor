@@ -90,10 +90,11 @@ DEFAULTS = {
         "reboot_enabled": False,
         "reboot_max_per_day": 4,
         "reboot_min_interval_sec": 900,
-        # 全场零算力熔断：本轮在线机里零算力超过此台数或占比(占比至少5台才算) → 视为矿池故障/限电/断网，
-        # 不自动重启(0=不按该项判断)
-        "zero_reboot_max_count": 50,
-        "zero_reboot_max_ratio": 0.2,
+        # 成片零算力熔断：某 /24 网段零算力 ≥ zero_reboot_mass_min 台且占该段在线机比例
+        # > zero_reboot_mass_ratio → 只暂停该段的零算力自动重启(维护/断电/矿池配置问题)；
+        # 去掉这些网段后全场剩余在线机仍满足同样条件 → 全场暂停(矿池故障/限电)。ratio=0 关闭熔断
+        "zero_reboot_mass_min": 5,
+        "zero_reboot_mass_ratio": 0.2,
         # 允许换到的矿池主机名(含子域名)。只能在 config.yaml 配置，网页改不了。
         # 为空 = 禁止网页换矿池、也不做矿池篡改告警
         "pool_allowlist": [],   # 下发重启后这么久内掉线不报警；过了仍不在线报"重启后未上线"
@@ -223,8 +224,8 @@ def _validate(cfg):
     clamp("control", "reboot_grace_sec", 0, 86400, int)
     clamp("control", "reboot_max_per_day", 1, 100, int)
     clamp("control", "reboot_min_interval_sec", 0, 86400, int)
-    clamp("control", "zero_reboot_max_count", 0, 100000, int)
-    clamp("control", "zero_reboot_max_ratio", 0, 1)
+    clamp("control", "zero_reboot_mass_min", 1, 100000, int)
+    clamp("control", "zero_reboot_mass_ratio", 0, 1)
     # 告警阈值：0 在这几项里是"关闭该告警"的约定语义，故下限取 0 而非正数；
     # 比例类限制在 0~1，百分比类限制在 0~100，温度取物理上可能的范围。
     clamp("alerts", "overheat_c", 0, 200)

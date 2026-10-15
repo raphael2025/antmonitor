@@ -162,34 +162,63 @@ class MonitorService:
         if not ctl.get("enabled") or not ctl.get("reboot_enabled"):
             return []
 
-        # 全场性零算力(矿池故障/限电休眠/断网)：重启解决不了，还会把休眠机全部唤醒。
-        # 本轮在线机里零算力占比或台数超限 → 整轮不重启，并把未尝试过的计时清零，
-        # 事件结束后掉队的机器重新等满 15 分钟，而不是一恢复就被立刻重启。
-        online = [r for r in records if r.get("status") == "online"
-                  and r["ip"] in roster and r["ip"] not in repair]
-        zero_n = sum(1 for r in online if r.get("hr_rt") == 0)
-        max_n = int(ctl.get("zero_reboot_max_count", 50) or 0)
-        max_ratio = float(ctl.get("zero_reboot_max_ratio", 0.2) or 0)
-        # 占比只在零算力达到 5 台以上时才看：小场地 1~2 台坏机不该被当成全场事件
-        mass = (max_n and zero_n > max_n) or (
-            max_ratio and zero_n >= 5 and zero_n / len(online) > max_ratio)
-        if mass:
-            db.clear_zero_reboot_states(
-                self.conn, [ip for ip, st in states.items() if int(st.get("attempts") or 0) == 0])
-            if not self._alert_state.get("zero_mass"):
-                self._alert_state["zero_mass"] = True
-                log.warning("零算力自动重启暂停: %d/%d 台在线机同时零算力，疑似矿池故障/限电",
-                            zero_n, len(online))
-                try:
-                    alerts.push_text(
-                        self.cfg,
-                        f"⚠ {zero_n}/{len(online)} 台在线机同时零算力，疑似矿池故障/限电/断网，"
-                        f"已暂停零算力自动重启，恢复后自动继续")
-                except Exception:  # noqa: BLE001
-                    log.exception("零算力熔断推送失败")
+        # 成片零算力 = 事件，不是单机故障：重启解决不了，还会把休眠机全部唤醒。
+        #   1) 按 /24 网段：段内零算力 ≥ zero_reboot_mass_min 台且占该段在线机 > zero_reboot_mass_ratio
+        #      → 只暂停这一段(维护某个网段、该段断电/交换机/矿池配置问题)，其他网段照常
+        #   2) 去掉暂停的网段后，剩余在线机仍满足同样条件 → 全场性(矿池故障/限电/断网)，整体暂停
+        # 暂停范围内未尝试过的计时清零：事件结束后掉队的机器重新等满 15 分钟，而不是一恢复就被重启
+        mass_min = int(ctl.get("zero_reboot_mass_min", 5) or 1)
+        mass_ratio = float(ctl.get("zero_reboot_mass_ratio", 0.2) or 0)
+
+        def is_mass(zero, total):
+            return bool(mass_ratio) and total > 0 and zero >= mass_min and zero / total > mass_ratio
+
+        seg_total, seg_zero = {}, {}
+        for r in records:
+            ip = r["ip"]
+            if r.get("status") != "online" or ip not in roster or ip in repair:
+                continue
+            seg = ".".join(ip.split(".")[:3])
+            seg_total[seg] = seg_total.get(seg, 0) + 1
+            if r.get("hr_rt") == 0:
+                seg_zero[seg] = seg_zero.get(seg, 0) + 1
+        mass_segs = {seg for seg, z in seg_zero.items() if is_mass(z, seg_total[seg])}
+        rest_total = sum(n for seg, n in seg_total.items() if seg not in mass_segs)
+        rest_zero = sum(n for seg, n in seg_zero.items() if seg not in mass_segs)
+        site_mass = is_mass(rest_zero, rest_total)
+        if site_mass:
+            mass_segs = set(seg_total)
+        paused = set(mass_segs)
+
+        clear = [ip for ip, st in states.items() if int(st.get("attempts") or 0) == 0
+                 and ".".join(ip.split(".")[:3]) in paused]
+        db.clear_zero_reboot_states(self.conn, clear)
+        for ip in clear:
+            states.pop(ip, None)
+
+        prev = self._alert_state.get("zero_mass_segs") or set()
+        new_segs = sorted(paused - prev)
+        if new_segs:
+            if site_mass:
+                z = sum(seg_zero.values())
+                t = sum(seg_total.values())
+                text = (f"⚠ {z}/{t} 台在线机同时零算力，疑似矿池故障/限电/断网，"
+                        f"已暂停全场零算力自动重启，恢复后自动继续")
+            else:
+                desc = "、".join(f"{seg}.x({seg_zero[seg]}/{seg_total[seg]})" for seg in new_segs[:10])
+                more = f" 等 {len(new_segs)} 个网段" if len(new_segs) > 10 else ""
+                text = (f"⚠ 网段 {desc}{more} 成片零算力，疑似维护/断电/矿池配置问题，"
+                        f"已暂停这些网段的零算力自动重启，其他网段照常")
+            log.warning(text)
+            try:
+                alerts.push_text(self.cfg, text)
+            except Exception:  # noqa: BLE001
+                log.exception("零算力熔断推送失败")
+        if prev - paused:
+            log.info("零算力成片事件解除: %s", ", ".join(sorted(prev - paused)[:10]))
+        self._alert_state["zero_mass_segs"] = paused
+        if site_mass:
             return []
-        if self._alert_state.pop("zero_mass", None):
-            log.info("全场零算力已解除，零算力自动重启恢复")
 
         grace = int(acfg.get("zero_grace_sec", 600) or 0)
         starts = []
@@ -198,7 +227,7 @@ class MonitorService:
             if r.get("status") != "online" or r.get("hr_rt") != 0:
                 continue
             seg = ".".join(ip.split(".")[:3])
-            if ip in repair or seg in active_segments:
+            if ip in repair or seg in active_segments or seg in paused:
                 continue
             # Start the 15-minute timer on the first zero sample. Startup grace is
             # checked separately before sending, so it never delays the timer itself.
@@ -223,7 +252,7 @@ class MonitorService:
                 if grace and isinstance(uptime, (int, float)) and uptime < grace:
                     continue
                 seg = ".".join(ip.split(".")[:3])
-                if ip in repair or seg in active_segments:
+                if ip in repair or seg in active_segments or seg in paused:
                     continue
             else:
                 # 自动重启只处理在线且明确读到 0 算力的机器。
