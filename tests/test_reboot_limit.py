@@ -135,3 +135,76 @@ def test_apply_settings_reboot_keys(cfg):
     assert ctl["reboot_delay_sec"] == 12
     assert ctl["reboot_max_per_day"] == 3
     assert ctl["reboot_min_interval_sec"] == 600
+
+
+def _auto_svc(conn, cfg, monkeypatch):
+    """开启自动重启的 svc；下发线程替换成记录器，测试里同步等它跑完。"""
+    cfg["control"]["enabled"] = True
+    cfg["control"]["reboot_enabled"] = True
+    svc = _svc(conn, cfg)
+    sent, pushed = [], []
+
+    def fake_run(targets, user):
+        sent.append(sorted(t[0] for t in targets))
+        svc._reboot_lock.release()
+
+    svc._run_auto_reboot = fake_run
+    monkeypatch.setattr(service.alerts, "push_text", lambda c, t: pushed.append(t))
+
+    def tick(records):
+        svc._maybe_auto_reboot(records)
+        for t in threading.enumerate():
+            if t.name == "auto-reboot":
+                t.join(5)
+    return svc, sent, pushed, tick
+
+
+def test_auto_reboot_needs_consecutive_offline_rounds(conn, cfg, monkeypatch):
+    """单轮离线(含服务刚启动第一轮)不重启；连续 2 轮确认离线才重启。"""
+    svc, sent, _p, tick = _auto_svc(conn, cfg, monkeypatch)
+    db.upsert_known_miners(conn, [rec("10.0.5.1"), rec("10.0.5.2")], int(time.time()))
+    tick([rec("10.0.5.1", status="offline"), rec("10.0.5.2")])
+    assert sent == []
+    # 中间一轮在线 / 未探测 → 计数清零
+    tick([rec("10.0.5.1", status="unknown"), rec("10.0.5.2")])
+    tick([rec("10.0.5.1", status="offline"), rec("10.0.5.2")])
+    assert sent == []
+    tick([rec("10.0.5.1", status="offline"), rec("10.0.5.2")])
+    assert sent == [["10.0.5.1"]]
+
+
+def test_auto_reboot_breaker_on_mass_fresh_offline(conn, cfg, monkeypatch):
+    """一轮大量新掉线(扫描误判) → 熔断不重启，且这批一直挂起直到恢复在线。"""
+    cfg["control"]["reboot_auto_max"] = 10
+    svc, sent, pushed, tick = _auto_svc(conn, cfg, monkeypatch)
+    ips = [f"10.1.{i}.1" for i in range(20)]   # 每段 1 台，不触发整段掉线
+    db.upsert_known_miners(conn, [rec(ip) for ip in ips], int(time.time()))
+    off = [rec(ip, status="offline") for ip in ips]
+    for _ in range(4):
+        tick(off)
+    assert sent == []
+    assert len(pushed) == 1   # 只推一次
+    # 恢复在线后再单独掉线：解除挂起，按正常流程重启
+    tick([rec(ip) for ip in ips])
+    one = [rec(ips[0], status="offline")] + [rec(ip) for ip in ips[1:]]
+    tick(one)
+    tick(one)
+    assert sent == [[ips[0]]]
+
+
+def test_auto_reboot_long_dead_do_not_trip_breaker(conn, cfg, monkeypatch):
+    """常年掉线的坏机不计入"新掉线"熔断计数，不会把熔断一直顶开。"""
+    cfg["control"]["reboot_auto_max"] = 3
+    cfg["control"]["reboot_min_interval_sec"] = 0
+    svc, sent, _p, tick = _auto_svc(conn, cfg, monkeypatch)
+    dead = [f"10.2.{i}.1" for i in range(5)]
+    db.upsert_known_miners(conn, [rec(ip) for ip in dead + ["10.3.0.1"]], int(time.time()))
+    # 服务刚启动时 5 台都是"新掉线" → 熔断挂起
+    tick([rec(ip, status="offline") for ip in dead] + [rec("10.3.0.1")])
+    tick([rec(ip, status="offline") for ip in dead] + [rec("10.3.0.1")])
+    assert sent == []
+    # 之后新掉的单台照常重启
+    recs = [rec(ip, status="offline") for ip in dead] + [rec("10.3.0.1", status="offline")]
+    tick(recs)
+    tick(recs)
+    assert sent == [["10.3.0.1"]]

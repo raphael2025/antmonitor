@@ -94,6 +94,8 @@ control:
   reboot_enabled: false    # 掉线自动重启总开关(默认关；网页顶部可开)。只挡自动，手动仍可用
   reboot_max_per_day: 4    # 滚动 24h 内每 IP 最多成功重启次数(手动+自动共用；只计 ok=1)
   reboot_min_interval_sec: 900  # 同一 IP 两次成功重启最小间隔(秒)；默认 15 分钟
+  reboot_offline_rounds: 2 # 自动重启前须连续几轮扫描确认离线(防单轮误判；服务启动后第一轮不会自动重启)
+  reboot_auto_max: 50      # 同一轮"新掉线"超过此数 → 判定为扫描误判/网络故障，熔断这批不自动重启并推送
   # 矿池白名单(防偷算力)：API 换矿池只能换到这些主机名(及其子域名)；扫描时发现矿机上
   # 配了白名单外的矿池(含备用池)→ 严重告警。只能在这里改，网页改不了。留空=禁止 API 换矿池。
   pool_allowlist: []       # 例: ["f2pool.com", "antpool.com", "viabtc.com"]
