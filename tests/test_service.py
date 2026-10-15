@@ -342,3 +342,19 @@ def test_mass_hashrate_drop_does_not_reprobe_the_whole_farm(svc, monkeypatch):
     svc.scan_full("full")
     svc.scan_full("full")
     assert calls[-1] == ["10.9.0.5"]                  # 只重探了掉线的那台
+
+
+def test_repair_flag_kept_until_machine_hashes_again(svc, monkeypatch):
+    """维修中：控制板在线但零算力(拆了算力板)不撤销标记；出算力才自动恢复。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1")]))
+    svc.scan_full("full")
+    db.set_machine_state(svc.conn, ["10.9.0.1"], "repair")
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1", hr_rt=0)]))
+    svc.scan_full("full")
+    assert "10.9.0.1" in db.repair_ips(svc.conn)
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1", hr_rt=None)]))
+    svc.scan_full("full")
+    assert "10.9.0.1" in db.repair_ips(svc.conn)
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1")]))
+    svc.scan_full("full")
+    assert "10.9.0.1" not in db.repair_ips(svc.conn)

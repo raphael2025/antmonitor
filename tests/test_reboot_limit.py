@@ -128,3 +128,38 @@ def test_apply_settings_reboot_keys(cfg):
     assert ctl["reboot_delay_sec"] == 12
     assert ctl["reboot_max_per_day"] == 3
     assert ctl["reboot_min_interval_sec"] == 600
+
+
+def test_mass_zero_hashrate_pauses_auto_reboot(conn, cfg, monkeypatch):
+    """矿池故障/限电：全场同时零算力 → 不重启、清计时，事件结束后重新计时 15 分钟。"""
+    cfg["control"]["enabled"] = True
+    cfg["control"]["reboot_enabled"] = True
+    svc = _svc(conn, cfg)
+    pushed = []
+    monkeypatch.setattr(service.alerts, "push_text", lambda c, t: pushed.append(t))
+    now = int(time.time())
+    ips = [f"10.0.{i // 200}.{i % 200 + 1}" for i in range(100)]
+    db.upsert_known_miners(conn, [rec(ip) for ip in ips], now)
+    zero = [rec(ip, hr_rt=0) for ip in ips]
+    assert svc.zero_reboot_candidates(zero, now=now) == []
+    assert svc.zero_reboot_candidates(zero, now=now + 1800) == []
+    assert len(pushed) == 1
+    assert db.zero_reboot_states(conn) == {}
+    # 恢复后剩 1 台还是零算力：重新起算，不会立刻重启
+    one = [rec(ips[0], hr_rt=0)] + [rec(ip) for ip in ips[1:]]
+    assert svc.zero_reboot_candidates(one, now=now + 1900) == []
+    got = svc.zero_reboot_candidates(one, now=now + 1900 + 900)
+    assert [t[0] for t in got] == [ips[0]]
+
+
+def test_mass_zero_ratio_needs_min_count(conn, cfg):
+    """小场地 1 台零算力占比虽高，不算全场事件。"""
+    cfg["control"]["enabled"] = True
+    cfg["control"]["reboot_enabled"] = True
+    svc = _svc(conn, cfg)
+    now = int(time.time())
+    db.upsert_known_miners(conn, [rec("10.0.9.1"), rec("10.0.9.2")], now)
+    recs = [rec("10.0.9.1", hr_rt=0), rec("10.0.9.2")]
+    svc.zero_reboot_candidates(recs, now=now)
+    got = svc.zero_reboot_candidates(recs, now=now + 900)
+    assert [t[0] for t in got] == ["10.0.9.1"]

@@ -148,6 +148,35 @@ class MonitorService:
         if not ctl.get("enabled") or not ctl.get("reboot_enabled"):
             return []
 
+        # 全场性零算力(矿池故障/限电休眠/断网)：重启解决不了，还会把休眠机全部唤醒。
+        # 本轮在线机里零算力占比或台数超限 → 整轮不重启，并把未尝试过的计时清零，
+        # 事件结束后掉队的机器重新等满 15 分钟，而不是一恢复就被立刻重启。
+        online = [r for r in records if r.get("status") == "online"
+                  and r["ip"] in roster and r["ip"] not in repair]
+        zero_n = sum(1 for r in online if r.get("hr_rt") == 0)
+        max_n = int(ctl.get("zero_reboot_max_count", 50) or 0)
+        max_ratio = float(ctl.get("zero_reboot_max_ratio", 0.2) or 0)
+        # 占比只在零算力达到 5 台以上时才看：小场地 1~2 台坏机不该被当成全场事件
+        mass = (max_n and zero_n > max_n) or (
+            max_ratio and zero_n >= 5 and zero_n / len(online) > max_ratio)
+        if mass:
+            db.clear_zero_reboot_states(
+                self.conn, [ip for ip, st in states.items() if int(st.get("attempts") or 0) == 0])
+            if not self._alert_state.get("zero_mass"):
+                self._alert_state["zero_mass"] = True
+                log.warning("零算力自动重启暂停: %d/%d 台在线机同时零算力，疑似矿池故障/限电",
+                            zero_n, len(online))
+                try:
+                    alerts.push_text(
+                        self.cfg,
+                        f"⚠ {zero_n}/{len(online)} 台在线机同时零算力，疑似矿池故障/限电/断网，"
+                        f"已暂停零算力自动重启，恢复后自动继续")
+                except Exception:  # noqa: BLE001
+                    log.exception("零算力熔断推送失败")
+            return []
+        if self._alert_state.pop("zero_mass", None):
+            log.info("全场零算力已解除，零算力自动重启恢复")
+
         grace = int(acfg.get("zero_grace_sec", 600) or 0)
         starts = []
         for r in records:
@@ -531,8 +560,10 @@ class MonitorService:
             self.progress["last_finished"] = ts
 
             fired, cfired = [], []
-            try:   # 维修机重新上线 → 自动恢复为正常
-                back = db.repair_ips(self.conn) & online_ips
+            try:   # 维修机恢复出算力 → 自动恢复为正常。只看"在线"不够：拆了算力板、控制板
+                # 还通电的机器在线但零算力，一上线就撤销标记会让它照常报警、被零算力自动重启
+                back = db.repair_ips(self.conn) & {
+                    r["ip"] for r in online_recs if (r.get("hr_rt") or 0) > 0}
                 if back:
                     db.set_machine_state(self.conn, list(back), "active")
             except Exception as e:  # noqa: BLE001
