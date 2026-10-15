@@ -126,3 +126,17 @@ def test_batch_does_not_write_for_nonexistent_alerts(conn, cfg):
         b.resolve(ip, "zero")
     assert b.to_resolve == []
     assert b.commit() == []
+
+
+def test_overheat_still_reported_inside_down_segment(conn, cfg):
+    """部分断电：段内 12/20 掉线触发整段事件，还在线的那台 99℃ 必须照报高温。"""
+    ips = [f"10.0.8.{i}" for i in range(1, 21)]
+    _roster(conn, ips)
+    _run(conn, cfg, [rec(ip) for ip in ips])
+    recs = ([rec(ip, status="offline") for ip in ips[:12]]
+            + [rec(ips[12], temp=99)] + [rec(ip) for ip in ips[13:]])
+    fired = [(f[0], f[1]) for f in _run(conn, cfg, recs)]
+    assert ("10.0.8.x", "segment_down") in fired
+    assert (ips[12], "overheat") in fired
+    _run(conn, cfg, recs)   # 下一轮仍在整段事件中：已有高温告警不被消掉
+    assert db.active_alert(conn, ips[12], "overheat") is not None

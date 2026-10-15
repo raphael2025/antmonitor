@@ -62,6 +62,7 @@ class MonitorService:
         self._container_miss = {}     # 集装箱连续未采到次数(二次确认离线，防一次丢包误报)
         self._container_miss_n = 2
         self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数、刚重启的机器)
+        self._restore_rebooting()
         self._last_full = 0.0         # 上次全网发现完成的 monotonic 时刻
         self._last_checkpoint = 0.0
         self._last_rollup = 0.0
@@ -98,6 +99,19 @@ class MonitorService:
         now = int(time.time())
         for ip in ips:
             rb[ip] = now
+
+    def _restore_rebooting(self):
+        """重启静默期标记只在内存里：静默期内服务一重启，正在开机的整批机器会被当成掉线
+        推 crit，"重启后 N 分钟仍未上线"也不再出现。从审计里成功下发的重启恢复回来。"""
+        grace = int((self.cfg.get("control") or {}).get("reboot_grace_sec", 600) or 600)
+        try:
+            marks = db.recent_reboots(self.conn, int(time.time()) - grace)
+        except Exception as e:  # noqa: BLE001
+            log.warning("恢复重启静默期标记失败: %s", e)
+            return
+        if marks:
+            self._alert_state.setdefault("rebooting", {}).update(marks)
+            log.info("已恢复 %d 台机器的重启静默期标记", len(marks))
 
     def unmark_rebooting(self, ips):
         rb = self._alert_state.setdefault("rebooting", {})

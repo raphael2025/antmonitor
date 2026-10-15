@@ -700,6 +700,14 @@ def list_commands(conn, limit=100):
     return [dict(r) for r in rows]
 
 
+def recent_reboots(conn, since_ts):
+    """since_ts 之后成功下发过重启的 IP → 最近一次时间。服务重启后据此恢复重启静默期标记。"""
+    rows = _r(conn).execute(
+        "SELECT ip, MAX(ts) AS t FROM command_log WHERE action='reboot' AND ok=1 AND ts>=? "
+        "GROUP BY ip", (int(since_ts),)).fetchall()
+    return {r["ip"]: int(r["t"]) for r in rows}
+
+
 def reboot_stats(conn, ips, window_sec=86400):
     """每 IP 在滚动 window_sec 内成功重启次数与最近一次成功时间。
 

@@ -5,6 +5,7 @@
 落库口径、内存快照、IP 迁移自动下架、世代作废。
 """
 import threading
+import time
 
 import pytest
 
@@ -358,3 +359,27 @@ def test_repair_flag_kept_until_machine_hashes_again(svc, monkeypatch):
     monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1")]))
     svc.scan_full("full")
     assert "10.9.0.1" not in db.repair_ips(svc.conn)
+
+
+def test_reboot_grace_marks_survive_service_restart(cfg, monkeypatch, tmp_path):
+    """静默期内服务重启：从审计恢复标记，正在开机的机器不被当成掉线推 crit。"""
+    cfg["db"]["path"] = str(tmp_path / "r.db")
+    cfg["schedule"]["enabled"] = False
+    now = int(time.time())
+    s1 = service.MonitorService(cfg)
+    db.log_commands(s1.conn, "ops@test", "reboot", [
+        {"ip": "10.9.0.1", "ok": True, "msg": "ok"},
+        {"ip": "10.9.0.2", "ok": False, "msg": "连不上"}])
+    with db._wlock, s1.conn:   # 很久以前的重启：静默期早过，不恢复
+        s1.conn.execute("INSERT INTO command_log(ts,user,action,ip,ok,msg) "
+                        "VALUES(?,?,?,?,?,?)", (now - 7200, "x", "reboot", "10.9.0.3", 1, "ok"))
+    s1.stop()
+    s1.conn.close()
+    db.close_readers()
+    s2 = service.MonitorService(cfg)
+    try:
+        assert set(s2._alert_state["rebooting"]) == {"10.9.0.1"}
+    finally:
+        s2.stop()
+        s2.conn.close()
+        db.close_readers()

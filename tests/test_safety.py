@@ -215,3 +215,51 @@ def test_log_rotation_blocked_by_locked_file_does_not_lose_records(tmp_path, mon
         h.close()
     text = path.read_text(encoding="utf-8")
     assert all(f"record-{i:02d}" in text for i in range(30)) and not errors
+
+
+def test_telegram_push_retries_network_errors_and_respects_429(monkeypatch):
+    """断网/限流时补推：告警已落库为活跃，之后不会再推第二次，丢了就永远丢了。"""
+    import requests
+
+    class Resp:
+        status_code = 429
+
+        def json(self):
+            return {"parameters": {"retry_after": 7}}
+
+    seq = [requests.ConnectionError("断网"),
+           requests.HTTPError("限流", response=Resp()), None]
+    sent, slept = [], []
+
+    def send(cfg, text):
+        e = seq.pop(0)
+        if e:
+            raise e
+        sent.append(text)
+
+    monkeypatch.setattr(alerts, "_tg_send", send)
+    monkeypatch.setattr(alerts, "_sleep", slept.append)
+    alerts._send_with_retry({}, "掉线")
+    assert sent == ["掉线"] and slept == [5, 7]
+
+
+def test_telegram_long_message_split_and_bad_request_not_retried(monkeypatch):
+    import requests
+
+    class Resp:
+        status_code = 400
+
+    sent, slept = [], []
+
+    def send(cfg, text):
+        sent.append(text)
+        if text.startswith("坏"):
+            raise requests.HTTPError("bad", response=Resp())
+
+    monkeypatch.setattr(alerts, "_tg_send", send)
+    monkeypatch.setattr(alerts, "_sleep", slept.append)
+    alerts._send_with_retry({}, "\n".join(["x" * 1000] * 9))
+    assert len(sent) == 3 and all(len(t) <= alerts._TG_MAX_LEN for t in sent)
+    sent.clear()
+    alerts._send_with_retry({}, "坏请求")
+    assert sent == ["坏请求"] and slept == []
