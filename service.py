@@ -66,6 +66,7 @@ class MonitorService:
         self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数、刚重启的机器)
         self._restore_rebooting()
         self._last_full = 0.0         # 上次全网发现完成的 monotonic 时刻
+        self._early_full = False      # 巡检发现疑似 IP 迁移 → 下一轮提前做全网发现
         self._last_checkpoint = 0.0
         self._last_rollup = 0.0
         self._last_vacuum_day = None
@@ -589,6 +590,8 @@ class MonitorService:
                     r["worker"] = r.get("worker") or info.get("worker") or ""
                     r["firmware"] = r.get("firmware") or info.get("firmware") or ""
 
+            if kind == "quick":
+                self._maybe_request_early_full(miners)
             miners = self._drop_migrated_ghosts(miners)
 
             # 只落库在线机 + 名册内(曾在线/维修)的离线机；丢弃约1.5万死IP空记录。
@@ -677,6 +680,28 @@ class MonitorService:
                 lock.release()
             except RuntimeError as e:
                 log.warning("_do_scan release error: %s", e)
+
+    def _maybe_request_early_full(self, miners):
+        """巡检只探名册内的老 IP，看不到机器换到的新 IP：IP 迁移(改静态/DHCP 换址)造成的假掉线
+        要等下一次全网发现(最长 full_interval)才会被识别为残影。巡检发现有身份(SN/MAC)的机器
+        刚掉线时，提前做一次全网发现。
+        限制：一次掉线超过 migrate_max 台不触发(那是断电/交换机故障，不是迁移，此时全网扫描
+        只会加重三层压力)；距上次全网发现不足 early_full_min_interval 不触发。"""
+        sc = self.cfg["scan"]
+        min_iv = int(sc.get("early_full_min_interval", 1200) or 0)
+        if not min_iv or self._early_full:
+            return
+        if self._last_full and time.monotonic() - self._last_full < min_iv:
+            return
+        prev_online = set(db.online_ips(self.conn))
+        newly_off = [r["ip"] for r in miners if r["status"] == "offline" and r["ip"] in prev_online
+                     and (miner_core.sn_valid(r.get("sn")) or miner_core.normalize_mac(r.get("mac")))]
+        if not newly_off or len(newly_off) > int(sc.get("migrate_max", 200)):
+            return
+        log.info("巡检发现 %d 台有身份的机器刚掉线(%s…)，提前做一次全网发现以识别 IP 迁移",
+                 len(newly_off), newly_off[:5])
+        self._early_full = True
+        self.wake()
 
     def _drop_migrated_ghosts(self, miners):
         """自动识别 IP 迁移(改静态等)：同一台机(按SN)已在新IP上线、旧IP掉线 → 旧IP是残影，
@@ -807,11 +832,13 @@ class MonitorService:
             try:   # 单轮扫描失败不杀死调度线程(否则监控会永久静默停摆)
                 sch = self.cfg["schedule"]
                 full_iv = sch.get("full_interval", 3600)
-                need_full = (self._last_full == 0.0) or (start - self._last_full >= full_iv)
+                need_full = (self._last_full == 0.0 or start - self._last_full >= full_iv
+                             or self._early_full)
                 result = self.scan_full("full") if need_full else self.scan_quick()
                 skipped = result is None   # 锁被占用(手动扫描在跑)→尽快重试，别空等满间隔
                 if result and result.get("kind") == "full":
                     self._last_full = time.monotonic()
+                    self._early_full = False
             except Exception as e:  # noqa: BLE001
                 log.exception("scan loop error: %s", e)
             if self._stop.is_set():
@@ -854,7 +881,10 @@ class MonitorService:
                     except Exception:  # noqa: BLE001
                         pass
         else:
-            db.resolve_alert(self.conn, "__monitor__", "stalled")
+            if db.active_alert(self.conn, "__monitor__", "stalled"):
+                db.resolve_alert(self.conn, "__monitor__", "stalled")
+                if (self.cfg.get("alerts") or {}).get("push_recovery", True):
+                    alerts.push_text(self.cfg, "✅ 矿机监控已恢复正常扫描")
             self._ensure_scan_thread("watchdog")
         self._ensure_container_loop()
         return stale

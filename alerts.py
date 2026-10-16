@@ -122,6 +122,25 @@ def _tg_send(tg_cfg, text):
     r.raise_for_status()
 
 
+# 恢复时推送通知的告警类型(严重类)。零算力/掉算力/拒绝率这类 warn 抖动多，恢复不推，免得刷屏
+RECOVERY_TYPES = ("offline", "segment_down", "overheat", "pool_hijack", "cooler_offline")
+_RECOVERY_LABEL = {"offline": "掉线", "segment_down": "整段掉线", "overheat": "高温",
+                   "pool_hijack": "矿池不在白名单", "cooler_offline": "集装箱控制器离线"}
+
+
+def _push_recovered(cfg, recovered):
+    if not recovered or not (cfg.get("alerts") or {}).get("push_recovery", True):
+        return
+    lines = ["<b>✅ 告警恢复</b>"]
+    for ip, type_ in recovered[:30]:
+        label = _RECOVERY_LABEL.get(type_) or (
+            f"集装箱故障 {type_.split(':', 1)[1]}" if type_.startswith("cooler:") else type_)
+        lines.append(f"🟢 {html.escape(str(ip))} {html.escape(label)} 已恢复")
+    if len(recovered) > 30:
+        lines.append(f"... 另有 {len(recovered) - 30} 条")
+    _enqueue(cfg.get("telegram", {}), "\n".join(lines))
+
+
 class _Batch:
     """一轮评估的告警增量收集器：内存里判重/判冷却，最后两条 SQL 落库。"""
 
@@ -132,6 +151,7 @@ class _Batch:
         self.active, self.cooled = db.alert_state(conn, now - cooldown if cooldown else 0)
         self.to_fire = []      # [(ip, type, sev, detail)]
         self.to_resolve = []   # [(ip, type)]
+        self.recovered = []    # [(ip, type)] 真恢复(不含维修/掉线连带消掉的)，用于推送恢复通知
 
     def fire(self, ip, type_, sev, detail, force=False):
         key = (ip, type_)
@@ -143,12 +163,15 @@ class _Batch:
         self.active.add(key)            # 同一轮内不重复
         self.to_fire.append((ip, type_, sev, detail))
 
-    def resolve(self, ip, type_):
+    def resolve(self, ip, type_, recovered=True):
+        """recovered=False：不是故障恢复，只是不再适用(维修中/机器掉线连带清掉高温等)，不推恢复通知。"""
         key = (ip, type_)
         if key not in self.active:      # 本来就没有 → 不产生无谓 UPDATE
             return
         self.active.discard(key)
         self.to_resolve.append(key)
+        if recovered and (type_ in RECOVERY_TYPES or type_.startswith("cooler:")):
+            self.recovered.append(key)
 
     def commit(self):
         if self.to_resolve:
@@ -267,11 +290,11 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         seg = ".".join(ip.split(".")[:3])
         if r["status"] == "offline":
             for t in ("zero", "reject", "low_hashrate", "overheat"):
-                b.resolve(ip, t)
+                b.resolve(ip, t, recovered=False)   # 掉线了读不到，不代表恢复
             streak.pop(ip, None)
             zero_since.pop(ip, None)
             if ip in repair:
-                b.resolve(ip, "offline")   # 维修中 → 清掉单条(人已经知道了)
+                b.resolve(ip, "offline", recovered=False)   # 维修中 → 清掉单条(人已经知道了)
                 rebooting.pop(ip, None)
                 continue
             if seg in down_segments:
@@ -346,7 +369,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             elif temp < hot_clear or ip in repair:
                 # 未静音：滞回消警(中间区间 [hot_clear, hot_c) 维持原状态)
                 # 维修中：无条件消掉已有高温告警(人已经知道了)
-                b.resolve(ip, "overheat")
+                b.resolve(ip, "overheat", recovered=ip not in repair)
 
         # 矿池防篡改：矿机上配置了白名单外的矿池(含备用池) → 严重告警，不受维修/网段静音。
         # 覆盖"绕过面板直接用 root/root 登矿机改池"这条面板管不到的路径
@@ -401,6 +424,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     fired = b.commit()
     if fired:
         _push_batch(cfg.get("telegram", {}), fired)
+    _push_recovered(cfg, b.recovered)
     return fired
 
 
@@ -510,6 +534,7 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
     fired = b.commit()
     if fired:
         _push_batch(cfg.get("telegram", {}), fired)
+    _push_recovered(cfg, b.recovered)
     return fired
 
 

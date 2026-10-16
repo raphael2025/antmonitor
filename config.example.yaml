@@ -26,6 +26,7 @@ scan:
   container_offline_kick_sec: 86400  # 集装箱离线超过此秒数(默认24h)从记忆中踢除
   roster_retention_days: 7   # 机器名册保留天数(限电下线的机器在此期内仍会被巡检以抓恢复)
   migrate_max: 200      # 一轮最多自动下架多少个"同SN已在新IP上线"的旧IP残影，超过则交人工
+  early_full_min_interval: 1200  # 巡检发现有SN/MAC的机器刚掉线 → 提前做全网发现识别IP迁移(否则假掉线最长等 full_interval)；距上次全网发现至少这么多秒，0=关闭
   passwords:            # 原厂 digest 依次尝试的密码
     - ["root", "root"]
 
@@ -46,6 +47,7 @@ alerts:
   cooldown: 1800              # 同机同类告警冷却(秒)，防抖动刷屏
   zero_grace_sec: 600         # 零算力机器运行时长<此值(秒)暂不报(刚开机/限电恢复升频中)；0=立即报
   reject_pct: 5.0             # 拒绝率 ≥ 此值(%) → 矿池健康告警；0 关闭
+  push_recovery: true         # 掉线/整段掉线/高温/矿池篡改/集装箱故障恢复时推送一条恢复通知(零算力等不推)
   reject_min_shares: 50       # 拒绝率按两次判定之间的份额增量算，增量至少这么多份额才判(防刚开机样本少误报)
   segment_down_ratio: 0.6     # 某网段已知真机掉线比例 ≥ 此值 → 合并为网段事件
   segment_down_min: 5         # 且掉线数 ≥ 此值才触发网段合并

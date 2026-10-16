@@ -49,6 +49,8 @@ DEFAULTS = {
         "container_offline_kick_sec": 86400,
         "roster_retention_days": 7,
         "migrate_max": 200,
+        # 巡检发现有身份的机器刚掉线 → 提前全网发现识别 IP 迁移；距上次全网发现至少这么久(秒)，0=关闭
+        "early_full_min_interval": 1200,
         "passwords": [["root", "root"]],
     },
     "schedule": {
@@ -60,6 +62,7 @@ DEFAULTS = {
     },
     "alerts": {
         "enabled": True, "cooldown": 1800, "zero_grace_sec": 600, "reject_pct": 5.0,
+        "push_recovery": True,          # 掉线/整段掉线/高温/矿池篡改/集装箱故障恢复时推送
         "reject_min_shares": 50,        # 拒绝率至少按这么多份额的增量判断(防样本太少误报)
         "segment_down_ratio": 0.6, "segment_down_min": 5,
         "low_hashrate_ratio": 0.7,      # 低于同型号中位数的此比例 → 掉算力告警；0=关
@@ -240,6 +243,7 @@ def _validate(cfg):
     clamp("alerts", "container_pressure_clear_sec", 0, 3600, int)
     # 写错类型(如 check_interval: "1h"、port: "8800a")以前会在启动时抛异常，守护连续
     # 拉起失败后放弃，整站监控停摆；这里回退默认值并打警告
+    clamp("scan", "early_full_min_interval", 0, 86400, int)
     clamp("update", "check_interval", 300, 604800, int)
     clamp("server", "port", 1, 65535, int)
     if cfg["alerts"]["overheat_c"] and cfg["alerts"]["overheat_clear_c"] >= cfg["alerts"]["overheat_c"]:

@@ -159,3 +159,16 @@ def test_reject_rate_uses_share_delta_not_lifetime_totals(conn, cfg):
     assert not [f for f in fired if f[1] == "reject"]
     fired = _run(conn, cfg, [rec(ip, accepted=99, rejected=1)], state=st)
     assert not [f for f in fired if f[1] == "reject"]
+
+
+def test_cloud_summary_counts_machines_in_down_segments(conn):
+    """整段断电：云端摘要按段内离线台数计、归到客户，而不是"网段整体掉线 1 台"。"""
+    import cloud_alert_summary
+    ips = [f"10.0.6.{i}" for i in range(1, 11)]
+    db.upsert_known_miners(conn, [rec(ip, worker="甲" if i < 6 else "乙")
+                                  for i, ip in enumerate(ips, 1)], int(__import__("time").time()))
+    db.save_scan(conn, "quick", [rec(ip, status="offline") for ip in ips])
+    db.raise_alert(conn, "10.0.6.x", "segment_down", "crit", "网段 10.0.6.x 大面积掉线 10/10")
+    g = {x["category"]: x for x in cloud_alert_summary.build(conn)}["segment_down"]
+    assert g["count"] == 10 and "1个网段" in g["label"]
+    assert {w["worker"]: w["count"] for w in g["workers"]} == {"甲": 5, "乙": 5}

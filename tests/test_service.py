@@ -473,3 +473,36 @@ def test_machine_unknown_last_round_still_gets_reconfirmed(svc, monkeypatch):
     assert db.active_alert(svc.conn, A, "offline") is None
     _m, records = svc.latest()
     assert {r["ip"]: r["status"] for r in records}[A] == "online"
+
+
+def test_quick_scan_requests_early_discovery_for_possible_ip_migration(svc, monkeypatch):
+    """巡检看不到新 IP：有身份的机器刚掉线 → 提前全网发现(识别迁移)，但要限频、限量。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1", sn="REALSN000777"),
+                                                      rec("10.9.0.2", sn="REALSN000778")]))
+    svc.scan_full("full")
+    import time as _t
+    svc._last_full = _t.monotonic() - 3000           # 上次全网发现已过 50 分钟
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2", sn="REALSN000778")]))
+    svc.scan_quick()                                  # 10.9.0.1 刚掉线(可能换了 IP)
+    assert svc._early_full is True
+
+    svc._early_full = False
+    svc._last_full = _t.monotonic() - 60             # 刚做过全网发现：不再提前
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1", sn="REALSN000777")]))
+    svc.scan_quick()
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2", sn="REALSN000778")]))
+    svc.scan_quick()
+    assert svc._early_full is False
+
+
+def test_mass_offline_does_not_request_early_discovery(svc, monkeypatch):
+    """一次掉线超过 migrate_max 台是断电/交换机故障，不是迁移：不加做全网扫描。"""
+    svc.cfg["scan"]["migrate_max"] = 1
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1", sn="REALSN000781"),
+                                                      rec("10.9.0.2", sn="REALSN000782")]))
+    svc.scan_full("full")
+    import time as _t
+    svc._last_full = _t.monotonic() - 3000
+    monkeypatch.setattr(miner_core, "scan", fake_scan([]))
+    svc.scan_quick()
+    assert svc._early_full is False

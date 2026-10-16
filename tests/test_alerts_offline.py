@@ -212,3 +212,22 @@ def test_zero_hashrate_after_real_boot_still_gets_grace(conn, cfg, clock):
     _round(conn, cfg, clock, [rec(ip, status="offline")], st)
     fired = _round(conn, cfg, clock, [rec(ip, hr=0.0, uptime=100)], st)
     assert (ip, "zero") not in fired
+
+
+def test_recovery_pushed_for_real_recovery_only(conn, cfg, clock, monkeypatch):
+    """掉线恢复推一条恢复通知；掉线时连带消掉的高温、维修中清掉的掉线不算恢复，不推。"""
+    sent = []
+    monkeypatch.setattr(alerts, "_enqueue", lambda tg, text: sent.append(text))
+    st = {}
+    a, b = "10.0.8.1", "10.0.8.2"
+    _round(conn, cfg, clock, [rec(a, temp=99), rec(b)], st)            # a 高温
+    _round(conn, cfg, clock, [rec(a, status="offline"), rec(b)], st)   # a 掉线(高温连带消)
+    sent.clear()
+    _round(conn, cfg, clock, [rec(a), rec(b)], st)                     # a 恢复在线
+    rec_msgs = [t for t in sent if "告警恢复" in t]
+    assert len(rec_msgs) == 1 and f"{a} 掉线 已恢复" in rec_msgs[0] and "高温" not in rec_msgs[0]
+    _round(conn, cfg, clock, [rec(a), rec(b, status="offline")], st)   # b 掉线
+    db.set_machine_state(conn, [b], "repair")
+    sent.clear()
+    _round(conn, cfg, clock, [rec(a), rec(b, status="offline")], st)   # 维修中清掉
+    assert not [t for t in sent if "告警恢复" in t]
