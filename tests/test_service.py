@@ -383,3 +383,27 @@ def test_reboot_grace_marks_survive_service_restart(cfg, monkeypatch, tmp_path):
         s2.stop()
         s2.conn.close()
         db.close_readers()
+
+
+def test_full_scan_does_not_reevaluate_known_container_with_stale_data(svc, monkeypatch):
+    """全网扫描拿到的已知箱读数是几分钟前的：只发现新箱，不评估故障、不覆盖箱体状态。"""
+    known = {"device": "container", "ip": "10.9.0.3", "faults": [], "supply_pressure": 0.3,
+             "return_pressure": 0.2, "miner_ips": []}
+    db.upsert_containers(svc.conn, [known], int(time.time()))
+    stale = dict(known, faults=[{"flag": "leakage_fault", "label": "漏液", "sev": "crit"}])
+    new_box = dict(known, ip="10.9.0.4")
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1"), stale, new_box]))
+    svc.scan_full("full")
+    assert not db.active_alerts_by_type(svc.conn, like="cooler")
+    assert set(db.known_container_ips(svc.conn)) == {"10.9.0.3", "10.9.0.4"}
+
+
+def test_kicked_container_is_announced_not_silently_dropped(svc, monkeypatch):
+    pushed = []
+    monkeypatch.setattr(service.alerts, "push_text", lambda c, t: pushed.append(t))
+    old = int(time.time()) - 2 * 86400
+    db.upsert_containers(svc.conn, [{"ip": "10.9.0.5", "faults": [], "miner_ips": []}], old)
+    db.mark_containers_offline(svc.conn, ["10.9.0.5"])
+    svc._kick_containers()
+    assert "10.9.0.5" not in db.known_container_ips(svc.conn)
+    assert len(pushed) == 1 and "10.9.0.5" in pushed[0]

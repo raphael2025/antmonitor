@@ -176,3 +176,32 @@ def test_invalid_sn_does_not_overwrite_a_known_good_sn(conn):
     db.upsert_known_miners(conn, [rec("10.3.0.1", sn="N/A")], 2000)
     db.upsert_known_miners(conn, [rec("10.3.0.1", sn="no miner sn stored on board")], 3000)
     assert db.known_identity(conn)["10.3.0.1"]["sn"] == "SNGOOD12345"
+
+
+def test_prune_resolves_alerts_of_machines_dropped_from_roster(conn):
+    """掉线满 7 天移出名册后不再被评估：它的掉线告警、已清空网段的 segment_down 必须一并消掉，
+    否则永远挂着。"""
+    import time as _t
+    old = int(_t.time()) - 8 * 86400
+    db.upsert_known_miners(conn, ["10.7.0.1", "10.7.0.2"], old)
+    db.upsert_known_miners(conn, ["10.7.1.1"], old)
+    db.upsert_known_miners(conn, ["10.7.1.2"], int(_t.time()))   # 同段还有在监控的机器
+    for ip in ("10.7.0.1", "10.7.1.1"):
+        db.raise_alert(conn, ip, "offline", "crit", "x")
+    db.raise_alert(conn, "10.7.0.x", "segment_down", "crit", "seg")
+    db.raise_alert(conn, "10.7.1.x", "segment_down", "crit", "seg")
+    db.prune(conn, retention_days=3, roster_days=7)
+    assert db.active_alert(conn, "10.7.0.1", "offline") is None
+    assert db.active_alert(conn, "10.7.1.1", "offline") is None
+    assert db.active_alert(conn, "10.7.0.x", "segment_down") is None
+    assert db.active_alert(conn, "10.7.1.x", "segment_down") is not None
+
+
+def test_migrating_whole_segment_resolves_its_segment_alert(conn):
+    """整段断电后改网段重新上电：旧段机器被识别为迁移残影 → 旧段 segment_down 消掉。"""
+    db.upsert_known_miners(conn, ["10.8.0.1", "10.8.0.2"], now_hour())
+    db.raise_alert(conn, "10.8.0.x", "segment_down", "crit", "seg")
+    db.mark_miners_migrated(conn, ["10.8.0.1"])
+    assert db.active_alert(conn, "10.8.0.x", "segment_down") is not None
+    db.mark_miners_migrated(conn, ["10.8.0.2"])
+    assert db.active_alert(conn, "10.8.0.x", "segment_down") is None

@@ -60,6 +60,7 @@ DEFAULTS = {
     },
     "alerts": {
         "enabled": True, "cooldown": 1800, "zero_grace_sec": 600, "reject_pct": 5.0,
+        "reject_min_shares": 50,        # 拒绝率至少按这么多份额的增量判断(防样本太少误报)
         "segment_down_ratio": 0.6, "segment_down_min": 5,
         "low_hashrate_ratio": 0.7,      # 低于同型号中位数的此比例 → 掉算力告警；0=关
         "low_hashrate_rounds": 2,       # 需连续 N 轮成立才报(防单轮读数抖动)
@@ -233,6 +234,7 @@ def _validate(cfg):
     clamp("alerts", "low_hashrate_ratio", 0, 1)
     clamp("alerts", "segment_down_ratio", 0, 1)
     clamp("alerts", "reject_pct", 0, 100)
+    clamp("alerts", "reject_min_shares", 1, 1000000, int)
     clamp("alerts", "zero_grace_sec", 0, 86400, int)
     clamp("alerts", "container_pressure_hold_sec", 0, 3600, int)
     clamp("alerts", "container_pressure_clear_sec", 0, 3600, int)

@@ -621,20 +621,21 @@ class MonitorService:
                 self._maybe_auto_reboot(kept)
             except Exception as e:  # noqa: BLE001
                 log.exception("auto-reboot error: %s", e)
-            # 集装箱：记住/发现新箱 + 对采到的箱评估故障；不在此判离线
+            # 集装箱：全网扫描只负责发现新箱，已知箱的读数和故障评估全部交给 10 秒刷新。
+            # 全网扫描要跑好几分钟，这里拿到的已知箱读数是几分钟前的：用它评估会把 10 秒刷新
+            # 已确认恢复的漏液再报一次 crit，还会用旧读数覆盖箱体表里更新的状态。
+            # 也不在此判离线：全网扫描对集装箱"未采到"不可靠(判活闸门会误杀查 PLC 慢的控制器)
             got = self._container_lock.acquire(timeout=60)   # 等正在跑的 10 秒刷新做完
             try:
                 if not got:
                     raise RuntimeError("等集装箱刷新超时，本轮不处理集装箱")
-                detected_ips = {c["ip"] for c in containers}
-                db.save_containers(self.conn, ts, containers)
-                db.upsert_containers(self.conn, containers, ts)
-                # 全网扫描对集装箱"未采到"不可靠(判活闸门会误杀查 PLC 慢的控制器)，
-                # 离线判定统一交给 _container_loop(给足超时、每10s 一次)。
-                cfired = alerts.evaluate_containers(self.conn, containers, detected_ips, self.cfg,
-                                                    state=self._alert_state)
-                db.kick_offline_containers(
-                    self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
+                known = set(db.known_container_ips(self.conn))
+                fresh = [c for c in containers if c["ip"] not in known]
+                if fresh:
+                    db.save_containers(self.conn, ts, fresh)
+                    db.upsert_containers(self.conn, fresh, ts)
+                    log.info("发现新集装箱 %d 个: %s", len(fresh), [c["ip"] for c in fresh][:8])
+                self._kick_containers()
             except Exception as e:  # noqa: BLE001
                 log.exception("container eval error: %s", e)
             finally:
@@ -727,6 +728,20 @@ class MonitorService:
             return self.scan_full(kind="full")   # 没有底库先全扫
         return self._do_scan(kind, ips, workers=self.cfg["scan"].get("workers", 300))
 
+    def _kick_containers(self):
+        """离线太久的箱子移出监控。移出后漏液等冷却告警就不再检测，必须明确通知，
+        不能让 crit 告警自己悄悄消失。"""
+        gone = db.kick_offline_containers(
+            self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
+        if gone:
+            hours = int(self.cfg["scan"].get("container_offline_kick_sec", 86400)) // 3600
+            log.warning("集装箱离线超过 %d 小时，移出监控: %s", hours, gone)
+            try:
+                alerts.push_text(self.cfg, f"🔴 集装箱 {'、'.join(gone[:10])} 控制器离线已超过 {hours} 小时，"
+                                           f"已移出监控(漏液/压力等冷却告警不再检测)；控制器恢复后会自动重新发现")
+            except Exception:  # noqa: BLE001
+                log.exception("集装箱移出推送失败")
+
     def scan_containers(self):
         """高频刷新已知集装箱（只打 /cooler）。用独立的 _container_lock：矿机扫描进行中
         照样刷新(漏液这类数据等不起一两分钟)，只和"全网扫描里处理集装箱那一小段"互斥。"""
@@ -759,8 +774,7 @@ class MonitorService:
             # known_before 只传 已采到 + 已确认离线 → 未确认(刚漏1轮)的不报 cooler_offline
             cfired = alerts.evaluate_containers(self.conn, cs, detected | set(confirmed_off),
                                                 self.cfg, state=self._alert_state)
-            db.kick_offline_containers(
-                self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
+            self._kick_containers()
             if cfired and self.notify:
                 try:
                     self.notify({"type": "refresh", "fired": len(cfired)})

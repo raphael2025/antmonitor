@@ -324,7 +324,7 @@ def mark_containers_offline(conn, ips):
 
 
 def kick_offline_containers(conn, max_offline_sec=86400):
-    """离线超过 max_offline_sec 的箱子从记忆中踢除，并清掉其残留冷却告警。返回踢除数。"""
+    """离线超过 max_offline_sec 的箱子从记忆中踢除，并清掉其残留冷却告警。返回被踢除的 IP 列表。"""
     cutoff = int(time.time()) - max_offline_sec
     ts = int(time.time())
     with _wlock, conn:
@@ -336,7 +336,7 @@ def kick_offline_containers(conn, max_offline_sec=86400):
                          f"AND ip IN ({qm}) AND (type='cooler_offline' OR type LIKE 'cooler:%')",
                          (ts, *victims))
             conn.execute(f"DELETE FROM containers WHERE ip IN ({qm})", victims)
-        return len(victims)
+        return victims
 
 
 def get_containers(conn):
@@ -467,20 +467,38 @@ def set_machine_state(conn, ips, state):
         conn.executemany("UPDATE known_miners SET state=? WHERE ip=?", [(state, ip) for ip in ips])
 
 
+_MINER_ALERT_TYPES = ("offline", "zero", "reject", "low_hashrate", "overheat", "pool_hijack")
+
+
+def _resolve_gone_miners(conn, ips, ts):
+    """机器已不在监控范围(下架/迁移/掉出名册)：消掉它们的单机告警；某网段名册里已没有
+    受监控的机器时，顺带消掉该段 segment_down——否则这些告警没人会再评估，永远挂着。
+    调用方持有 _wlock 并在事务内。"""
+    if not ips:
+        return
+    tqm = ",".join("?" * len(_MINER_ALERT_TYPES))
+    conn.executemany(
+        f"UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 AND ip=? "
+        f"AND type IN ({tqm})", [(ts, ip, *_MINER_ALERT_TYPES) for ip in ips])
+    bases = sorted({".".join(ip.split(".")[:3]) for ip in ips if ip.count(".") == 3})
+    for base in bases:
+        left = conn.execute("SELECT COUNT(*) FROM known_miners WHERE ip LIKE ? "
+                            "AND state!='migrated'", (base + ".%",)).fetchone()[0]
+        if left == 0:
+            conn.execute("UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 "
+                         "AND type='segment_down' AND ip=?", (ts, base + ".x"))
+
+
 def mark_miners_migrated(conn, ips):
     """Quarantine superseded IPs without deleting their inventory/history."""
     if not ips:
         return
     ts = int(time.time())
     ips = list(dict.fromkeys(ips))
-    types = ("offline", "zero", "reject", "low_hashrate", "overheat", "pool_hijack")
-    tqm = ",".join("?" * len(types))
     with _wlock, conn:
         conn.executemany("UPDATE known_miners SET state='migrated' WHERE ip=?",
                          [(ip,) for ip in ips])
-        conn.executemany(
-            f"UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 AND ip=? "
-            f"AND type IN ({tqm})", [(ts, ip, *types) for ip in ips])
+        _resolve_gone_miners(conn, ips, ts)
 
 
 def remove_miners(conn, ips):
@@ -491,25 +509,14 @@ def remove_miners(conn, ips):
         return
     ts = int(time.time())
     ips = list(dict.fromkeys(ips))
-    bases = sorted({".".join(ip.split(".")[:3]) for ip in ips if ip.count(".") == 3})
-    types = ("offline", "zero", "reject", "low_hashrate", "overheat", "pool_hijack")
-    tqm = ",".join("?" * len(types))
     with _wlock, conn:
-        conn.executemany(
-            f"UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 AND ip=? "
-            f"AND type IN ({tqm})", [(ts, ip, *types) for ip in ips])
         conn.executemany("DELETE FROM known_miners WHERE ip=?", [(ip,) for ip in ips])
         # 同时从最近一次扫描快照删掉，下架后立刻从矿机列表消失
         last = conn.execute("SELECT MAX(scan_id) FROM scans").fetchone()[0]
         if last:
             conn.executemany("DELETE FROM snapshots WHERE ip=? AND scan_id=?",
                              [(ip, last) for ip in ips])
-        for base in bases:   # 仅当该网段名册已空，才消该段 segment_down
-            left = conn.execute("SELECT COUNT(*) FROM known_miners WHERE ip LIKE ?",
-                                (base + ".%",)).fetchone()[0]
-            if left == 0:
-                conn.execute("UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 "
-                             "AND type='segment_down' AND ip=?", (ts, base + ".x"))
+        _resolve_gone_miners(conn, ips, ts)
 
 
 def online_ips(conn):
@@ -955,8 +962,13 @@ def prune(conn, retention_days, roster_days=7, rollup_days=400):
                 conn.execute(f"DELETE FROM scans WHERE scan_id IN ({qm})", chunk)
         conn.execute("DELETE FROM container_snaps WHERE ts<?", (time_cut,))
         conn.execute("DELETE FROM alerts WHERE resolved=1 AND resolved_ts<?", (time_cut,))
+        gone = [r["ip"] for r in conn.execute(
+            "SELECT ip FROM known_miners WHERE last_online<? AND state='active'",
+            (roster_cut,)).fetchall()]
         conn.execute("DELETE FROM known_miners WHERE last_online<? AND state='active'",
                      (roster_cut,))
+        # 掉出名册的机器不再被评估：它们的掉线告警、整段已清空网段的 segment_down 一并消掉
+        _resolve_gone_miners(conn, gone, now)
         conn.execute("DELETE FROM worker_hourly WHERE hour<?", (rollup_cut,))
         # 审计：定位灯/维修标记这类高频低价值记录按条数只留最近 5000；重启/换矿池/下架/
         # 被拒绝的命令按时间长期保留——否则批量点几次"维修中"就能把换矿池记录冲掉
