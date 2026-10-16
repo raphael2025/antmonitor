@@ -172,7 +172,21 @@ EOF
 
 sync_code() {
   mkdir -p "$INSTALL_DIR"
-  if [[ -n "$LOCAL_SRC" ]]; then
+  if [[ -n "$LOCAL_SRC" && -d "$LOCAL_SRC/.git" && -d "$INSTALL_DIR/.git" \
+        && "$(cd "$LOCAL_SRC" && pwd -P)" != "$(cd "$INSTALL_DIR" && pwd -P)" ]]; then
+    # 两边都是 git 仓库：按提交快进，不用 rsync 覆盖工作区。rsync 覆盖后工作区与安装目录
+    # 自己的 HEAD 对不上，git status 永远是脏的，网页更新会一直以"工作区有改动"拒绝；
+    # 若网页更新已让安装目录领先，rsync 还会悄悄把代码降级
+    info "从本地仓库快进合并 → $INSTALL_DIR"
+    # 以 root 操作普通用户的仓库，新版 git 会报 dubious ownership；命令行显式信任这两个目录
+    local g=(git -c safe.directory="$INSTALL_DIR" -c safe.directory="$LOCAL_SRC" -C "$INSTALL_DIR")
+    if "${g[@]}" fetch "$LOCAL_SRC" HEAD; then
+      "${g[@]}" merge --ff-only FETCH_HEAD || \
+        warn "无法快进(安装目录有本地提交或已领先本地源码)，代码保持不变"
+    else
+      warn "从 $LOCAL_SRC 拉取失败，代码保持不变"
+    fi
+  elif [[ -n "$LOCAL_SRC" ]]; then
     info "从本地仓库同步 → $INSTALL_DIR"
     rsync -a --delete \
       --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
