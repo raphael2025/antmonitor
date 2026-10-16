@@ -17,7 +17,9 @@ import hashlib
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import urllib.request
 import zipfile
@@ -40,6 +42,22 @@ _GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never",
 
 def _say(msg):
     print(msg, flush=True)
+
+
+def _rmtree(path):
+    """shutil.rmtree that also removes read-only files: git object files are read-only on
+    Windows, and a plain rmtree would leave a half-made .git.adopting behind."""
+    def retry(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    if os.path.lexists(str(path)):
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(str(path), onexc=retry)
+        else:   # Python 3.8-3.11
+            shutil.rmtree(str(path), onerror=retry)
 
 
 def _mingit_dir():
@@ -83,10 +101,10 @@ def install_mingit():
             z.extractall(unpack)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
+            _rmtree(dest)
         os.replace(str(unpack), str(dest))
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _rmtree(tmp)
     git = dest / "cmd" / "git.exe"
     if not git.is_file():
         raise RuntimeError("portable Git is missing cmd\\git.exe")
@@ -126,7 +144,7 @@ def adopt(base, git, repo_url=REPO_URL, branch=BRANCH):
     if (base / ".git").exists():
         return None, []
     git_dir = base / ".git.adopting"
-    shutil.rmtree(git_dir, ignore_errors=True)
+    _rmtree(git_dir)
     g = _runner(git, git_dir, base)
     done = False
     try:
@@ -161,7 +179,7 @@ def adopt(base, git, repo_url=REPO_URL, branch=BRANCH):
         done = True
     finally:
         if not done:
-            shutil.rmtree(git_dir, ignore_errors=True)
+            _rmtree(git_dir)
     os.replace(str(git_dir), str(base / ".git"))
     return match, extra
 
