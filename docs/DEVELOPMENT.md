@@ -179,10 +179,10 @@
 在运行中抛 `KeyError` 静默停摆（这是以前的真实风险）。不合法的值会被夹到安全范围并打 warning。
 
 **`config.yaml` 关键段**（详见 `config.example.yaml` 内中文注释）：
-- `scan`：`online_timeout`/`data_timeout`/`max_pps`/`liveness_gate`/`gate_timeout`/`reconfirm_*`/`roster_retention_days`/`migrate_max`/`passwords`。
+- `scan`：`online_timeout`/`data_timeout`/`max_pps`/`liveness_gate`/`gate_timeout`/`reconfirm_*`/`roster_retention_days`/`migrate_max`/`early_full_min_interval`(巡检发现有身份的机器刚掉线时提前全网发现，识别 IP 迁移)/`passwords`。
 - `schedule`：`scan_interval`(巡检300)/`full_interval`(发现3600)/`container_interval`(10)/`watchdog_minutes`。
-- `alerts`：`cooldown`/`zero_grace_sec`/`reject_pct`/`segment_down_ratio/min`/`low_hashrate_*`/`overheat_*`/`container_faults_ignore`/压力阈值。
-- `control`：`enabled`(总开关)/`uniplus_password`/`timeout`/`max_batch`(批量上限)/`reboot_*`(浪涌保护)。
+- `alerts`：`cooldown`/`zero_grace_sec`/`reject_pct`/`reject_min_shares`(拒绝率按份额增量)/`push_recovery`(严重告警恢复推送)/`segment_down_ratio/min`/`low_hashrate_*`/`overheat_*`/`container_faults_ignore`/压力阈值。
+- `control`：`enabled`(总开关)/`uniplus_password`/`timeout`/`max_batch`(批量上限)/`reboot_*`(浪涌保护、限流)/`zero_reboot_mass_min`/`zero_reboot_mass_ratio`(成片零算力按网段/全场熔断)。
 - `auth`：`enabled`/`secure_cookie`/`users`(password 用 `python auth.py 新密码` 生成的 pbkdf2$ 哈希)。
 - `db`：`path`/`retention_days`(明细3天)/`rollup_retention_days`(计费400天)/`checkpoint_minutes`/`vacuum_hour`。
 - `server`：`host`/`port`/`trusted_proxies`(空=不信任 X-Forwarded-For，直连部署的正确选择)。

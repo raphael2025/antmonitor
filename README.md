@@ -87,7 +87,7 @@ python server.py                     # 浏览器打开 :8800
 旧 `.venv` 若使用不兼容版本，会保留为 `.venv.incompatible-*` 并自动重建。
 启动后在面板配置矿机网段。遇到错误会保留窗口显示原因；按 Ctrl+C 可停止服务。
 
-ZIP 下载可直接运行；网页更新功能需要通过 `git clone` 部署并安装 Git。
+ZIP 下载可直接运行，网页更新也能用：首次启动时会自动转成 git 部署——没装 Git 就下载固定版本的便携 Git（校验 SHA-256，放在 `%LOCALAPPDATA%\AntMonitor`），按文件内容找到 ZIP 对应的版本，之后在网页上检查/更新。需要能访问 github.com；ZIP 里的文件被改过时无法识别版本，会提示改用 `git clone`。设置环境变量 `MINER_NO_GIT_BOOTSTRAP=1` 可关闭。
 
 完整「简介 · 部署 · 使用」→ [选语言阅读](docs/guide/README.md)
 

@@ -8,6 +8,13 @@ import pytest
 import windows_launcher as launcher
 
 
+@pytest.fixture(autouse=True)
+def _no_web_update_bootstrap(monkeypatch):
+    """ZIP 转 git 会联网、调 git：这些单元测试只测守护循环，统一关掉(真实流程由
+    tests/windows_smoke.py 和 tests/windows_git_bootstrap.py 在 CI 的 Windows 上跑)。"""
+    monkeypatch.setattr(launcher, "enable_web_updates", lambda base, env: None)
+
+
 def environment(tmp_path):
     python = tmp_path / ".venv" / (
         "Scripts/python.exe" if launcher.os.name == "nt" else "bin/python")

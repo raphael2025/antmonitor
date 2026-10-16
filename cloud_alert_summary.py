@@ -32,6 +32,28 @@ def _category(alert_type):
     return alert_type, _CATEGORY_LABEL.get(alert_type, alert_type or "其他")
 
 
+def _add_segment_group(conn, seg_alerts, ip2worker, groups):
+    segs = {(a.get("ip") or "")[:-2] for a in seg_alerts if (a.get("ip") or "").endswith(".x")}
+    since = min((a["ts"] for a in seg_alerts if a.get("ts")), default=0)
+    workers = {}
+    try:
+        ls = db.latest_scan(conn)
+        recs = db.scan_records(conn, ls["scan_id"]) if ls else []
+    except Exception:  # noqa: BLE001
+        recs = []
+    n = 0
+    for r in recs:
+        if r.get("status") == "offline" and ".".join(r["ip"].split(".")[:3]) in segs:
+            n += 1
+            w = (ip2worker.get(r["ip"]) or {}).get("worker") or "(未知)"
+            workers[w] = workers.get(w, 0) + 1
+    if not n:                 # 快照里取不到(刚重启等)：退回按网段计，至少别显示 0
+        n, workers = len(segs) or len(seg_alerts), {}
+    groups["segment_down"] = {"category": "segment_down",
+                              "label": f"网段整体掉线({len(segs) or len(seg_alerts)}个网段)",
+                              "count": n, "since_ts": since, "_workers": workers}
+
+
 def build(conn):
     """返回 [{"category","label","count","since_ts","workers":[{"worker","count"}]}]，
     按受影响台数降序。since_ts=该类告警最早触发时间(可算出"已持续多久")。
@@ -51,6 +73,12 @@ def build(conn):
         ip2worker = {}
 
     groups = {}
+    seg_alerts = [a for a in alerts if a.get("type") == "segment_down"]
+    if seg_alerts:
+        # 网段事件按"段内当前离线的机器"计台数、归客户：段内单机掉线告警被网段事件静音，
+        # 若按告警条数算，整段 250 台断电在云端只显示"网段整体掉线 1 台、掉线 0 台"
+        alerts = [a for a in alerts if a.get("type") != "segment_down"]
+        _add_segment_group(conn, seg_alerts, ip2worker, groups)
     for a in alerts:
         cat, label = _category(a.get("type") or "")
         g = groups.setdefault(cat, {"category": cat, "label": label, "count": 0,

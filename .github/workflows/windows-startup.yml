@@ -30,6 +30,20 @@ jobs:
           python-version: '3.12'
       - name: Download and install Python, then launch with no Python on PATH
         run: python tests/windows_smoke.py --without-python
+  zip-to-git:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Turn a GitHub-style ZIP folder into a git deployment with portable Git
+        run: python tests/windows_git_bootstrap.py
   startup:
     runs-on: windows-latest
     timeout-minutes: 15

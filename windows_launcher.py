@@ -115,9 +115,25 @@ def prepare_config(python, base):
         raise RuntimeError("Cannot read the configuration. See the error above.")
 
 
+def enable_web_updates(base, env):
+    """A ZIP download has no .git, so the web panel cannot update it: adopt it as a git
+    deployment (portable Git is fetched if none is installed). Never blocks startup."""
+    if os.name != "nt":
+        return
+    try:
+        import git_bootstrap
+        git_dir = git_bootstrap.bootstrap(base)
+    except Exception as error:  # noqa: BLE001
+        print("Web updates unavailable ({}).".format(error), flush=True)
+        return
+    if git_dir:   # portable Git is not on PATH: the server's updater must still find it
+        env["PATH"] = git_dir + os.pathsep + env.get("PATH", "")
+
+
 def supervise(base):
     failures = 0
     env = dict(os.environ, MINER_GUARDIAN="1")
+    enable_web_updates(base, env)
     first_launch = True
     while True:
         python = prepare_environment(base)

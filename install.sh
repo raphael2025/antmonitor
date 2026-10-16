@@ -127,6 +127,11 @@ ensure_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq python3 python3-venv python3-pip git curl ca-certificates >/dev/null
+  # 依赖(fastapi 等)最低要 Python 3.8：Ubuntu 18.04 自带 3.6，不拦住的话会在 pip 安装时
+  # 报一堆看不懂的版本错误
+  if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= tuple(map(int, '${PY_MIN}'.split('.'))) else 1)"; then
+    die "系统 python3 版本 $(python3 -V 2>&1) 低于 ${PY_MIN}：请升级到 Ubuntu 20.04 及以上，或安装 python3.8+ 后重试"
+  fi
   ok "依赖已就绪"
 }
 
@@ -172,7 +177,33 @@ EOF
 
 sync_code() {
   mkdir -p "$INSTALL_DIR"
-  if [[ -n "$LOCAL_SRC" ]]; then
+  if [[ -n "$LOCAL_SRC" && -d "$LOCAL_SRC/.git" && -d "$INSTALL_DIR/.git" \
+        && "$(cd "$LOCAL_SRC" && pwd -P)" != "$(cd "$INSTALL_DIR" && pwd -P)" ]]; then
+    # 两边都是 git 仓库：按提交快进，不用 rsync 覆盖工作区。rsync 覆盖后工作区与安装目录
+    # 自己的 HEAD 对不上，git status 永远是脏的，网页更新会一直以"工作区有改动"拒绝；
+    # 若网页更新已让安装目录领先，rsync 还会悄悄把代码降级
+    info "从本地仓库快进合并 → $INSTALL_DIR"
+    # 以 root 操作普通用户的仓库，新版 git 会报 dubious ownership；命令行显式信任这两个目录
+    local g=(git -c safe.directory="$INSTALL_DIR" -c safe.directory="$LOCAL_SRC" -C "$INSTALL_DIR")
+    if "${g[@]}" fetch "$LOCAL_SRC" HEAD; then
+      local src_br
+      src_br="$(git -c safe.directory="$LOCAL_SRC" -C "$LOCAL_SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+      if "${g[@]}" merge --ff-only FETCH_HEAD; then
+        :
+      elif [[ "$src_br" != "HEAD" && -z "$("${g[@]}" rev-list --no-merges FETCH_HEAD..HEAD)" ]]; then
+        # 快进不了但安装目录没有本地源码里没有的实际改动(典型：旧版装在 dev，只多出合并提交)：
+        # 直接切到本地源码所在的分支和提交，否则会"提示更新完成、实际还是旧代码"
+        info "安装目录切换到 $src_br 分支（与本地源码一致）"
+        "${g[@]}" checkout -B "$src_br" FETCH_HEAD
+        "${g[@]}" rev-parse --verify --quiet "origin/$src_br" >/dev/null \
+          && "${g[@]}" branch --set-upstream-to="origin/$src_br" "$src_br" >/dev/null || true
+      else
+        warn "无法快进(安装目录有本地源码里没有的改动)，代码保持不变"
+      fi
+    else
+      warn "从 $LOCAL_SRC 拉取失败，代码保持不变"
+    fi
+  elif [[ -n "$LOCAL_SRC" ]]; then
     info "从本地仓库同步 → $INSTALL_DIR"
     rsync -a --delete \
       --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
@@ -189,14 +220,23 @@ sync_code() {
   elif [[ -d "$INSTALL_DIR/.git" ]]; then
     # 沿用现场当前分支(网页更新也是跟它)；只有显式设了 ANTMONITOR_BRANCH 才切换分支
     local br
-    br="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    local g=(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR")
+    br="$("${g[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
     if [[ -n "${ANTMONITOR_BRANCH:-}" || "$br" == "HEAD" ]]; then
       br="$BRANCH"
     fi
+    "${g[@]}" fetch --all --prune || warn "fetch 失败（私有仓需部署密钥/Token / 网络不通）"
+    # 旧版本脚本默认装在 dev，dev 已不再更新：dev 上没有 main 里没有的实际改动时改跟 main
+    # (与网页更新器的规则一致，见 updater._can_leave_legacy)
+    if [[ -z "${ANTMONITOR_BRANCH:-}" && "$br" == "dev" ]] \
+        && "${g[@]}" rev-parse --verify --quiet origin/main >/dev/null \
+        && [[ -z "$("${g[@]}" rev-list --no-merges origin/main..HEAD)" ]]; then
+      info "旧版安装在 dev 分支，改为跟踪 main"
+      br="main"
+    fi
     info "git pull ($br)"
-    git -C "$INSTALL_DIR" fetch --all --prune
-    git -C "$INSTALL_DIR" checkout "$br"
-    git -C "$INSTALL_DIR" pull --ff-only origin "$br" || \
+    "${g[@]}" checkout "$br"
+    "${g[@]}" pull --ff-only origin "$br" || \
       warn "pull 失败（私有仓需部署密钥/Token）。可在有代码的机器上再跑本脚本。"
   else
     info "git clone $REPO_URL"
