@@ -312,7 +312,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             if ip in roster:
                 b.fire(ip, "offline", "crit", f"{ip} 掉线")
             continue
-        b.resolve(ip, "offline")
+        b.resolve(ip, "offline", recovered=ip not in repair)   # 维修中的机器上线不推"恢复"
         # 静默期结束时在线 → 重启完成。按时间戳现判，不用 rb_quiet：评估途中请求线程
         # 可能刚写入新标记，rb_quiet 里还没有它，会被误当成"已过期"清掉
         if rb_expired(ip):

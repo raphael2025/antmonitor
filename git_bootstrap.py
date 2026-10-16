@@ -71,6 +71,18 @@ def _mingit_arch():
     return {"AMD64": "64-bit", "X86": "32-bit", "ARM64": "arm64"}.get(arch)
 
 
+def _path_dir_for(git):
+    """Directory the server must have first on PATH to run this git: "" when PATH already
+    resolves `git` to it. The Windows Store alias under WindowsApps does not count as git."""
+    if not git:
+        return ""
+    on_path = shutil.which("git")
+    if on_path and "\\windowsapps\\" not in on_path.lower() \
+            and os.path.normcase(os.path.abspath(on_path)) == os.path.normcase(os.path.abspath(git)):
+        return ""
+    return str(Path(git).parent)
+
+
 def find_git():
     """git on PATH (ignoring the Store alias), else a portable MinGit installed earlier."""
     found = shutil.which("git")
@@ -193,7 +205,7 @@ def bootstrap(base):
     try:
         git = find_git()
         if (base / ".git").exists():
-            return str(Path(git).parent) if git and not shutil.which("git") else ""
+            return _path_dir_for(git)
         if git is None:
             git = install_mingit()
         commit, extra = adopt(base, git)
@@ -205,7 +217,7 @@ def bootstrap(base):
         else:
             _say("Web updates unavailable: the files do not match any published version "
                  "(edited, or not downloaded from GitHub). Use `git clone` to enable updates.")
-        return str(Path(git).parent) if not shutil.which("git") else ""
+        return _path_dir_for(git)
     except Exception as e:  # noqa: BLE001 - never block the monitor from starting
         _say("Web updates unavailable ({}). The monitor still starts normally.".format(e))
         return ""

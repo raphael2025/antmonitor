@@ -186,8 +186,20 @@ sync_code() {
     # 以 root 操作普通用户的仓库，新版 git 会报 dubious ownership；命令行显式信任这两个目录
     local g=(git -c safe.directory="$INSTALL_DIR" -c safe.directory="$LOCAL_SRC" -C "$INSTALL_DIR")
     if "${g[@]}" fetch "$LOCAL_SRC" HEAD; then
-      "${g[@]}" merge --ff-only FETCH_HEAD || \
-        warn "无法快进(安装目录有本地提交或已领先本地源码)，代码保持不变"
+      local src_br
+      src_br="$(git -c safe.directory="$LOCAL_SRC" -C "$LOCAL_SRC" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+      if "${g[@]}" merge --ff-only FETCH_HEAD; then
+        :
+      elif [[ "$src_br" != "HEAD" && -z "$("${g[@]}" rev-list --no-merges FETCH_HEAD..HEAD)" ]]; then
+        # 快进不了但安装目录没有本地源码里没有的实际改动(典型：旧版装在 dev，只多出合并提交)：
+        # 直接切到本地源码所在的分支和提交，否则会"提示更新完成、实际还是旧代码"
+        info "安装目录切换到 $src_br 分支（与本地源码一致）"
+        "${g[@]}" checkout -B "$src_br" FETCH_HEAD
+        "${g[@]}" rev-parse --verify --quiet "origin/$src_br" >/dev/null \
+          && "${g[@]}" branch --set-upstream-to="origin/$src_br" "$src_br" >/dev/null || true
+      else
+        warn "无法快进(安装目录有本地源码里没有的改动)，代码保持不变"
+      fi
     else
       warn "从 $LOCAL_SRC 拉取失败，代码保持不变"
     fi
