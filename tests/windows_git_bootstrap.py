@@ -37,6 +37,17 @@ def main():
             z.extractall(site)
         (site / "config.yaml").write_text("schedule:\n  enabled: false\n", encoding="utf-8")
 
+        # The pinned hashes were computed outside CI: re-download every architecture here
+        # (GitHub's network, independent of where the hashes came from) and compare.
+        import hashlib
+        import urllib.request
+        for arch, expected in git_bootstrap.MINGIT_SHA256.items():
+            url = git_bootstrap._MINGIT_URL.format(v=git_bootstrap.MINGIT_VERSION, arch=arch)
+            with urllib.request.urlopen(url, timeout=300) as r:
+                digest = hashlib.sha256(r.read()).hexdigest()
+            assert digest == expected, (arch, digest)
+            print("PASS: MinGit", arch, "sha256 matches")
+
         os.environ["LOCALAPPDATA"] = str(folder / "LocalAppData")
         git = git_bootstrap.install_mingit()
         print("PASS: portable Git downloaded and verified:", git)
