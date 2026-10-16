@@ -469,6 +469,11 @@ class MonitorService:
         if not sc.get("reconfirm_enabled", True):
             return miners
         prev_online = set(db.online_ips(self.conn))
+        # 上一轮扫描超时没探到(unknown)的机器也算"上一轮在线"：它们的 last_online 停在再上一轮。
+        # 否则这一轮一次丢包就直接报掉线，二次确认恰好漏掉了刚经历过拥堵的那批机器
+        recent = int(time.time()) - 2 * int(self.cfg["schedule"].get("scan_interval", 300)) - 60
+        prev_online |= {ip for ip, i in db.known_identity(self.conn).items()
+                        if i.get("state") == "active" and int(i.get("last_online") or 0) >= recent}
         _m, prev_recs = self.latest()
         prev_hr = {r["ip"]: r.get("hr_rt") for r in prev_recs}
         # 零算力/读不到算力只在"上一轮还有算力"时才算疑似：限电休眠、密码不对的一批机器
@@ -573,7 +578,9 @@ class MonitorService:
                 # 只回填离线机：在线机的 MAC 必须是本轮实测值——有合法 SN 的原厂机不读 MAC，
                 # 若回填名册旧值(可能是之前在这个 IP 上的另一台机)，残影判定会把真掉线的
                 # 那台当成"已在别处上线"自动下架、告警静音
-                if info and r["status"] != "online":
+                # 已判为迁移残影的旧 IP 不回填：回填旧 SN 后每次全网扫描都会被重新算成残影，
+                # 累计超过 migrate_max 就把自动识别迁移永久熔断
+                if info and r["status"] != "online" and info.get("state") != "migrated":
                     r["mac"] = r.get("mac") or info.get("mac") or ""
                     r["model"] = r.get("model") or info.get("model") or ""
                     r["sn"] = r.get("sn") or info.get("sn") or ""
@@ -587,7 +594,9 @@ class MonitorService:
             # 判据用"库里有没有过扫描"而不是"名册是否为空"——后者会被 IP 迁移批量下架
             # 清空名册的情况误伤，导致某一轮突然把上万个死地址全写进库。
             roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
-            first_run = db.latest_scan(self.conn) is None
+            # 名册也要是空的：停机超过 retention_days 后重启，旧扫描已被清理但名册还在，
+            # 那不是首轮，按首轮落全量会把上万个死地址写进库
+            first_run = db.latest_scan(self.conn) is None and not db.known_identity(self.conn)
             sid, ts, kept = db.save_scan(self.conn, kind, miners,
                                          keep_ips=(None if first_run else roster))
             # 矿池地址不落库(列表且只用于本轮防篡改检查)，但 kept 是按库列重建的干净记录，

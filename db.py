@@ -804,12 +804,19 @@ def _aggregate(rows, deltas):
     (rows 已按 scan_id 升序 → 后写覆盖先写，结果确定)。离线行 worker 为空，
     需靠该机已知矿工名归属，停机时段才能算到正确客户头上。"""
     ip2worker = {}
+    ever_online = set()
     for r in rows:
         if r["worker"]:
             ip2worker[r["ip"]] = r["worker"]
+        if r["status"] == "online":
+            ever_online.add(r["ip"])
     agg = {}
     last_known = {}
     for r in rows:
+        if r["ip"] not in ever_online and r["ip"] not in ip2worker:
+            # 本区间从没在线、也没有任何已知矿工名：是空 IP(首轮全网扫描会把上万个死地址
+            # 全部落库)，不是客户的停机机器。真机掉线时 service 会回填矿工名，不受影响
+            continue
         w = ip2worker.get(r["ip"]) or "(未知)"
         a = agg.setdefault(w, {"ips": set(), "samples": 0, "online": 0, "th_h": 0.0, "kwh": 0.0})
         a["ips"].add(r["ip"])

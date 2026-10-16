@@ -407,3 +407,69 @@ def test_kicked_container_is_announced_not_silently_dropped(svc, monkeypatch):
     svc._kick_containers()
     assert "10.9.0.5" not in db.known_container_ips(svc.conn)
     assert len(pushed) == 1 and "10.9.0.5" in pushed[0]
+
+
+def test_old_migrations_do_not_trip_the_migration_breaker(svc, monkeypatch):
+    """已迁移的旧 IP 不能每轮全扫都被重新算成残影：累计超过 migrate_max 后，
+    新的真迁移就再也不会被自动识别(旧 IP 报掉线)。"""
+    monkeypatch.setattr(service.appconfig, "load_segments", lambda _c: (["10.9.0"], 1, 20))
+    svc.cfg["scan"]["migrate_max"] = 2
+    S = lambda ip, n: rec(ip, sn="REALSN%06d" % n)   # noqa: E731
+    monkeypatch.setattr(miner_core, "scan", fake_scan([S("10.9.0.1", 1), S("10.9.0.2", 2),
+                                                      S("10.9.0.3", 3)]))
+    svc.scan_full("full")
+    monkeypatch.setattr(miner_core, "scan", fake_scan([S("10.9.0.11", 1), S("10.9.0.12", 2),
+                                                      S("10.9.0.3", 3)]))
+    svc.scan_full("full")           # 迁移 2 台(达到上限但未超)
+    monkeypatch.setattr(miner_core, "scan", fake_scan([S("10.9.0.11", 1), S("10.9.0.12", 2),
+                                                      S("10.9.0.13", 3)]))
+    svc.scan_full("full")           # 之后只新迁移 1 台
+    assert db.known_identity(svc.conn)["10.9.0.3"]["state"] == "migrated"
+    assert db.active_alert(svc.conn, "10.9.0.3", "offline") is None
+
+
+def test_restart_after_scans_pruned_is_not_treated_as_first_run(svc, monkeypatch):
+    """停机超过保留期、旧扫描已被清理但名册还在：不是首轮，不能把死地址全量落库。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1")]))
+    assert svc.scan_full("full")["miners"] == 5      # 真首轮：全量
+    with db._wlock, svc.conn:
+        svc.conn.execute("DELETE FROM snapshots")
+        svc.conn.execute("DELETE FROM scans")
+    assert svc.scan_full("full")["miners"] == 1      # 名册在 → 只落真机
+
+
+def test_rollup_ignores_dead_addresses_from_first_scan(conn):
+    """首轮全量落库的空 IP(从没在线、没有矿工名)不能进计费汇总成"(未知) 上万台、可用率 0"。"""
+    h = now_hour(-1)
+    recs = [rec("10.3.0.1", worker="A", hr=100.0)] + \
+        [rec(f"10.3.0.{i}", status="offline") for i in range(2, 50)]
+    insert_scan(conn, h + 60, "full", recs)
+    db.rollup_hours(conn)
+    workers = {r["worker"]: r for r in conn.execute("SELECT * FROM worker_hourly WHERE hour=?",
+                                                    (h,)).fetchall()}
+    assert set(workers) == {"A"}
+
+
+def test_machine_unknown_last_round_still_gets_reconfirmed(svc, monkeypatch):
+    """上一轮扫描超时没探到(unknown)、这一轮又瞬时丢包：仍要二次确认，不能直接报掉线。"""
+    A = "10.9.0.1"
+    svc.cfg["scan"]["reconfirm_passes"] = 1
+    unknown = dict(rec(A, status="unknown"), note="本轮未探测(扫描超时)")
+    rounds = iter([
+        [rec(A)],                       # 第一次：在线
+        [unknown],                      # 第二次：整体超时没探到
+        [unknown],                      # (未探测且上一轮有算力 → 也会重探一次，仍没探到)
+        [],                             # 第三次主扫：瞬时丢包
+        [rec(A)],                       # 二次确认：其实在线
+    ])
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        by_ip = {r["ip"]: r for r in next(rounds)}
+        return [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    for _ in range(3):
+        svc.scan_full("full")
+    assert db.active_alert(svc.conn, A, "offline") is None
+    _m, records = svc.latest()
+    assert {r["ip"]: r["status"] for r in records}[A] == "online"
