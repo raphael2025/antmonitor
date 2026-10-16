@@ -57,7 +57,9 @@ class MonitorService:
         self._container_thread = None
         self._recover_lock = threading.Lock()
         self._wd_lock = threading.Lock()
-        self._container_lock = threading.Lock()
+        # 只保护"拉起集装箱刷新线程"；不能借用 _container_lock(数据锁)，否则看门狗会被
+        # 正在跑的集装箱刷新卡住
+        self._container_thread_lock = threading.Lock()
         self._trigger_lock = threading.Lock()   # 手动扫描触发的判重(防两个请求都说"已启动")
         self._container_miss = {}     # 集装箱连续未采到次数(二次确认离线，防一次丢包误报)
         self._container_miss_n = 2
@@ -350,7 +352,7 @@ class MonitorService:
         会永久静默停摆，而扫描、看门狗、面板看起来一切正常，不会有任何告警提示。"""
         if not self._scheduling_on():
             return
-        with self._container_lock:
+        with self._container_thread_lock:
             if self._container_thread is None or not self._container_thread.is_alive():
                 log.warning("集装箱刷新线程不在，自动启动")
                 self._container_thread = threading.Thread(target=self._container_loop,
@@ -889,10 +891,10 @@ class MonitorService:
         # sync路由跑在会动态开关线程的线程池里，线程一多、活得越久就攒得越多——
         # 面板被人盯着看、上报/告警轮询越频繁，攒的速度越快，攒够 1024 就把服务打
         # 到句柄耗尽、连上报的新 socket 都开不出来(生产上实测复现过)。定期强制关闭
-        # 重来，跟写连接完全独立，不用等扫描空闲，代价只是极小概率撞上某个读请求
-        # 正查到一半、报一次可忽略的失败。
+        # 重来，跟写连接完全独立。扫描进行中先不清：扫描线程的读操作撞上被关掉的连接会让
+        # 整轮扫描作废；一轮只要一两分钟，推迟到扫描空闲再清，句柄不会因此攒爆。
         sweep_iv = max(60, int(dbc.get("reader_sweep_minutes", 15)) * 60)
-        if now - self._last_reader_sweep >= sweep_iv:
+        if now - self._last_reader_sweep >= sweep_iv and not self.progress.get("running"):
             self._last_reader_sweep = now
             n = db.close_readers()
             if n:
