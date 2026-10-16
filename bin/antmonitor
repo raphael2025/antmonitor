@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# This file is also committed into the repo as a template. The installer will place a wrapper at ~/.local/bin/antmonitor
+# It forwards commands to the per-user installer / systemd --user service.
+
+HOME_DIR="$HOME"
+INSTALLER="$HOME_DIR/.antmonitor/install.sh"
+SERVICE="antmonitor.service"
+
+if [ "$#" -eq 0 ]; then
+  set -- status
+fi
+case "$1" in
+  install|update|reset-password|uninstall)
+    shift
+    "$INSTALLER" "$1" "$@"
+    ;;
+  start|stop|status|restart)
+    case "$1" in
+      status)
+        systemctl --user status "$SERVICE" || true
+        ps aux | grep -v grep | grep -E "[p]ython .*server.py" || true
+        ;;
+      *)
+        systemctl --user "$1" "$SERVICE" || true
+        ;;
+    esac
+    ;;
+  help|-h|--help)
+    "$INSTALLER" help
+    ;;
+  *)
+    echo "Unknown command: $1"
+    echo "Usage: antmonitor {install|start|stop|status|restart|update|reset-password|uninstall}"
+    exit 2
+    ;;
+esac
