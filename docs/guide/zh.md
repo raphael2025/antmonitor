@@ -51,7 +51,7 @@ python server.py                      # http://<IP>:8800
 Python 安装失败时，可查看 `%LOCALAPPDATA%\AntMonitor\python-install.log`；网络无法访问
 python.org 或 PyPI 时需要恢复网络再试，或手动安装 Python 和依赖。
 需要手动设置密码时，在项目目录的 CMD 执行 `.venv\Scripts\python.exe auth.py passwd admin`。
-ZIP 部署支持本地监控；网页更新需要 Git 和 git clone 的工作目录。
+ZIP 部署首次启动时会自动转成 git 部署（没装 Git 会下载校验过的便携 Git），之后可在网页上更新；ZIP 里的文件被改过时无法识别版本，需改用 `git clone`。
 Windows 启动守护代码更新后，关闭旧启动窗口再双击即可使用新的守护逻辑。
 安全清单：[SECURITY](../SECURITY.md)。
 
