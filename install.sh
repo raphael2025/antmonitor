@@ -127,6 +127,11 @@ ensure_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq python3 python3-venv python3-pip git curl ca-certificates >/dev/null
+  # 依赖(fastapi 等)最低要 Python 3.8：Ubuntu 18.04 自带 3.6，不拦住的话会在 pip 安装时
+  # 报一堆看不懂的版本错误
+  if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= tuple(map(int, '${PY_MIN}'.split('.'))) else 1)"; then
+    die "系统 python3 版本 $(python3 -V 2>&1) 低于 ${PY_MIN}：请升级到 Ubuntu 20.04 及以上，或安装 python3.8+ 后重试"
+  fi
   ok "依赖已就绪"
 }
 
