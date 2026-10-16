@@ -140,3 +140,22 @@ def test_overheat_still_reported_inside_down_segment(conn, cfg):
     assert (ips[12], "overheat") in fired
     _run(conn, cfg, recs)   # 下一轮仍在整段事件中：已有高温告警不被消掉
     assert db.active_alert(conn, ips[12], "overheat") is not None
+
+
+def test_reject_rate_uses_share_delta_not_lifetime_totals(conn, cfg):
+    """拒绝率按份额增量算：老机器突然全拒要立刻报；刚重启样本少不误报。"""
+    ip = "10.0.4.1"
+    _roster(conn, [ip])
+    st = {}
+    # 跑了 30 天：累计 90 万接受。之后 100 个份额全被拒 → 累计口径只有 0.01%，增量口径 100%
+    _run(conn, cfg, [rec(ip, accepted=900000, rejected=0)], state=st)
+    fired = _run(conn, cfg, [rec(ip, accepted=900000, rejected=100)], state=st)
+    assert (ip, "reject") in [(f[0], f[1]) for f in fired]
+    # 恢复正常：增量里没有拒绝 → 消警
+    _run(conn, cfg, [rec(ip, accepted=900200, rejected=100)], state=st)
+    assert db.active_alert(conn, ip, "reject") is None
+    # 重启后计数归零：12 接受 1 拒绝样本太少，不判；累积够 50 份额后才按真实比例判
+    fired = _run(conn, cfg, [rec(ip, accepted=12, rejected=1)], state=st)
+    assert not [f for f in fired if f[1] == "reject"]
+    fired = _run(conn, cfg, [rec(ip, accepted=99, rejected=1)], state=st)
+    assert not [f for f in fired if f[1] == "reject"]

@@ -168,6 +168,8 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         return []
     state = state if state is not None else {}
     streak = state.setdefault("low_hr_streak", {})
+    zero_since = state.setdefault("zero_since", {})   # ip → 连续零算力起始时间
+    shares = state.setdefault("reject_base", {})   # ip → (accepted, rejected) 拒绝率增量基准
     rebooting = state.setdefault("rebooting", {})   # ip → 下发重启的时间(MonitorService.mark_rebooting 写入)
     rb_grace = cfg.get("control", {}).get("reboot_grace_sec", 600)
 
@@ -179,6 +181,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     seg_ratio = acfg.get("segment_down_ratio", 0.6)
     seg_min = acfg.get("segment_down_min", 5)
     rej_thresh = acfg.get("reject_pct", 5.0)
+    rej_min = max(1, int(acfg.get("reject_min_shares", 50) or 50))
     grace = acfg.get("zero_grace_sec", 600)
     lo_ratio = acfg.get("low_hashrate_ratio", 0.7)
     lo_rounds = max(1, int(acfg.get("low_hashrate_rounds", 2)))
@@ -266,6 +269,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             for t in ("zero", "reject", "low_hashrate", "overheat"):
                 b.resolve(ip, t)
             streak.pop(ip, None)
+            zero_since.pop(ip, None)
             if ip in repair:
                 b.resolve(ip, "offline")   # 维修中 → 清掉单条(人已经知道了)
                 rebooting.pop(ip, None)
@@ -293,7 +297,14 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
 
         hr = r.get("hr_rt")
         up = r.get("uptime")
-        warming = grace and isinstance(up, (int, float)) and up < grace   # 刚开机/升频中
+        # 刚开机/升频中。只看 uptime 不够：挖矿程序每几分钟崩一次重启的机器 uptime 永远
+        # 小于宽限期，永远不报零算力。所以再看"连续零算力多久了"，超过宽限期照报
+        if hr == 0:
+            zero_since.setdefault(ip, now)
+        elif hr is not None:
+            zero_since.pop(ip, None)
+        warming = (grace and isinstance(up, (int, float)) and up < grace
+                   and not (hr == 0 and now - zero_since[ip] >= grace))
         muted = ip in repair or seg in down_segments   # 维修中 / 整段掉线 → 不单独报
 
         if hr == 0:                       # 明确为 0 才算零算力
@@ -349,18 +360,40 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             else:
                 b.resolve(ip, "pool_hijack")
 
-        # 拒绝率（矿池健康）
-        if rej_thresh and rej_thresh > 0 and (r.get("accepted") is not None
-                                              or r.get("rejected") is not None):
-            rp = miner_core.reject_pct(r.get("accepted"), r.get("rejected"))
-            if rp >= rej_thresh and not muted:
-                b.fire(ip, "reject", "warn", f"{ip} 拒绝率 {rp}% ≥ {rej_thresh}%")
+        # 拒绝率（矿池健康）：按两次判定之间的份额增量算。矿机给的是开机以来的累计值，
+        # 直接用累计值的话，跑了 30 天的机器突然全拒要一天多才报，刚重启 12 个份额拒 1 个
+        # 就立刻报。增量不足 reject_min_shares 份额时保留基准继续累积，告警状态不变
+        acc, rej = r.get("accepted"), r.get("rejected")
+        if rej_thresh and rej_thresh > 0 and (acc is not None or rej is not None):
+            a, j = acc or 0, rej or 0
+            base = shares.get(ip)
+            if base is None:
+                shares[ip] = (a, j)            # 首次见到：只记基准
             else:
-                b.resolve(ip, "reject")
+                if a < base[0] or j < base[1]:  # 计数归零(矿机/挖矿程序重启)：当前值就是增量
+                    base = (0, 0)
+                da, dj = a - base[0], j - base[1]
+                if muted:
+                    shares[ip] = (a, j)
+                    b.resolve(ip, "reject")
+                elif da + dj >= rej_min:
+                    shares[ip] = (a, j)
+                    rp = round(dj / (da + dj) * 100, 3)
+                    if rp >= rej_thresh:
+                        b.fire(ip, "reject", "warn",
+                               f"{ip} 拒绝率 {rp}% ≥ {rej_thresh}%(最近 {da + dj} 份额)")
+                    else:
+                        b.resolve(ip, "reject")
 
     for ip in list(streak):     # 已不在本轮样本内的机器(下架/换IP)：别让计数无限增长
         if ip not in cur:
             streak.pop(ip, None)
+    for ip in list(shares):
+        if ip not in cur:
+            shares.pop(ip, None)
+    for ip in list(zero_since):
+        if ip not in cur:
+            zero_since.pop(ip, None)
     for ip in list(rebooting):  # 同理：静默期过了还没出现在样本里的(下架/换IP)
         if ip not in cur and rb_expired(ip):
             rebooting.pop(ip, None)
@@ -470,7 +503,9 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
 
     for ip in known_before:              # 已记住的箱、本次未采到
         if ip not in cur:
-            b.fire(ip, "cooler_offline", "crit", f"集装箱 {ip} 控制器离线")
+            # force：与其他冷却 crit 一致不受冷却限制。控制器离线 = 漏液监测失效，
+            # 短暂掉线恢复后 30 分钟内再次掉线，不能被冷却推迟
+            b.fire(ip, "cooler_offline", "crit", f"集装箱 {ip} 控制器离线", force=True)
 
     fired = b.commit()
     if fired:

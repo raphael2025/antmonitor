@@ -46,7 +46,12 @@ CFG = appconfig.load_config(os.environ.get("MINER_CONFIG", "config.yaml"))
 logs.setup(CFG)
 log = logs.get(__name__)
 
-appconfig.apply_settings(CFG, appconfig.load_settings())   # 网页保存的参数覆盖
+_saved = appconfig.load_settings()
+_over = appconfig.settings_overrides(CFG, _saved)
+if _over:   # 网页存过的项会一直盖住 config.yaml，改配置文件不生效时一眼能看出原因
+    log.warning("以下设置以网页保存的 %s 为准，覆盖了 config.yaml(要改请在网页改，或删掉该文件里的对应项): %s",
+                os.path.basename(appconfig.SETTINGS_FILE), "; ".join(_over))
+appconfig.apply_settings(CFG, _saved)   # 网页保存的参数覆盖
 SVC = MonitorService(CFG)
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
@@ -902,9 +907,9 @@ def api_settings_get(sess: dict = Depends(require_viewer)):
            # 重启设置：viewer/ops 只读可见；admin 可 POST 改。开关只挡自动重启。
            "reboot_enabled": bool(ctl.get("reboot_enabled")),
            "reboot_concurrency": int(ctl.get("reboot_concurrency", 30) or 30),
-           "reboot_delay_sec": int(ctl.get("reboot_delay_sec", 8) or 8),
+           "reboot_delay_sec": int(ctl.get("reboot_delay_sec", 8)),
            "reboot_max_per_day": int(ctl.get("reboot_max_per_day", 4) or 4),
-           "reboot_min_interval_sec": int(ctl.get("reboot_min_interval_sec", 900) or 900)}
+           "reboot_min_interval_sec": int(ctl.get("reboot_min_interval_sec", 900))}
     if auth.has_role(sess, "admin"):   # 云端上报配置含 token，只给 admin
         c = CFG.get("cloud") or {}
         out["cloud"] = {"enabled": bool(c.get("enabled")), "url": c.get("url") or "",

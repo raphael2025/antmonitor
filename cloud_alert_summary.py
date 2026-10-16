@@ -17,6 +17,8 @@ _CATEGORY_LABEL = {
     "reject": "矿池拒绝率高",
     "segment_down": "网段整体掉线",
     "cooler_offline": "集装箱离线",
+    "pool_hijack": "矿池被篡改",
+    "stalled": "监控停滞",
 }
 
 _MAX_GROUPS = 20      # 类型数天然有限(≈10个)，封顶防异常数据撑爆上报体

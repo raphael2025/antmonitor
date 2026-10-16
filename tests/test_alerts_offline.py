@@ -189,3 +189,26 @@ def test_segment_hovering_around_threshold_does_not_spam(conn, cfg, clock):
                + [rec(ip) for ip in ips[n_off:]], st)
     rows = [a for a in db.list_alerts(conn, False, 100) if a["type"] == "segment_down"]
     assert len(rows) == 1 and not rows[0]["resolved"]
+
+
+def test_zero_hashrate_reported_for_miner_stuck_in_restart_loop(conn, cfg, clock):
+    """挖矿程序每 5 分钟崩溃重启一次：uptime 永远 < 宽限期，但连续零算力超过宽限期照报。"""
+    cfg["alerts"]["zero_grace_sec"] = 600
+    ip = "10.0.7.1"
+    st = {}
+    _round(conn, cfg, clock, [rec(ip)], st)
+    fired = []
+    for _ in range(4):   # 每轮 300s，uptime 每轮都只有 120s
+        fired += _round(conn, cfg, clock, [rec(ip, hr=0.0, uptime=120)], st)
+    assert (ip, "zero") in fired
+
+
+def test_zero_hashrate_after_real_boot_still_gets_grace(conn, cfg, clock):
+    """真开机：掉线一轮后回来零算力且 uptime 小 → 宽限期内不报。"""
+    cfg["alerts"]["zero_grace_sec"] = 600
+    ip = "10.0.7.2"
+    st = {}
+    _round(conn, cfg, clock, [rec(ip, hr=0.0, uptime=99999)], st)
+    _round(conn, cfg, clock, [rec(ip, status="offline")], st)
+    fired = _round(conn, cfg, clock, [rec(ip, hr=0.0, uptime=100)], st)
+    assert (ip, "zero") not in fired

@@ -92,9 +92,11 @@ def main():
     ap.add_argument("--lo", type=int, default=100)
     ap.add_argument("--hi", type=int, default=160)
     ap.add_argument("--base", default="172.16")
-    ap.add_argument("--online-timeout", type=float, default=0.5)
-    ap.add_argument("--data-timeout", type=float, default=2.0)
-    ap.add_argument("--workers", type=int, default=300)
+    # 超时/并发不给就沿用 config.yaml 的 scan 段(含判活闸门、max_pps 限速、矿机口令)：
+    # 以前固定 0.5s 超时、不限速、不走闸门，和后台服务同时跑会顶破三层交换机的 ARP 限速
+    ap.add_argument("--online-timeout", type=float, default=None)
+    ap.add_argument("--data-timeout", type=float, default=None)
+    ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
@@ -102,8 +104,12 @@ def main():
         report(load_csv(args.report), out=args.report)
         return
 
-    cfg = {"online_timeout": args.online_timeout, "data_timeout": args.data_timeout,
-           "workers": args.workers, "passwords": [["root", "root"]]}
+    import appconfig
+    cfg = dict(appconfig.load_config()["scan"])
+    for k, v in (("online_timeout", args.online_timeout), ("data_timeout", args.data_timeout),
+                 ("workers", args.workers)):
+        if v is not None:
+            cfg[k] = v
     ips = miner_core.gen_ips(args.lo, args.hi, args.base)
     print(f"扫描 {args.base}.{args.lo}.x - {args.base}.{args.hi}.x  共 {len(ips)} 个地址")
 

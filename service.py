@@ -57,7 +57,9 @@ class MonitorService:
         self._container_thread = None
         self._recover_lock = threading.Lock()
         self._wd_lock = threading.Lock()
-        self._container_lock = threading.Lock()
+        # 只保护"拉起集装箱刷新线程"；不能借用 _container_lock(数据锁)，否则看门狗会被
+        # 正在跑的集装箱刷新卡住
+        self._container_thread_lock = threading.Lock()
         self._trigger_lock = threading.Lock()   # 手动扫描触发的判重(防两个请求都说"已启动")
         self._container_miss = {}     # 集装箱连续未采到次数(二次确认离线，防一次丢包误报)
         self._container_miss_n = 2
@@ -103,7 +105,7 @@ class MonitorService:
     def _restore_rebooting(self):
         """重启静默期标记只在内存里：静默期内服务一重启，正在开机的整批机器会被当成掉线
         推 crit，"重启后 N 分钟仍未上线"也不再出现。从审计里成功下发的重启恢复回来。"""
-        grace = int((self.cfg.get("control") or {}).get("reboot_grace_sec", 600) or 600)
+        grace = int((self.cfg.get("control") or {}).get("reboot_grace_sec", 600))
         try:
             marks = db.recent_reboots(self.conn, int(time.time()) - grace)
         except Exception as e:  # noqa: BLE001
@@ -130,7 +132,7 @@ class MonitorService:
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         clear = set(repair) | (set(states) - roster)
         rebooting = self._alert_state.get("rebooting") or {}
-        rb_grace = int(ctl.get("reboot_grace_sec", 600) or 600)
+        rb_grace = int(ctl.get("reboot_grace_sec", 600))
         # 旧版可能在离线期间保留了零算力计时。未下发过自动重启的机器，
         # 若计时开始后曾确认离线，重新上线时必须从新的零算力样本重新计时。
         for ip, state in states.items():
@@ -350,7 +352,7 @@ class MonitorService:
         会永久静默停摆，而扫描、看门狗、面板看起来一切正常，不会有任何告警提示。"""
         if not self._scheduling_on():
             return
-        with self._container_lock:
+        with self._container_thread_lock:
             if self._container_thread is None or not self._container_thread.is_alive():
                 log.warning("集装箱刷新线程不在，自动启动")
                 self._container_thread = threading.Thread(target=self._container_loop,
@@ -469,6 +471,11 @@ class MonitorService:
         if not sc.get("reconfirm_enabled", True):
             return miners
         prev_online = set(db.online_ips(self.conn))
+        # 上一轮扫描超时没探到(unknown)的机器也算"上一轮在线"：它们的 last_online 停在再上一轮。
+        # 否则这一轮一次丢包就直接报掉线，二次确认恰好漏掉了刚经历过拥堵的那批机器
+        recent = int(time.time()) - 2 * int(self.cfg["schedule"].get("scan_interval", 300)) - 60
+        prev_online |= {ip for ip, i in db.known_identity(self.conn).items()
+                        if i.get("state") == "active" and int(i.get("last_online") or 0) >= recent}
         _m, prev_recs = self.latest()
         prev_hr = {r["ip"]: r.get("hr_rt") for r in prev_recs}
         # 零算力/读不到算力只在"上一轮还有算力"时才算疑似：限电休眠、密码不对的一批机器
@@ -573,7 +580,9 @@ class MonitorService:
                 # 只回填离线机：在线机的 MAC 必须是本轮实测值——有合法 SN 的原厂机不读 MAC，
                 # 若回填名册旧值(可能是之前在这个 IP 上的另一台机)，残影判定会把真掉线的
                 # 那台当成"已在别处上线"自动下架、告警静音
-                if info and r["status"] != "online":
+                # 已判为迁移残影的旧 IP 不回填：回填旧 SN 后每次全网扫描都会被重新算成残影，
+                # 累计超过 migrate_max 就把自动识别迁移永久熔断
+                if info and r["status"] != "online" and info.get("state") != "migrated":
                     r["mac"] = r.get("mac") or info.get("mac") or ""
                     r["model"] = r.get("model") or info.get("model") or ""
                     r["sn"] = r.get("sn") or info.get("sn") or ""
@@ -587,7 +596,9 @@ class MonitorService:
             # 判据用"库里有没有过扫描"而不是"名册是否为空"——后者会被 IP 迁移批量下架
             # 清空名册的情况误伤，导致某一轮突然把上万个死地址全写进库。
             roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
-            first_run = db.latest_scan(self.conn) is None
+            # 名册也要是空的：停机超过 retention_days 后重启，旧扫描已被清理但名册还在，
+            # 那不是首轮，按首轮落全量会把上万个死地址写进库
+            first_run = db.latest_scan(self.conn) is None and not db.known_identity(self.conn)
             sid, ts, kept = db.save_scan(self.conn, kind, miners,
                                          keep_ips=(None if first_run else roster))
             # 矿池地址不落库(列表且只用于本轮防篡改检查)，但 kept 是按库列重建的干净记录，
@@ -621,20 +632,21 @@ class MonitorService:
                 self._maybe_auto_reboot(kept)
             except Exception as e:  # noqa: BLE001
                 log.exception("auto-reboot error: %s", e)
-            # 集装箱：记住/发现新箱 + 对采到的箱评估故障；不在此判离线
+            # 集装箱：全网扫描只负责发现新箱，已知箱的读数和故障评估全部交给 10 秒刷新。
+            # 全网扫描要跑好几分钟，这里拿到的已知箱读数是几分钟前的：用它评估会把 10 秒刷新
+            # 已确认恢复的漏液再报一次 crit，还会用旧读数覆盖箱体表里更新的状态。
+            # 也不在此判离线：全网扫描对集装箱"未采到"不可靠(判活闸门会误杀查 PLC 慢的控制器)
             got = self._container_lock.acquire(timeout=60)   # 等正在跑的 10 秒刷新做完
             try:
                 if not got:
                     raise RuntimeError("等集装箱刷新超时，本轮不处理集装箱")
-                detected_ips = {c["ip"] for c in containers}
-                db.save_containers(self.conn, ts, containers)
-                db.upsert_containers(self.conn, containers, ts)
-                # 全网扫描对集装箱"未采到"不可靠(判活闸门会误杀查 PLC 慢的控制器)，
-                # 离线判定统一交给 _container_loop(给足超时、每10s 一次)。
-                cfired = alerts.evaluate_containers(self.conn, containers, detected_ips, self.cfg,
-                                                    state=self._alert_state)
-                db.kick_offline_containers(
-                    self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
+                known = set(db.known_container_ips(self.conn))
+                fresh = [c for c in containers if c["ip"] not in known]
+                if fresh:
+                    db.save_containers(self.conn, ts, fresh)
+                    db.upsert_containers(self.conn, fresh, ts)
+                    log.info("发现新集装箱 %d 个: %s", len(fresh), [c["ip"] for c in fresh][:8])
+                self._kick_containers()
             except Exception as e:  # noqa: BLE001
                 log.exception("container eval error: %s", e)
             finally:
@@ -727,6 +739,20 @@ class MonitorService:
             return self.scan_full(kind="full")   # 没有底库先全扫
         return self._do_scan(kind, ips, workers=self.cfg["scan"].get("workers", 300))
 
+    def _kick_containers(self):
+        """离线太久的箱子移出监控。移出后漏液等冷却告警就不再检测，必须明确通知，
+        不能让 crit 告警自己悄悄消失。"""
+        gone = db.kick_offline_containers(
+            self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
+        if gone:
+            hours = int(self.cfg["scan"].get("container_offline_kick_sec", 86400)) // 3600
+            log.warning("集装箱离线超过 %d 小时，移出监控: %s", hours, gone)
+            try:
+                alerts.push_text(self.cfg, f"🔴 集装箱 {'、'.join(gone[:10])} 控制器离线已超过 {hours} 小时，"
+                                           f"已移出监控(漏液/压力等冷却告警不再检测)；控制器恢复后会自动重新发现")
+            except Exception:  # noqa: BLE001
+                log.exception("集装箱移出推送失败")
+
     def scan_containers(self):
         """高频刷新已知集装箱（只打 /cooler）。用独立的 _container_lock：矿机扫描进行中
         照样刷新(漏液这类数据等不起一两分钟)，只和"全网扫描里处理集装箱那一小段"互斥。"""
@@ -759,8 +785,7 @@ class MonitorService:
             # known_before 只传 已采到 + 已确认离线 → 未确认(刚漏1轮)的不报 cooler_offline
             cfired = alerts.evaluate_containers(self.conn, cs, detected | set(confirmed_off),
                                                 self.cfg, state=self._alert_state)
-            db.kick_offline_containers(
-                self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
+            self._kick_containers()
             if cfired and self.notify:
                 try:
                     self.notify({"type": "refresh", "fired": len(cfired)})
@@ -866,10 +891,10 @@ class MonitorService:
         # sync路由跑在会动态开关线程的线程池里，线程一多、活得越久就攒得越多——
         # 面板被人盯着看、上报/告警轮询越频繁，攒的速度越快，攒够 1024 就把服务打
         # 到句柄耗尽、连上报的新 socket 都开不出来(生产上实测复现过)。定期强制关闭
-        # 重来，跟写连接完全独立，不用等扫描空闲，代价只是极小概率撞上某个读请求
-        # 正查到一半、报一次可忽略的失败。
+        # 重来，跟写连接完全独立。扫描进行中先不清：扫描线程的读操作撞上被关掉的连接会让
+        # 整轮扫描作废；一轮只要一两分钟，推迟到扫描空闲再清，句柄不会因此攒爆。
         sweep_iv = max(60, int(dbc.get("reader_sweep_minutes", 15)) * 60)
-        if now - self._last_reader_sweep >= sweep_iv:
+        if now - self._last_reader_sweep >= sweep_iv and not self.progress.get("running"):
             self._last_reader_sweep = now
             n = db.close_readers()
             if n:

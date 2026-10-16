@@ -100,6 +100,10 @@ def _restart():
     except Exception as e:  # noqa: BLE001
         # 拉不起新进程就别退出：新代码已在磁盘上，旧进程继续服务，人工重启即可生效
         log.error("自动重启失败(新版本已就位，请手动重启服务生效): %s", e)
+        try:   # apply 为"即将退出"保留了更新锁；不退出就得放掉，否则之后每次更新都被拒
+            _apply_lock.release()
+        except RuntimeError:
+            pass
         return
     os._exit(0)
 

@@ -376,6 +376,12 @@ if err:
     sys.exit(1)
 print("密码已更新（备份 config.yaml.bak）。正在重启服务…")
 PY
+  # 上面以 root 原子替换了 config.yaml(属主会变成 root)：还给服务账号，否则服务读不了
+  # 600 权限的配置起不来，或网页改密码时写不回去
+  local svc_user
+  svc_user="$(systemctl show -p User --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+  svc_user="${svc_user:-root}"
+  chown "$svc_user:$svc_user" "$INSTALL_DIR/config.yaml" "$INSTALL_DIR/config.yaml.bak" 2>/dev/null || true
   systemctl restart "${SERVICE_NAME}.service" 2>/dev/null || true
   ok "账号已更新，请用新用户名/密码登录面板"
 }
