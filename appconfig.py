@@ -238,6 +238,23 @@ def _validate(cfg):
     clamp("alerts", "zero_grace_sec", 0, 86400, int)
     clamp("alerts", "container_pressure_hold_sec", 0, 3600, int)
     clamp("alerts", "container_pressure_clear_sec", 0, 3600, int)
+    # 写错类型(如 check_interval: "1h"、port: "8800a")以前会在启动时抛异常，守护连续
+    # 拉起失败后放弃，整站监控停摆；这里回退默认值并打警告
+    clamp("update", "check_interval", 300, 604800, int)
+    clamp("server", "port", 1, 65535, int)
+    if cfg["alerts"]["overheat_c"] and cfg["alerts"]["overheat_clear_c"] >= cfg["alerts"]["overheat_c"]:
+        nv = max(0, cfg["alerts"]["overheat_c"] - 5)
+        warn.append(f"alerts.overheat_clear_c 应小于 overheat_c，否则高温回差失效，已改为 {nv}")
+        cfg["alerts"]["overheat_clear_c"] = nv
+    users = cfg["auth"].get("users")
+    if not isinstance(users, list):
+        warn.append("auth.users 不是列表，已忽略")
+        users = []
+    good = [u for u in users if isinstance(u, dict) and isinstance(u.get("username"), str)
+            and u["username"].strip()]
+    if len(good) != len(users):
+        warn.append(f"auth.users 里有 {len(users) - len(good)} 项缺少 username(写成了 user?)，已忽略")
+    cfg["auth"]["users"] = good
 
     if cfg["scan"]["host_end"] < cfg["scan"]["host_start"]:
         warn.append("scan.host_end < host_start，已对调")
@@ -456,6 +473,25 @@ _INT_SETTINGS = ("scan_interval", "full_interval", "container_interval",
 # 网页可热改的 control 整数项(自动重启相关)；与 _INT_SETTINGS 分开，避免误写到 scan/schedule
 _CONTROL_INT_SETTINGS = ("reboot_concurrency", "reboot_delay_sec",
                          "reboot_max_per_day", "reboot_min_interval_sec")
+
+
+def settings_overrides(cfg, s):
+    """settings.json 里与当前 cfg(config.yaml) 不同的项，形如 ["reboot_enabled: False → True"]。
+    网页保存过的项会一直覆盖 config.yaml 里的同名项——启动时打出来，免得改了配置文件
+    (例如检修时关掉自动重启)以为生效了其实没有。"""
+    out = []
+    for k in _INT_SETTINGS + _CONTROL_INT_SETTINGS + ("reboot_enabled",):
+        if k not in s:
+            continue
+        if k in ("scan_interval", "full_interval", "container_interval"):
+            cur = cfg["schedule"].get(k)
+        elif k in ("max_pps", "discovery_workers"):
+            cur = cfg["scan"].get(k)
+        else:
+            cur = (cfg.get("control") or {}).get(k)
+        if str(cur) != str(s[k]):
+            out.append(f"{k}: {cur} → {s[k]}")
+    return out
 
 
 def apply_settings(cfg, s):

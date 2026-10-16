@@ -103,7 +103,7 @@ class MonitorService:
     def _restore_rebooting(self):
         """重启静默期标记只在内存里：静默期内服务一重启，正在开机的整批机器会被当成掉线
         推 crit，"重启后 N 分钟仍未上线"也不再出现。从审计里成功下发的重启恢复回来。"""
-        grace = int((self.cfg.get("control") or {}).get("reboot_grace_sec", 600) or 600)
+        grace = int((self.cfg.get("control") or {}).get("reboot_grace_sec", 600))
         try:
             marks = db.recent_reboots(self.conn, int(time.time()) - grace)
         except Exception as e:  # noqa: BLE001
@@ -130,7 +130,7 @@ class MonitorService:
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         clear = set(repair) | (set(states) - roster)
         rebooting = self._alert_state.get("rebooting") or {}
-        rb_grace = int(ctl.get("reboot_grace_sec", 600) or 600)
+        rb_grace = int(ctl.get("reboot_grace_sec", 600))
         # 旧版可能在离线期间保留了零算力计时。未下发过自动重启的机器，
         # 若计时开始后曾确认离线，重新上线时必须从新的零算力样本重新计时。
         for ip, state in states.items():

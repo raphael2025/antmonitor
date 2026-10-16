@@ -33,7 +33,7 @@ def filter_reboot_targets(conn, targets, cfg):
     import db  # 延迟导入：避免 control↔db 顶层环依赖(测试里常单独 mock)
     ctl = cfg.get("control") or {}
     max_day = int(ctl.get("reboot_max_per_day", 4) or 4)
-    min_iv = int(ctl.get("reboot_min_interval_sec", 900) or 900)
+    min_iv = int(ctl.get("reboot_min_interval_sec", 900))
     ips = [t[0] for t in targets]
     stats = db.reboot_stats(conn, ips, window_sec=86400)
     now = int(time.time())

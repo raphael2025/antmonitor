@@ -4,6 +4,7 @@ import sqlite3
 import pytest
 
 import alerts
+import appconfig
 import backup_db
 import control
 import updater
@@ -263,3 +264,37 @@ def test_telegram_long_message_split_and_bad_request_not_retried(monkeypatch):
     sent.clear()
     alerts._send_with_retry({}, "坏请求")
     assert sent == ["坏请求"] and slept == []
+
+
+def test_config_typos_fall_back_instead_of_crashing_startup():
+    """写错一处配置不能让服务起不来(守护连续失败后放弃，整站停摆)。"""
+    cfg = appconfig._validate(appconfig._merge(appconfig.DEFAULTS, {
+        "update": {"check_interval": "1h"}, "server": {"port": "88oo"},
+        "auth": {"users": [{"user": "admin", "password": "x"},
+                           {"username": "ops", "password": "y"}]},
+        "alerts": {"overheat_c": 95, "overheat_clear_c": 97},
+    }))
+    assert cfg["update"]["check_interval"] == appconfig.DEFAULTS["update"]["check_interval"]
+    assert cfg["server"]["port"] == 8800
+    assert [u["username"] for u in cfg["auth"]["users"]] == ["ops"]
+    assert cfg["alerts"]["overheat_clear_c"] < cfg["alerts"]["overheat_c"]
+
+
+def test_zero_values_are_respected_not_replaced_by_defaults(conn):
+    """重启最小间隔设 0 = 不限间隔：以前 `or 900` 把 0 当成没设置，实际仍按 900 秒限流。"""
+    import time
+    import control
+    import db
+    cfg = appconfig._merge(appconfig.DEFAULTS, {})
+    cfg["control"]["reboot_min_interval_sec"] = 0
+    with db._wlock, conn:
+        conn.execute("INSERT INTO command_log(ts,user,action,ip,ok,msg) VALUES(?,?,?,?,?,?)",
+                     (int(time.time()) - 10, "x", "reboot", "10.0.0.1", 1, "ok"))
+    allowed, skipped = control.filter_reboot_targets(conn, [("10.0.0.1", "")], cfg)
+    assert allowed == [("10.0.0.1", "")] and skipped == []
+
+
+def test_settings_json_overrides_are_listed():
+    cfg = appconfig._merge(appconfig.DEFAULTS, {})
+    over = appconfig.settings_overrides(cfg, {"reboot_enabled": True, "scan_interval": 300})
+    assert over == ["reboot_enabled: False → True"]
