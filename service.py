@@ -62,6 +62,7 @@ class MonitorService:
         self._container_miss = {}     # 集装箱连续未采到次数(二次确认离线，防一次丢包误报)
         self._container_miss_n = 2
         self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数、刚重启的机器)
+        self._restore_rebooting()
         self._last_full = 0.0         # 上次全网发现完成的 monotonic 时刻
         self._last_checkpoint = 0.0
         self._last_rollup = 0.0
@@ -98,6 +99,19 @@ class MonitorService:
         now = int(time.time())
         for ip in ips:
             rb[ip] = now
+
+    def _restore_rebooting(self):
+        """重启静默期标记只在内存里：静默期内服务一重启，正在开机的整批机器会被当成掉线
+        推 crit，"重启后 N 分钟仍未上线"也不再出现。从审计里成功下发的重启恢复回来。"""
+        grace = int((self.cfg.get("control") or {}).get("reboot_grace_sec", 600) or 600)
+        try:
+            marks = db.recent_reboots(self.conn, int(time.time()) - grace)
+        except Exception as e:  # noqa: BLE001
+            log.warning("恢复重启静默期标记失败: %s", e)
+            return
+        if marks:
+            self._alert_state.setdefault("rebooting", {}).update(marks)
+            log.info("已恢复 %d 台机器的重启静默期标记", len(marks))
 
     def unmark_rebooting(self, ips):
         rb = self._alert_state.setdefault("rebooting", {})
@@ -148,6 +162,64 @@ class MonitorService:
         if not ctl.get("enabled") or not ctl.get("reboot_enabled"):
             return []
 
+        # 成片零算力 = 事件，不是单机故障：重启解决不了，还会把休眠机全部唤醒。
+        #   1) 按 /24 网段：段内零算力 ≥ zero_reboot_mass_min 台且占该段在线机 > zero_reboot_mass_ratio
+        #      → 只暂停这一段(维护某个网段、该段断电/交换机/矿池配置问题)，其他网段照常
+        #   2) 去掉暂停的网段后，剩余在线机仍满足同样条件 → 全场性(矿池故障/限电/断网)，整体暂停
+        # 暂停范围内未尝试过的计时清零：事件结束后掉队的机器重新等满 15 分钟，而不是一恢复就被重启
+        mass_min = int(ctl.get("zero_reboot_mass_min", 5) or 1)
+        mass_ratio = float(ctl.get("zero_reboot_mass_ratio", 0.2) or 0)
+
+        def is_mass(zero, total):
+            return bool(mass_ratio) and total > 0 and zero >= mass_min and zero / total > mass_ratio
+
+        seg_total, seg_zero = {}, {}
+        for r in records:
+            ip = r["ip"]
+            if r.get("status") != "online" or ip not in roster or ip in repair:
+                continue
+            seg = ".".join(ip.split(".")[:3])
+            seg_total[seg] = seg_total.get(seg, 0) + 1
+            if r.get("hr_rt") == 0:
+                seg_zero[seg] = seg_zero.get(seg, 0) + 1
+        mass_segs = {seg for seg, z in seg_zero.items() if is_mass(z, seg_total[seg])}
+        rest_total = sum(n for seg, n in seg_total.items() if seg not in mass_segs)
+        rest_zero = sum(n for seg, n in seg_zero.items() if seg not in mass_segs)
+        site_mass = is_mass(rest_zero, rest_total)
+        if site_mass:
+            mass_segs = set(seg_total)
+        paused = set(mass_segs)
+
+        clear = [ip for ip, st in states.items() if int(st.get("attempts") or 0) == 0
+                 and ".".join(ip.split(".")[:3]) in paused]
+        db.clear_zero_reboot_states(self.conn, clear)
+        for ip in clear:
+            states.pop(ip, None)
+
+        prev = self._alert_state.get("zero_mass_segs") or set()
+        new_segs = sorted(paused - prev)
+        if new_segs:
+            if site_mass:
+                z = sum(seg_zero.values())
+                t = sum(seg_total.values())
+                text = (f"⚠ {z}/{t} 台在线机同时零算力，疑似矿池故障/限电/断网，"
+                        f"已暂停全场零算力自动重启，恢复后自动继续")
+            else:
+                desc = "、".join(f"{seg}.x({seg_zero[seg]}/{seg_total[seg]})" for seg in new_segs[:10])
+                more = f" 等 {len(new_segs)} 个网段" if len(new_segs) > 10 else ""
+                text = (f"⚠ 网段 {desc}{more} 成片零算力，疑似维护/断电/矿池配置问题，"
+                        f"已暂停这些网段的零算力自动重启，其他网段照常")
+            log.warning(text)
+            try:
+                alerts.push_text(self.cfg, text)
+            except Exception:  # noqa: BLE001
+                log.exception("零算力熔断推送失败")
+        if prev - paused:
+            log.info("零算力成片事件解除: %s", ", ".join(sorted(prev - paused)[:10]))
+        self._alert_state["zero_mass_segs"] = paused
+        if site_mass:
+            return []
+
         grace = int(acfg.get("zero_grace_sec", 600) or 0)
         starts = []
         for r in records:
@@ -155,7 +227,7 @@ class MonitorService:
             if r.get("status") != "online" or r.get("hr_rt") != 0:
                 continue
             seg = ".".join(ip.split(".")[:3])
-            if ip in repair or seg in active_segments:
+            if ip in repair or seg in active_segments or seg in paused:
                 continue
             # Start the 15-minute timer on the first zero sample. Startup grace is
             # checked separately before sending, so it never delays the timer itself.
@@ -180,7 +252,7 @@ class MonitorService:
                 if grace and isinstance(uptime, (int, float)) and uptime < grace:
                     continue
                 seg = ".".join(ip.split(".")[:3])
-                if ip in repair or seg in active_segments:
+                if ip in repair or seg in active_segments or seg in paused:
                     continue
             else:
                 # 自动重启只处理在线且明确读到 0 算力的机器。
@@ -226,6 +298,8 @@ class MonitorService:
                 ips = [r["ip"] for r in results]
                 db.record_zero_reboot_attempts(self.conn, ips, int(time.time()))
                 self.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
+                # 逐批写审计：中途进程退出(更新重启)也不丢已下发的记录，限流照样有效
+                db.log_commands(self.conn, user, "reboot", results)
 
             results, err = control.run_batch(targets, "reboot", {}, self.cfg,
                                              before_group=self.mark_rebooting,
@@ -234,7 +308,6 @@ class MonitorService:
                 self.unmark_rebooting([ip for ip, _fw in targets])
                 log.warning("零算力自动重启批次错误: %s", err)
             if results:
-                db.log_commands(self.conn, user, "reboot", results)
                 ok_n = sum(1 for r in results if r["ok"])
                 log.info("零算力自动重启完成: 尝试 %d 台，已下发 %d 台", len(results), ok_n)
                 try:
@@ -531,8 +604,10 @@ class MonitorService:
             self.progress["last_finished"] = ts
 
             fired, cfired = [], []
-            try:   # 维修机重新上线 → 自动恢复为正常
-                back = db.repair_ips(self.conn) & online_ips
+            try:   # 维修机恢复出算力 → 自动恢复为正常。只看"在线"不够：拆了算力板、控制板
+                # 还通电的机器在线但零算力，一上线就撤销标记会让它照常报警、被零算力自动重启
+                back = db.repair_ips(self.conn) & {
+                    r["ip"] for r in online_recs if (r.get("hr_rt") or 0) > 0}
                 if back:
                     db.set_machine_state(self.conn, list(back), "active")
             except Exception as e:  # noqa: BLE001

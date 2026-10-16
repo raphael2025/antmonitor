@@ -64,18 +64,29 @@ def prepare_environment(base):
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if installed != fingerprint or probe.returncode:
         print("Installing/checking dependencies from requirements.txt...", flush=True)
-        pip = subprocess.run([str(python), "-m", "pip", "--version"], cwd=str(base),
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if pip.returncode:
-            run_checked([python, "-m", "ensurepip", "--upgrade"], base)
-        install = [python, "-m", "pip", "install", "--disable-pip-version-check",
-                   "--only-binary=:all:", "-r", requirements]
-        if installed == fingerprint and probe.returncode:
-            # Metadata can survive missing/damaged package files; a plain pip
-            # install would report "already satisfied" and leave them broken.
-            install.append("--force-reinstall")
-        run_checked(install, base)
-        run_checked([python, "-c", IMPORT_CHECK], base)
+        try:
+            pip = subprocess.run([str(python), "-m", "pip", "--version"], cwd=str(base),
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if pip.returncode:
+                run_checked([python, "-m", "ensurepip", "--upgrade"], base)
+            install = [python, "-m", "pip", "install", "--disable-pip-version-check",
+                       "--only-binary=:all:", "-r", requirements]
+            if installed == fingerprint and probe.returncode:
+                # Metadata can survive missing/damaged package files; a plain pip
+                # install would report "already satisfied" and leave them broken.
+                install.append("--force-reinstall")
+            run_checked(install, base)
+            run_checked([python, "-c", IMPORT_CHECK], base)
+        except (OSError, subprocess.SubprocessError):
+            if probe.returncode:
+                raise
+            # The current packages still import (e.g. an update raised a version
+            # floor while the site is offline). Keep running on them: stopping the
+            # guardian would leave the site unmonitored and skip the server's
+            # boot_guard rollback. The stamp stays stale so the next start retries.
+            print("WARNING: dependency update failed; starting with the installed "
+                  "packages.", flush=True)
+            return python
         stamp.write_text(fingerprint + "\n", encoding="ascii")
     return python
 

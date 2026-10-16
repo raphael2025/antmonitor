@@ -56,7 +56,24 @@ def test_missing_module_repaired_even_when_requirements_unchanged(tmp_path, monk
 
 
 def test_failed_install_not_marked_successful(tmp_path, monkeypatch):
+    """首次安装(依赖还 import 不了)失败：必须报错停下，不能标记为已安装。"""
     environment(tmp_path)
+
+    def run(args, **kwargs):
+        if "install" in args:
+            raise subprocess.CalledProcessError(1, args)
+        return subprocess.CompletedProcess(args, int(args[-1] == launcher.IMPORT_CHECK))
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError):
+        launcher.prepare_environment(tmp_path)
+    assert not (tmp_path / ".venv/.antmonitor-requirements.sha256").exists()
+
+
+def test_failed_update_install_keeps_working_environment(tmp_path, monkeypatch):
+    """更新改了 requirements 但 pip 失败(断网)：旧依赖还能 import 就继续启动，不让守护退出；
+    指纹不更新，下次启动再试。"""
+    python = environment(tmp_path)
 
     def run(args, **kwargs):
         if "install" in args:
@@ -64,8 +81,7 @@ def test_failed_install_not_marked_successful(tmp_path, monkeypatch):
         return subprocess.CompletedProcess(args, 0)
 
     monkeypatch.setattr(launcher.subprocess, "run", run)
-    with pytest.raises(subprocess.CalledProcessError):
-        launcher.prepare_environment(tmp_path)
+    assert launcher.prepare_environment(tmp_path) == python
     assert not (tmp_path / ".venv/.antmonitor-requirements.sha256").exists()
 
 

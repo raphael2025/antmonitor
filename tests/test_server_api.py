@@ -99,3 +99,26 @@ def test_server_auth_validation_and_read_endpoints(monkeypatch):
     assert client.post("/api/scan").status_code == 403
 
     client.close()
+
+
+def test_async_batch_reboot_audits_each_group(monkeypatch):
+    """异步分批重启逐批写审计：跑到一半进程被打断(更新重启)，已下发的批次也有记录，
+    24h 次数上限/15 分钟间隔对它们照样生效。"""
+    config = Path(__file__).with_name("server_config.yaml")
+    monkeypatch.setenv("MINER_CONFIG", str(config))
+    server = importlib.import_module("server")
+
+    def interrupted(targets, action, params, cfg, progress=None, before_group=None,
+                    after_group=None):
+        grp = targets[:1]
+        before_group([ip for ip, _fw in grp])
+        after_group(grp, [{"ip": grp[0][0], "ok": True, "msg": "reboot ok"}])
+        raise RuntimeError("进程在第二批前被打断")
+
+    monkeypatch.setattr(server.control, "run_batch", interrupted)
+    assert server.SVC._reboot_lock.acquire(blocking=False)
+    server._run_command_bg([("10.0.0.21", ""), ("10.0.0.22", "")], "reboot", {}, "ops@test")
+    stats = server.db.reboot_stats(server.SVC.conn, ["10.0.0.21", "10.0.0.22"])
+    assert stats["10.0.0.21"]["count"] == 1 and stats["10.0.0.22"]["count"] == 0
+    assert not server.SVC._reboot_lock.locked()
+    assert server.updater.BUSY_CHECK() == ""

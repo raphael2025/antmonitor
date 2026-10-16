@@ -102,3 +102,34 @@ def test_manual_retry_ignores_the_bad_mark(state, monkeypatch):
 
 def test_git_env_does_not_override_site_ssh_setup():
     assert "GIT_SSH_COMMAND" not in updater._GIT_ENV
+
+
+def test_changed_requirements_installed_before_selfcheck(state, monkeypatch, tmp_path):
+    """新版本加了依赖：合并后先 pip install，再自检；否则自检 import 必失败、永远更新不上去。"""
+    calls, order = [], []
+    base = _fake_git(calls)
+
+    def g(*args, **kw):
+        if args[0] == "diff":
+            return "requirements.txt"
+        return base(*args, **kw)
+
+    (tmp_path / "requirements.txt").write_text("newdep\n")
+    monkeypatch.setattr(updater, "BASE", str(tmp_path))
+    monkeypatch.setattr(updater, "_git", g)
+    monkeypatch.setattr(updater.subprocess, "run",
+                        lambda cmd, **kw: order.append(cmd[1:4]) or
+                        updater.subprocess.CompletedProcess(cmd, 0, "", ""))
+    monkeypatch.setattr(updater, "_selfcheck", lambda: order.append("selfcheck") or "")
+    assert updater.apply(restart=False)["ok"]
+    assert order == [["-m", "pip", "install"], "selfcheck"]
+
+
+def test_update_deferred_while_reboot_running(state, monkeypatch):
+    """分批重启进行中不更新：更新会重启进程，把后面几批打断。"""
+    calls = []
+    monkeypatch.setattr(updater, "_git", _fake_git(calls))
+    monkeypatch.setattr(updater, "BUSY_CHECK", lambda: "正在执行重启/批量命令")
+    r = updater.apply(restart=False)
+    assert not r["ok"] and "推迟" in r["msg"]
+    assert not any(c[0] == "merge" for c in calls)

@@ -128,3 +128,71 @@ def test_apply_settings_reboot_keys(cfg):
     assert ctl["reboot_delay_sec"] == 12
     assert ctl["reboot_max_per_day"] == 3
     assert ctl["reboot_min_interval_sec"] == 600
+
+
+def _zero_svc(conn, cfg, monkeypatch):
+    cfg["control"]["enabled"] = True
+    cfg["control"]["reboot_enabled"] = True
+    svc = _svc(conn, cfg)
+    pushed = []
+    monkeypatch.setattr(service.alerts, "push_text", lambda c, t: pushed.append(t))
+    return svc, pushed
+
+
+def test_maintenance_segment_paused_other_segments_still_reboot(conn, cfg, monkeypatch):
+    """维护某个网段(150 台零算力)：只暂停这一段，别的网段里真坏的那台照常重启。"""
+    svc, pushed = _zero_svc(conn, cfg, monkeypatch)
+    now = int(time.time())
+    maint = [f"10.0.1.{i}" for i in range(1, 151)]
+    other = [f"10.0.{s}.{i}" for s in (2, 3, 4) for i in range(1, 201)]
+    db.upsert_known_miners(conn, [rec(ip) for ip in maint + other], now)
+    recs = ([rec(ip, hr_rt=0) for ip in maint] + [rec(other[0], hr_rt=0)]
+            + [rec(ip) for ip in other[1:]])
+    assert svc.zero_reboot_candidates(recs, now=now) == []
+    got = svc.zero_reboot_candidates(recs, now=now + 900)
+    assert [t[0] for t in got] == [other[0]]
+    assert len(pushed) == 1 and "10.0.1.x" in pushed[0] and "其他网段照常" in pushed[0]
+    assert not any(ip in db.zero_reboot_states(conn) for ip in maint)
+    # 维护结束后剩 1 台还是零算力：从恢复那一刻重新计时 15 分钟
+    recs = [rec(maint[0], hr_rt=0)] + [rec(ip) for ip in maint[1:] + other]
+    assert svc.zero_reboot_candidates(recs, now=now + 1000) == []
+    got = svc.zero_reboot_candidates(recs, now=now + 1000 + 900)
+    assert [t[0] for t in got] == [maint[0]]
+
+
+def test_site_wide_zero_hashrate_pauses_everything(conn, cfg, monkeypatch):
+    """矿池故障/限电：各网段都成片零算力 → 全场暂停，只推一次。"""
+    svc, pushed = _zero_svc(conn, cfg, monkeypatch)
+    now = int(time.time())
+    ips = [f"10.0.{s}.{i}" for s in range(1, 6) for i in range(1, 101)]
+    db.upsert_known_miners(conn, [rec(ip) for ip in ips], now)
+    zero = [rec(ip, hr_rt=0) for ip in ips]
+    assert svc.zero_reboot_candidates(zero, now=now) == []
+    assert svc.zero_reboot_candidates(zero, now=now + 1800) == []
+    assert len(pushed) == 1
+    assert db.zero_reboot_states(conn) == {}
+
+
+def test_scattered_zero_across_site_pauses_everything(conn, cfg, monkeypatch):
+    """每段只有零星几台、但全场合计占比过高(如部分矿池故障)：按全场暂停。"""
+    svc, pushed = _zero_svc(conn, cfg, monkeypatch)
+    now = int(time.time())
+    ips = [f"10.0.{s}.{i}" for s in range(1, 11) for i in range(1, 11)]   # 10 段 × 10 台
+    db.upsert_known_miners(conn, [rec(ip) for ip in ips], now)
+    recs = [rec(ip, hr_rt=0 if int(ip.rsplit(".", 1)[1]) <= 3 else 100.0) for ip in ips]
+    svc.zero_reboot_candidates(recs, now=now)        # 每段 3 台(<5 台不算段事件)，全场 30%
+    assert svc.zero_reboot_candidates(recs, now=now + 900) == []
+    assert len(pushed) == 1 and "全场" in pushed[0]
+
+
+def test_mass_zero_ratio_needs_min_count(conn, cfg):
+    """小场地 1 台零算力占比虽高，不算成片事件。"""
+    cfg["control"]["enabled"] = True
+    cfg["control"]["reboot_enabled"] = True
+    svc = _svc(conn, cfg)
+    now = int(time.time())
+    db.upsert_known_miners(conn, [rec("10.0.9.1"), rec("10.0.9.2")], now)
+    recs = [rec("10.0.9.1", hr_rt=0), rec("10.0.9.2")]
+    svc.zero_reboot_candidates(recs, now=now)
+    got = svc.zero_reboot_candidates(recs, now=now + 900)
+    assert [t[0] for t in got] == ["10.0.9.1"]

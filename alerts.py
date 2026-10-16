@@ -33,11 +33,65 @@ _push_thread = None
 _push_lock = threading.Lock()
 
 
+# 推送失败重试间隔(秒)：断网/Telegram 限流时补推，合计约 8 分钟。告警已写库且处于活跃状态，
+# 之后不会再推第二次——不重试的话，最需要通知的那条(整栋断电往往连带断网)就永远丢了
+_RETRY_DELAYS = (5, 15, 60, 120, 300)
+_TG_MAX_LEN = 4000   # Telegram 单条上限 4096 字符，超长整条 400 被拒
+_sleep = time.sleep
+
+
+def _chunks(text, limit=_TG_MAX_LEN):
+    """按行切成不超过 limit 的若干条(按行切不会切断 HTML 标签)。"""
+    out, cur = [], ""
+    for line in text.split("\n"):
+        line = line[:limit]
+        if cur and len(cur) + 1 + len(line) > limit:
+            out.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _retry_after(e):
+    """429 返回 Telegram 要求的等待秒数；其余 4xx(请求本身有问题，重试也没用)返回 -1；
+    网络错误/5xx 返回 None(按退避重试)。"""
+    resp = getattr(e, "response", None)
+    code = getattr(resp, "status_code", None)
+    if code == 429:
+        try:
+            return int(resp.json()["parameters"]["retry_after"])
+        except Exception:  # noqa: BLE001
+            return 30
+    if code is not None and 400 <= code < 500:
+        return -1
+    return None
+
+
+def _send_with_retry(cfg, text):
+    for part in _chunks(text):
+        for attempt in range(len(_RETRY_DELAYS) + 1):
+            try:
+                _tg_send(cfg, part)
+                break
+            except Exception as e:  # noqa: BLE001
+                wait = _retry_after(e)
+                if wait == -1 or attempt == len(_RETRY_DELAYS):
+                    log.warning("告警推送失败(已放弃): %s | %s", e, part[:200])
+                    break
+                wait = wait if wait is not None else _RETRY_DELAYS[attempt]
+                log.warning("告警推送失败，%ds 后重试(%d/%d): %s",
+                            wait, attempt + 1, len(_RETRY_DELAYS), e)
+                _sleep(min(wait, 600))
+
+
 def _push_worker():
     while True:
         cfg, text = _push_q.get()
         try:
-            _tg_send(cfg, text)
+            _send_with_retry(cfg, text)
         except Exception as e:  # noqa: BLE001
             log.warning("告警推送失败: %s", e)
         finally:
@@ -274,11 +328,13 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         # 高温：滞回消警，避免在阈值附近反复触发/恢复刷屏
         temp = r.get("temp")
         if hot_c and isinstance(temp, (int, float)):
-            if temp >= hot_c and not muted:
+            # 高温只看维修静音、不跟整段掉线一起静音：部分断电时段内还在线的机器数据可信，
+            # 高温是会烧机的 crit，恰恰不能被"同段别的机器掉线"压掉
+            if temp >= hot_c and ip not in repair:
                 b.fire(ip, "overheat", "crit", f"{ip} 芯片温 {temp}℃ ≥ {hot_c}℃")
-            elif temp < hot_clear or muted:
+            elif temp < hot_clear or ip in repair:
                 # 未静音：滞回消警(中间区间 [hot_clear, hot_c) 维持原状态)
-                # 维修中/整段掉线静音：无条件消掉已有高温告警，与 zero/reject 一致
+                # 维修中：无条件消掉已有高温告警(人已经知道了)
                 b.resolve(ip, "overheat")
 
         # 矿池防篡改：矿机上配置了白名单外的矿池(含备用池) → 严重告警，不受维修/网段静音。
