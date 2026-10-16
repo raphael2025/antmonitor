@@ -208,14 +208,23 @@ sync_code() {
   elif [[ -d "$INSTALL_DIR/.git" ]]; then
     # 沿用现场当前分支(网页更新也是跟它)；只有显式设了 ANTMONITOR_BRANCH 才切换分支
     local br
-    br="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    local g=(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR")
+    br="$("${g[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
     if [[ -n "${ANTMONITOR_BRANCH:-}" || "$br" == "HEAD" ]]; then
       br="$BRANCH"
     fi
+    "${g[@]}" fetch --all --prune || warn "fetch 失败（私有仓需部署密钥/Token / 网络不通）"
+    # 旧版本脚本默认装在 dev，dev 已不再更新：dev 上没有 main 里没有的实际改动时改跟 main
+    # (与网页更新器的规则一致，见 updater._can_leave_legacy)
+    if [[ -z "${ANTMONITOR_BRANCH:-}" && "$br" == "dev" ]] \
+        && "${g[@]}" rev-parse --verify --quiet origin/main >/dev/null \
+        && [[ -z "$("${g[@]}" rev-list --no-merges origin/main..HEAD)" ]]; then
+      info "旧版安装在 dev 分支，改为跟踪 main"
+      br="main"
+    fi
     info "git pull ($br)"
-    git -C "$INSTALL_DIR" fetch --all --prune
-    git -C "$INSTALL_DIR" checkout "$br"
-    git -C "$INSTALL_DIR" pull --ff-only origin "$br" || \
+    "${g[@]}" checkout "$br"
+    "${g[@]}" pull --ff-only origin "$br" || \
       warn "pull 失败（私有仓需部署密钥/Token）。可在有代码的机器上再跑本脚本。"
   else
     info "git clone $REPO_URL"

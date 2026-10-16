@@ -143,10 +143,23 @@ def _mark_bad(sha):
     _save_state(st)
 
 
-def _set_pending(prev, to):
+def _set_pending(prev, to, branch=""):
     st = _load_state()
-    st["pending"] = {"prev": prev, "to": to, "attempts": 0, "ts": int(time.time())}
+    st["pending"] = {"prev": prev, "to": to, "branch": branch, "attempts": 0,
+                     "ts": int(time.time())}
     _save_state(st)
+
+
+def _rollback(prev, branch=""):
+    """回到更新前：先切回更新前所在的分支(dev → main 迁移失败时要回到 dev)，再 reset 到原提交。"""
+    if branch:
+        try:
+            cur = _git("rev-parse", "--abbrev-ref", "HEAD")
+        except Exception:  # noqa: BLE001
+            cur = ""
+        if cur != branch:
+            _git("checkout", "-f", branch)
+    _git("reset", "--hard", prev)
 
 
 def boot_guard():
@@ -172,7 +185,7 @@ def boot_guard():
     except Exception:  # noqa: BLE001
         pass
     try:
-        _git("reset", "--hard", p["prev"])
+        _rollback(p["prev"], p.get("branch") or "")
     except Exception as e:  # noqa: BLE001
         log.error("自动回滚失败，需要人工处理: git reset --hard %s (%s)", p["prev"], e)
         return
@@ -201,6 +214,20 @@ def _git(*args, timeout=60):
     return (r.stdout or "").strip()
 
 
+LEGACY_BRANCH = "dev"
+MAIN_BRANCH = "main"
+
+
+def _can_leave_legacy():
+    """dev → main 是否安全：远端有 main，且 dev 上没有 main 里没有的非合并提交(只差合并提交时
+    两边代码一致，切过去不会丢东西)。有独有改动的现场照旧跟 dev，交人工决定。"""
+    try:
+        _git("rev-parse", "--verify", "--quiet", f"origin/{MAIN_BRANCH}")
+        return not _git("rev-list", "--no-merges", f"origin/{MAIN_BRANCH}..HEAD")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def check(branch=None):
     """返回 {git, branch, local, remote, behind, changes[], checked_ts} 或 {git:False/error}。"""
     try:
@@ -216,11 +243,18 @@ def check(branch=None):
         if branch and cur != "HEAD" and cur != branch:
             return {"git": True, "error": f"配置跟踪分支 {branch}，但本地当前在 {cur} 分支；"
                                           f"请先 git checkout {branch} 或改 update.branch"}
+        legacy = not branch and cur == LEGACY_BRANCH
         branch = branch or cur
         if branch == "HEAD":   # detached HEAD(按 tag/提交部署)：别悄悄跟到远端默认分支
             return {"git": True, "error": "当前不在任何分支上(detached HEAD)，"
                                           "请在 config.yaml 配置 update.branch 或先 git checkout 分支"}
         _git("fetch", "--quiet", "origin", timeout=120)
+        switch_from = ""
+        if legacy and _can_leave_legacy():
+            # 旧版 install.sh 默认装在 dev 分支，dev 早已不再更新：这些现场按当前分支跟踪
+            # 就永远拿不到修复。没在 config.yaml 指定分支时自动改跟 main(dev 上没有 main 里
+            # 没有的实际改动才切，见 _can_leave_legacy)
+            switch_from, branch = cur, MAIN_BRANCH
         local = _git("rev-parse", "HEAD")
         remote = _git("rev-parse", f"origin/{branch}")
         behind = int(_git("rev-list", "--count", f"HEAD..origin/{branch}") or 0)
@@ -228,7 +262,8 @@ def check(branch=None):
                    if behind else [])
         return {"git": True, "branch": branch, "local": local[:10], "remote": remote[:10],
                 "behind": behind, "changes": changes, "checked_ts": int(time.time()),
-                "remote_full": remote, "known_bad": remote in _load_state().get("bad", [])}
+                "remote_full": remote, "known_bad": remote in _load_state().get("bad", []),
+                "switch_from": switch_from}
     except Exception as e:
         return {"git": True, "error": str(e)[:300]}
 
@@ -357,8 +392,13 @@ def _apply(branch=None, restart=True, force=False):
         return {"ok": False, "msg": f"远端版本 {st['remote']} 之前自检未通过或启动失败已回滚，等待新的提交",
                 "check": st}
     prev = _git("rev-parse", "HEAD")
+    prev_branch = st.get("switch_from") or st["branch"]
     try:
-        _git("merge", "--ff-only", f"origin/{st['branch']}")
+        if st.get("switch_from"):   # 旧现场从 dev 改跟 main：dev 分支原样留着，回滚时切回去
+            _git("checkout", "-B", st["branch"], "--track", f"origin/{st['branch']}")
+            log.info("更新分支 %s → %s", st["switch_from"], st["branch"])
+        else:
+            _git("merge", "--ff-only", f"origin/{st['branch']}")
     except Exception as e:
         return {"ok": False, "msg": f"合并失败(本地有改动或分叉?): {e}"}
     _install_requirements(prev)   # 新版本加了依赖：先装上，否则自检 import 必然失败、永远更新不上去
@@ -367,7 +407,7 @@ def _apply(branch=None, restart=True, force=False):
         _mark_bad(st.get("remote_full") or "")
         for attempt in (1, 2):
             try:
-                _git("reset", "--hard", prev)
+                _rollback(prev, prev_branch)
                 break
             except Exception as e:  # noqa: BLE001 - 文件被占用/index.lock 时再试一次
                 if attempt == 2:
@@ -379,7 +419,7 @@ def _apply(branch=None, restart=True, force=False):
         return {"ok": False, "msg": f"新代码自检失败，已回滚到 {prev[:10]}: {err}"[:300]}
     new = _git("rev-parse", "HEAD")
     if restart:
-        _set_pending(prev, new)                  # 新版本若一启动就崩，boot_guard 会自动回滚
+        _set_pending(prev, new, prev_branch)     # 新版本若一启动就崩，boot_guard 会自动回滚
         threading.Timer(1.5, _restart).start()   # 等响应发出去再退
     return {"ok": True, "from": prev[:10], "to": new[:10],
             "changes": st.get("changes"), "restarting": restart,

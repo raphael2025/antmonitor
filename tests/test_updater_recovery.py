@@ -133,3 +133,101 @@ def test_update_deferred_while_reboot_running(state, monkeypatch):
     r = updater.apply(restart=False)
     assert not r["ok"] and "推迟" in r["msg"]
     assert not any(c[0] == "merge" for c in calls)
+
+
+def _real_repo(tmp_path, dev_extra=False):
+    """origin(bare) 有 main 和 dev；dev 只比 main 旧、多一个合并提交(和现实一致)。
+    返回已切在 dev 上的本地克隆目录。"""
+    import subprocess
+
+    def g(*a, cwd):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a], cwd=cwd,
+                       check=True, capture_output=True)
+    origin, work, site = tmp_path / "origin.git", tmp_path / "work", tmp_path / "site"
+    g("init", "-q", "--bare", "-b", "main", str(origin), cwd=tmp_path)
+    g("clone", "-q", str(origin), str(work), cwd=tmp_path)
+    (work / "a.py").write_text("v = 1\n")
+    g("add", "-A", cwd=work)
+    g("commit", "-q", "-m", "one", cwd=work)
+    g("push", "-q", "origin", "HEAD:main", cwd=work)
+    # 功能分支 feat 的提交两边都有；dev 用 --no-ff 合并它，多出一个只在 dev 上的合并提交
+    g("checkout", "-q", "-b", "dev", cwd=work)
+    g("checkout", "-q", "-b", "feat", "main", cwd=work)
+    (work / "c.py").write_text("feat = 1\n")
+    g("add", "-A", cwd=work)
+    g("commit", "-q", "-m", "feat", cwd=work)
+    g("push", "-q", "origin", "HEAD:main", cwd=work)
+    g("checkout", "-q", "dev", cwd=work)
+    g("merge", "-q", "--no-ff", "-m", "Merge feat", "feat", cwd=work)
+    if dev_extra:
+        (work / "b.py").write_text("only_on_dev = 1\n")
+        g("add", "-A", cwd=work)
+        g("commit", "-q", "-m", "dev only", cwd=work)
+    g("push", "-q", "origin", "dev", cwd=work)
+    g("checkout", "-q", "main", cwd=work)
+    g("merge", "-q", "--ff-only", "feat", cwd=work)
+    (work / "a.py").write_text("v = 2\n")
+    g("commit", "-q", "-am", "fix on main", cwd=work)
+    g("push", "-q", "origin", "main", cwd=work)
+    g("clone", "-q", "-b", "dev", str(origin), str(site), cwd=tmp_path)
+    return site
+
+
+def _head(site):
+    import subprocess
+    out = lambda *a: subprocess.run(["git", *a], cwd=site, capture_output=True,  # noqa: E731
+                                    text=True).stdout.strip()
+    return out("rev-parse", "--abbrev-ref", "HEAD"), (site / "a.py").read_text()
+
+
+def test_legacy_dev_install_switches_to_main(state, monkeypatch, tmp_path):
+    """旧版 install.sh 装在 dev 上、没配 update.branch 的现场：自动改跟 main，拿到修复。"""
+    site = _real_repo(tmp_path)
+    monkeypatch.setattr(updater, "BASE", str(site))
+    monkeypatch.setattr(updater, "_selfcheck", lambda: "")
+    st = updater.check()
+    assert st["branch"] == "main" and st["switch_from"] == "dev" and st["behind"] == 1
+    assert updater.apply(restart=False)["ok"]
+    assert _head(site) == ("main", "v = 2\n")
+    assert updater.check()["switch_from"] == ""          # 之后正常跟踪 main
+
+
+def test_legacy_switch_rolls_back_to_dev_on_selfcheck_failure(state, monkeypatch, tmp_path):
+    site = _real_repo(tmp_path)
+    monkeypatch.setattr(updater, "BASE", str(site))
+    monkeypatch.setattr(updater, "_selfcheck", lambda: "ImportError")
+    r = updater.apply(restart=False)
+    assert not r["ok"] and "回滚" in r["msg"]
+    assert _head(site) == ("dev", "v = 1\n")
+
+
+def test_dev_with_its_own_changes_is_not_switched(state, monkeypatch, tmp_path):
+    """dev 上有 main 没有的实际改动：不自动切，照旧跟 dev(交人工决定)。"""
+    site = _real_repo(tmp_path, dev_extra=True)
+    monkeypatch.setattr(updater, "BASE", str(site))
+    st = updater.check()
+    assert st["branch"] == "dev" and st["switch_from"] == ""
+
+
+def test_explicit_branch_setting_is_respected(state, monkeypatch, tmp_path):
+    site = _real_repo(tmp_path)
+    monkeypatch.setattr(updater, "BASE", str(site))
+    assert "请先 git checkout main" in updater.check("main")["error"]
+
+
+def test_boot_guard_rolls_back_a_legacy_switch_to_dev(state, monkeypatch, tmp_path):
+    """切到 main 后新版本一启动就崩：启动保护回到 dev 分支的原提交。"""
+    import subprocess
+    site = _real_repo(tmp_path)
+    monkeypatch.setattr(updater, "BASE", str(site))
+    monkeypatch.setattr(updater, "_selfcheck", lambda: "")
+    prev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=site, capture_output=True,
+                          text=True).stdout.strip()
+    assert updater.apply(restart=False)["ok"]
+    updater._set_pending(prev, "new", "dev")
+    restarted = []
+    monkeypatch.setattr(updater, "_restart", lambda: restarted.append(1))
+    for _ in range(updater.MAX_BOOT_ATTEMPTS + 1):
+        updater.boot_guard()
+    assert restarted == [1]
+    assert _head(site) == ("dev", "v = 1\n")
