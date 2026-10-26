@@ -260,3 +260,19 @@ def test_probe_timeouts_are_at_least_three_seconds():
     assert cfg["scan"]["reconfirm_online_timeout"] == 3.0
     d = appconfig._validate(appconfig._merge(appconfig.DEFAULTS, {}))["scan"]
     assert d["online_timeout"] == 3.0 and d["gate_timeout"] == 3.0
+
+
+def test_segment_alert_merges_into_site_alert(conn, dcfg, clock):
+    """先一栋断电报了整段，后来扩成全场：整段告警并进全场告警，只剩一条。"""
+    dcfg["alerts"]["site_down_min"] = 10
+    st = {}
+    good = _seg(10) + _seg(10, "10.0.2") + _seg(10, "10.0.3")
+    _round(conn, dcfg, clock, good, st)
+    one = _seg(10, status="offline") + _seg(10, "10.0.2") + _seg(10, "10.0.3")
+    _round(conn, dcfg, clock, one, st)
+    assert _round(conn, dcfg, clock, one, st) == [("10.0.1.x", "segment_down")]
+    two = _seg(10, status="offline") + _seg(10, "10.0.2", status="offline") + _seg(10, "10.0.3")
+    _round(conn, dcfg, clock, two, st)
+    _round(conn, dcfg, clock, two, st)
+    assert db.active_alerts_by_type(conn, "site_down")
+    assert not db.active_alerts_by_type(conn, "segment_down")

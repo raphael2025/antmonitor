@@ -292,9 +292,11 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     else:
         site_raw = (off_all >= site_min and off_all / tot_all >= site_ratio
                     and len(down_segments) >= 2)
+    site_on = False   # 全场告警本轮在报(已有或刚报)
     if site_raw:
         first = site_since.setdefault(SITE_KEY, now)
         if site_active or now - first >= off_confirm:
+            site_on = True
             segs = sorted(down_segments)
             more = f" 等 {len(segs)} 个" if len(segs) > 8 else ""
             b.fire(SITE_KEY, "site_down", "crit",
@@ -309,6 +311,11 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     for seg in down_segments:
         off, tot = seg_off.get(seg, 0), seg_total.get(seg, 0)
         first = seg_since.setdefault(seg, now)
+        if site_on and seg in active_segs:
+            # 第一栋先报了整段掉线、后来扩成全场事件：并进全场告警，别两条同时挂着。
+            # 全场恢复后这段若仍掉线，seg_since 还在计时，下一轮会立即重新报整段掉线
+            b.resolve(f"{seg}.x", "segment_down", recovered=False)
+            continue
         # 全场事件期间不再逐段报；交换机重启这类一两分钟的抖动等确认期过了才报
         if site_raw or (seg not in active_segs and now - first < off_confirm):
             continue

@@ -111,6 +111,10 @@ def test_cloud_fingerprint_is_validated_and_normalized(app, monkeypatch):
     fp = ":".join(["AB"] * 32)
     assert c.post("/api/settings", json={"cloud": dict(cloud, tls_fingerprint=fp)}).status_code == 200
     assert server.CFG["cloud"]["tls_fingerprint"] == "ab" * 32
+    # config.yaml 里写成带冒号/大写的指纹：留空 token 保存不能被当成"指纹改了"
+    server.CFG["cloud"]["tls_fingerprint"] = fp
+    assert c.post("/api/settings", json={"cloud": dict(cloud, token="", tls_fingerprint=fp)}
+                  ).status_code == 200
 
 
 def test_csv_formula_injection_is_neutralized(app, monkeypatch):

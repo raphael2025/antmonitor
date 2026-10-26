@@ -940,7 +940,8 @@ def _cloud_form(c, keep_token=True):
     if not token and keep_token and cur.get("token"):
         # 沿用已保存的 token 只限地址和指纹都没变：否则改个地址就能让本服务把 token
         # 明文发到任意服务器——浏览器拿不到 token 的保护就白做了
-        if url != str(cur.get("url") or "").rstrip("/") or fp != (cur.get("tls_fingerprint") or ""):
+        saved_fp = cloud_report.normalize_fingerprint(cur.get("tls_fingerprint")) or ""
+        if url != str(cur.get("url") or "").rstrip("/") or fp != saved_fp:
             return None, "云端地址或证书指纹改了，请重新填写上报 token(或粘贴新的接入码)"
         token = str(cur.get("token") or "")
     cl = {"enabled": c.get("enabled", False),
