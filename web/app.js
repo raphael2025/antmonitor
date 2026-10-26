@@ -34,7 +34,9 @@ function alertDetail(x) {
   const value = (pattern) => d.match(pattern);
   if (x.type === "offline") {
     const m = value(/重启后\s*(\d+)\s*分钟/);
-    return m ? t("alert.offline_reboot", { minutes: m[1] }) : t("alert.offline");
+    if (m) return t("alert.offline_reboot", { minutes: m[1] });
+    const u = value(/持续无应答\s*(\d+)\s*轮/);
+    return u ? t("alert.offline_unresponsive", { rounds: u[1] }) : t("alert.offline");
   }
   if (x.type === "zero") return t("alert.zero");
   if (x.type === "reject") {
@@ -58,6 +60,10 @@ function alertDetail(x) {
     const m = value(/大面积掉线\s*(\d+)\/(\d+)/);
     return m ? t("alert.segment_down", { offline: m[1], total: m[2] })
       : t("alert.segment_down_short");
+  }
+  if (x.type === "site_down") {
+    const m = value(/大面积掉线\s*(\d+)\/(\d+)/);
+    return m ? t("alert.site_down", { offline: m[1], total: m[2] }) : t("alert.site_down_short");
   }
   if (x.type === "stalled") {
     const m = value(/已\s*(\d+)\s*分钟/);
@@ -315,6 +321,7 @@ function announceCounts(counts) {
   const parts = [];
   if (n("pool_hijack")) parts.push(t("voice.pool_hijack", { n: n("pool_hijack") }));
   if (n("stalled")) parts.push(t("voice.stalled"));
+  if (n("site_down")) parts.push(t("voice.site_down"));
   if (n("segment_down")) parts.push(t("voice.segment_down", { n: n("segment_down") }));
   if (n("offline")) parts.push(t("voice.offline", { n: n("offline") }));
   if (n("zero")) parts.push(t("voice.zero", { n: n("zero") }));
@@ -945,18 +952,89 @@ async function openSeg() {
   $("setInterval").value = s.scan_interval;
   if ($("setFullInterval")) $("setFullInterval").value = s.full_interval;
   $("setPps").value = s.max_pps;
-  if (s.cloud) {   // 云端上报配置(仅 admin 下发)
+  if (s.cloud) {   // 云端上报配置(仅 admin 下发；token 不回传明文，留空保存=沿用)
     $("cloudEnabled").checked = !!s.cloud.enabled;
     $("cloudName").value = s.cloud.site_name || "";
     $("cloudType").value = s.cloud.site_type || "air";
     $("cloudUrl").value = s.cloud.url || "";
-    $("cloudToken").value = s.cloud.token || "";
+    $("cloudToken").value = "";
+    $("cloudToken").placeholder = s.cloud.token_set
+      ? t("seg.token_saved_ph", { hint: s.cloud.token_hint || "****" }) : "ingest token";
+    $("cloudFp").value = s.cloud.tls_fingerprint || "";
     $("cloudSiteId").textContent = s.site_id || "-";
+    cloudSiteIdOverride = "";
   }
+  $("cloudCode").value = "";
   $("cloudToken").type = "password";   // 每次打开都回到遮蔽态
   if ($("cloudTokenEye")) $("cloudTokenEye").textContent = t("seg.token_eye");
   $("segModal").classList.remove("hidden");
+  if (s.cloud) refreshCloudStatus();
 }
+
+// 云端「场地接入」生成的接入码：AMC1-<base64url(JSON {u:地址, t:token, f:证书指纹, s:场地ID})>
+let cloudSiteIdOverride = "";
+function parseConnectCode(code) {
+  const m = String(code || "").trim().match(/^AMC1-([A-Za-z0-9_-]+)$/);
+  if (!m) return null;
+  try {
+    const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
+    const d = JSON.parse(atob(b64 + "===".slice((b64.length + 3) % 4)));
+    return d && typeof d.u === "string" && typeof d.t === "string" ? d : null;
+  } catch (e) { return null; }
+}
+$("cloudCodeApply").onclick = () => {
+  const d = parseConnectCode($("cloudCode").value);
+  if (!d) { toast(t("toast.connect_bad"), "fail"); return; }
+  $("cloudUrl").value = d.u;
+  $("cloudToken").value = d.t;
+  $("cloudFp").value = d.f || "";
+  if (d.s) { cloudSiteIdOverride = d.s; $("cloudSiteId").textContent = d.s; }
+  $("cloudCode").value = "";
+  $("cloudEnabled").checked = true;
+  toast(t("toast.connect_applied"), "ok");
+};
+function cloudForm() {
+  const c = {
+    enabled: $("cloudEnabled").checked,
+    site_name: $("cloudName").value.trim(),
+    site_type: $("cloudType").value,
+    url: $("cloudUrl").value.trim(),
+    token: $("cloudToken").value.trim(),
+    tls_fingerprint: $("cloudFp").value.trim(),
+  };
+  if (cloudSiteIdOverride) c.site_id = cloudSiteIdOverride;
+  return c;
+}
+function agoText(ts) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  return s < 90 ? t("cloud.ago_s", { n: s }) : t("cloud.ago_m", { n: Math.round(s / 60) });
+}
+async function refreshCloudStatus() {
+  const el = $("cloudStatus");
+  try {
+    const st = await jget("/api/cloud/status");
+    el.className = "muted";
+    if (!st.enabled) { el.textContent = t("cloud.st_disabled"); return; }
+    if (st.fails && st.last_err) {
+      el.className = "res-fail";
+      el.textContent = t("cloud.st_fail", { n: st.fails, err: st.last_err });
+    } else if (st.last_ok) {
+      el.className = "res-ok";
+      el.textContent = t("cloud.st_ok", { ago: agoText(st.last_ok) });
+    } else {
+      el.textContent = st.last_err || t("cloud.st_wait");
+    }
+  } catch (e) { el.textContent = ""; }
+}
+$("cloudTest").onclick = async () => {
+  const el = $("cloudStatus");
+  el.className = "muted"; el.textContent = t("cloud.testing");
+  try {
+    const d = await jpost("/api/cloud/test", { cloud: cloudForm() });
+    el.className = d.ok ? "res-ok" : "res-fail";
+    el.textContent = d.message || d.error || "";
+  } catch (e) { el.textContent = ""; }
+};
 async function saveSeg(scan) {
   const segs = $("segText").value.split(/[\n,\s]+/).map(s => s.trim()).filter(Boolean);
   try {
@@ -971,13 +1049,7 @@ async function saveSeg(scan) {
     const body = {
       scan_interval: num("setInterval"),
       max_pps: num("setPps"),
-      cloud: {
-        enabled: $("cloudEnabled").checked,
-        site_name: $("cloudName").value.trim(),
-        site_type: $("cloudType").value,
-        url: $("cloudUrl").value.trim(),
-        token: $("cloudToken").value.trim(),
-      },
+      cloud: cloudForm(),
     };
     if ($("setFullInterval")) body.full_interval = num("setFullInterval");
     Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);

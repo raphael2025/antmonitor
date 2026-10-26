@@ -23,16 +23,21 @@ cloud:
   customer_interval: 600
   customer_hours: 24
   timeout: 10
+  tls_fingerprint: ""                    # 云端没有域名、用自签证书(https://IP:端口)时填云端面板
+                                         # 「场地接入」里显示的证书指纹(SHA-256)，按指纹认证书
 
 断网期间不缓存重传（总览缺几分钟无妨，云端会显示"未上报"变灰），恢复自动续传。
 上报失败只打日志，绝不影响本地扫描/告警。
 """
 import os
+import re
 import secrets
 import threading
 import time
+import warnings
 
 import requests
+from requests.adapters import HTTPAdapter
 
 import logs
 
@@ -63,6 +68,120 @@ def site_id(cfg):
     with open(_ID_FILE, "w", encoding="ascii") as f:
         f.write(sid + "\n")
     return sid
+
+
+_FP_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def normalize_fingerprint(fp):
+    """'AB:CD:…' / 'ab cd …' / 'sha256:…' → 64 位小写十六进制；空串原样返回空；非法返回 None。"""
+    raw = str(fp or "").strip().lower()
+    if raw.startswith("sha256:"):
+        raw = raw[7:]
+    raw = re.sub(r"[\s:]", "", raw)
+    if not raw:
+        return ""
+    return raw if _FP_RE.match(raw) else None
+
+
+class _PinnedAdapter(HTTPAdapter):
+    """按证书 SHA-256 指纹认云端(自签证书 / 没有域名时)。
+
+    不走 CA 校验，但握手时把对端证书的指纹和配置里的比对，对不上直接断开——
+    比"关掉证书校验"安全得多：中间人拿不到云端私钥就伪造不出同指纹的证书。"""
+
+    def __init__(self, fingerprint, **kw):
+        self._fp = fingerprint
+        super().__init__(**kw)
+
+    def init_poolmanager(self, *a, **kw):
+        kw["assert_fingerprint"] = self._fp
+        kw["assert_hostname"] = False
+        return super().init_poolmanager(*a, **kw)
+
+
+def _session(c):
+    s = requests.Session()
+    fp = normalize_fingerprint(c.get("tls_fingerprint"))
+    if fp:
+        s.mount("https://", _PinnedAdapter(fp))
+        s.verify = False   # 证书链不校验，改由上面的指纹校验
+    return s
+
+
+# 上报状态：给本地面板显示"最后一次成功/失败原因"，不用登机器翻日志
+_STATUS = {"last_ok": 0, "last_try": 0, "last_err": "", "fails": 0, "last_customers_ok": 0}
+_status_lock = threading.Lock()
+
+
+def _set_status(**kw):
+    with _status_lock:
+        _STATUS.update(kw)
+
+
+def status():
+    with _status_lock:
+        return dict(_STATUS)
+
+
+def explain(e):
+    """把上报异常翻成值班员看得懂的一句话。"""
+    resp = getattr(e, "response", None)
+    code = getattr(resp, "status_code", None)
+    if code == 401:
+        return "上报 token 不对(401)：到云端面板「场地接入」核对后重新填写"
+    if code == 404:
+        return "云端上报接口未开启(404)：云端还没生成上报 token，或云端版本过旧"
+    if code == 403:
+        detail = ""
+        try:
+            detail = (resp.json() or {}).get("detail") or ""
+        except Exception:  # noqa: BLE001
+            pass
+        return f"云端拒绝(403){'：' + detail if detail else ''}"
+    if code == 410:
+        return "本场地已在云端被删除(410)：请云端管理员在「已删除场地」里恢复"
+    if code == 429:
+        return "上报太频繁被云端限速(429)"
+    if code:
+        return f"云端返回错误 HTTP {code}"
+    text = str(e)
+    if "fingerprint" in text.lower():
+        return "云端证书指纹不匹配：可能连错了服务器或被中间人劫持，请到云端面板核对指纹"
+    if isinstance(e, requests.exceptions.SSLError):
+        return ("HTTPS 证书校验失败：云端用的是自签证书(按 IP 访问)时，"
+                "请填写云端面板「场地接入」里显示的证书指纹")
+    if isinstance(e, requests.exceptions.ConnectTimeout):
+        return "连接云端超时：检查云端地址/端口、云服务器防火墙(安全组)放行，以及本场地能否上外网"
+    if isinstance(e, requests.exceptions.ConnectionError):
+        return f"连不上云端：{text[:160]}"
+    if isinstance(e, requests.exceptions.Timeout):
+        return "云端响应超时"
+    return text[:200]
+
+
+def test(cfg_cloud, sid):
+    """给网页「测试连接」用：发一条 ping(只校验 token，不写数据)。返回 (ok, 说明)。"""
+    c = dict(cfg_cloud or {})
+    if not c.get("url") or not c.get("token"):
+        return False, "请先填写云端地址和上报 token"
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            r = _session(c).post(c["url"].rstrip("/") + "/api/ingest/ping",
+                                 json={"site_id": sid, "site": c.get("site_name") or sid},
+                                 timeout=float(c.get("timeout", 10)),
+                                 headers={"Authorization": f"Bearer {c.get('token', '')}"})
+        if r.status_code == 404:
+            return False, ("云端没有 ping 接口(云端版本过旧，或上报接口未开启)；"
+                           "可直接保存并启用，看下方上报状态是否成功")
+        r.raise_for_status()
+        d = r.json() if r.content else {}
+        if d.get("registered"):
+            return True, f"连接成功：云端已识别本场地(显示名「{d.get('site_name') or sid}」)"
+        return True, "连接成功：token 有效，保存并启用后场地会自动出现在云端面板"
+    except Exception as e:  # noqa: BLE001
+        return False, explain(e)
 
 
 def enabled(cfg):
@@ -105,10 +224,13 @@ def start(cfg, get_summary, get_customers):
         return None
 
 
-def _post(c, path, payload):
-    r = requests.post(c["url"].rstrip("/") + path, json=payload,
-                      timeout=float(c.get("timeout", 10)),
-                      headers={"Authorization": f"Bearer {c.get('token', '')}"})
+def _post(c, path, payload, sess=None):
+    with warnings.catch_warnings():
+        # 指纹模式下 verify=False 会触发 InsecureRequestWarning；已由指纹校验兜底，不刷日志
+        warnings.simplefilter("ignore")
+        r = (sess or requests).post(c["url"].rstrip("/") + path, json=payload,
+                                    timeout=float(c.get("timeout", 10)),
+                                    headers={"Authorization": f"Bearer {c.get('token', '')}"})
     r.raise_for_status()
 
 
@@ -128,6 +250,8 @@ def _loop(gen, c, sid, get_summary, get_customers):
     cust_hours = int(c.get("customer_hours", 24))
     last_cust = 0.0
     fails = 0
+    sess = _session(c)
+    _set_status(last_err="", fails=0)
     while gen == _GEN:   # 配置被网页改过(代数变了)就退出，由新线程接管
         t0 = time.time()
         pushed = False
@@ -138,6 +262,7 @@ def _loop(gen, c, sid, get_summary, get_customers):
                 scan_ts = s.get("scan_ts") or 0
                 if gen != _GEN:   # 取数期间配置被改：这一轮别再用旧token/旧名字推了
                     break
+                _set_status(last_try=now)
                 _post(c, "/api/ingest/summary", {
                     "site_id": sid, "site": c["site_name"],
                     "type": c.get("site_type", "air"), "ts": now,
@@ -150,13 +275,18 @@ def _loop(gen, c, sid, get_summary, get_customers):
                     "containers_offline": s.get("containers_offline") or 0,
                     "scan_age_s": (now - scan_ts) if scan_ts else None,
                     "alert_summary": s.get("alert_summary") or [],
-                })
+                }, sess)
                 pushed = True
                 if fails:
                     log.info("上报恢复(此前连续失败 %d 次)", fails)
                 fails = 0
+                _set_status(last_ok=int(time.time()), last_err="", fails=0)
+            else:
+                _set_status(last_err="本地还没完成首轮扫描，扫完后自动开始上报")
         except Exception as e:  # noqa: BLE001
             fails += 1
+            if gen == _GEN:
+                _set_status(last_err=explain(e), fails=fails, last_try=int(time.time()))
             if fails <= 3 or fails % 30 == 0:   # 断网时别刷屏
                 log.warning("上报失败×%d: %s", fails, e)
         if gen != _GEN:   # 每次发请求前都重新确认代数，缩短热重启时新旧线程重叠窗口
@@ -169,8 +299,9 @@ def _loop(gen, c, sid, get_summary, get_customers):
                     break
                 _post(c, "/api/ingest/customers",
                       {"site_id": sid, "site": c["site_name"],
-                       "hours": cust_hours, "customers": rows})
+                       "hours": cust_hours, "customers": rows}, sess)
                 last_cust = t0
+                _set_status(last_customers_ok=int(time.time()))
             except Exception as e:  # noqa: BLE001
                 log.warning("客户报表上报失败(下轮重试): %s", e)
         _sleep(gen, max(5.0, interval - (time.time() - t0)))

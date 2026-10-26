@@ -91,9 +91,14 @@
             <option value="hydro" data-i18n="seg.type_hydro">💧 水冷</option>
             <option value="mixed" data-i18n="seg.type_mixed">🌀 混合</option>
           </select></div>
-        <div class="seg-host"><span data-i18n="seg.cloud_url">云端地址</span> <input id="cloudUrl" type="text" placeholder="https://overview.example.com"></div>
+        <div class="seg-host"><span data-i18n="seg.connect_code">接入码</span> <input id="cloudCode" type="password" autocomplete="off" data-i18n-placeholder="seg.connect_code_ph" placeholder="从云端面板「场地接入」复制，一次填好地址/token/指纹">
+          <button id="cloudCodeApply" type="button" class="mini-btn" data-i18n="seg.connect_apply">填入</button></div>
+        <div class="seg-host"><span data-i18n="seg.cloud_url">云端地址</span> <input id="cloudUrl" type="text" placeholder="https://overview.example.com  /  https://1.2.3.4:8900"></div>
         <div class="seg-host"><span data-i18n="seg.cloud_token">上报token</span> <input id="cloudToken" type="password" autocomplete="off" placeholder="ingest token">
           <button id="cloudTokenEye" type="button" class="mini-btn" data-i18n="seg.token_eye" data-i18n-title="seg.token_eye">👁 显示</button></div>
+        <div class="seg-host"><span data-i18n="seg.cloud_fp">证书指纹</span> <input id="cloudFp" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="seg.cloud_fp_ph" placeholder="云端无域名(https://IP)时必填；有域名留空"></div>
+        <div class="seg-host"><button id="cloudTest" type="button" class="mini-btn" data-i18n="seg.cloud_test">🔌 测试连接</button>
+          <span id="cloudStatus" class="muted" role="status"></span></div>
       </div>
       <div class="modal-foot">
         <button id="segCancel" data-i18n="seg.cancel">取消</button>

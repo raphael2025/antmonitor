@@ -16,6 +16,7 @@ _CATEGORY_LABEL = {
     "overheat": "高温",
     "reject": "矿池拒绝率高",
     "segment_down": "网段整体掉线",
+    "site_down": "全场大面积掉线",
     "cooler_offline": "集装箱离线",
     "pool_hijack": "矿池被篡改",
     "stalled": "监控停滞",
@@ -79,6 +80,18 @@ def build(conn):
         # 若按告警条数算，整段 250 台断电在云端只显示"网段整体掉线 1 台、掉线 0 台"
         alerts = [a for a in alerts if a.get("type") != "segment_down"]
         _add_segment_group(conn, seg_alerts, ip2worker, groups)
+    site = [a for a in alerts if a.get("type") == "site_down"]
+    if site:
+        # 全场事件按"当前离线台数"计，而不是 1 条告警
+        alerts = [a for a in alerts if a.get("type") != "site_down"]
+        try:
+            ls = db.latest_scan(conn)
+            n = int(ls.get("offline") or 0) if ls else 0
+        except Exception:  # noqa: BLE001
+            n = 0
+        groups["site_down"] = {"category": "site_down", "label": _CATEGORY_LABEL["site_down"],
+                               "count": n or 1, "since_ts": site[0].get("ts") or 0,
+                               "_workers": {}}
     for a in alerts:
         cat, label = _category(a.get("type") or "")
         g = groups.setdefault(cat, {"category": cat, "label": label, "count": 0,

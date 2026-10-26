@@ -25,7 +25,10 @@ log = logs.get(__name__)
 
 # 本模块产生的全部告警类型（启动清理旧类型时作为白名单）
 MINER_TYPES = ("offline", "zero", "reject", "low_hashrate", "overheat",
-               "segment_down", "stalled", "pool_hijack")
+               "segment_down", "site_down", "stalled", "pool_hijack")
+
+# 全场级事件的告警 ip(不是某台机器)
+SITE_KEY = "__site__"
 
 # ---- 推送队列：发送失败/慢不影响扫描 ----
 _push_q = queue.Queue(maxsize=200)
@@ -123,8 +126,10 @@ def _tg_send(tg_cfg, text):
 
 
 # 恢复时推送通知的告警类型(严重类)。零算力/掉算力/拒绝率这类 warn 抖动多，恢复不推，免得刷屏
-RECOVERY_TYPES = ("offline", "segment_down", "overheat", "pool_hijack", "cooler_offline")
-_RECOVERY_LABEL = {"offline": "掉线", "segment_down": "整段掉线", "overheat": "高温",
+RECOVERY_TYPES = ("offline", "segment_down", "site_down", "overheat", "pool_hijack",
+                  "cooler_offline")
+_RECOVERY_LABEL = {"offline": "掉线", "segment_down": "整段掉线", "site_down": "全场大面积掉线",
+                   "overheat": "高温",
                    "pool_hijack": "矿池不在白名单", "cooler_offline": "集装箱控制器离线"}
 
 
@@ -194,6 +199,14 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     zero_since = state.setdefault("zero_since", {})   # ip → 连续零算力起始时间
     shares = state.setdefault("reject_base", {})   # ip → (accepted, rejected) 拒绝率增量基准
     rebooting = state.setdefault("rebooting", {})   # ip → 下发重启的时间(MonitorService.mark_rebooting 写入)
+    # 跨轮次确认用的起始时间/计数。大场地网络抖动(交换机重启、STP 收敛、ARP 表刷新)和矿机
+    # 网页服务卡顿一两分钟就过去，单轮判定会"报掉线→几分钟后恢复"反复误报，所以掉线/整段
+    # 掉线/全场掉线/零算力都要求持续 confirm 秒(默认跨到下一轮巡检)仍成立才报
+    offline_since = state.setdefault("offline_since", {})   # ip → 首次确认离线时间
+    seg_since = state.setdefault("seg_down_since", {})      # 网段 → 首次满足整段掉线时间
+    site_since = state.setdefault("site_down_since", {})    # SITE_KEY → 首次满足全场掉线时间
+    alive_streak = state.setdefault("alive_streak", {})     # ip → 连续"连得上但读不到"轮数
+    hot_streak = state.setdefault("hot_streak", {})         # ip → 连续高温轮数
     rb_grace = cfg.get("control", {}).get("reboot_grace_sec", 600)
 
     def rb_expired(ip):   # 有重启标记且静默期已过(按时间戳现判，见下方在线分支注释)
@@ -211,6 +224,12 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     lo_peers = max(1, int(acfg.get("low_hashrate_min_peers", 5)))
     hot_c = acfg.get("overheat_c", 95)
     hot_clear = acfg.get("overheat_clear_c", 90)
+    hot_rounds = max(1, int(acfg.get("overheat_rounds", 2) or 1))
+    off_confirm = max(0, int(acfg.get("offline_confirm_sec", 240) or 0))
+    zero_confirm = max(0, int(acfg.get("zero_confirm_sec", 240) or 0))
+    unresp_rounds = max(1, int(acfg.get("unresponsive_rounds", 3) or 1))
+    site_ratio = acfg.get("site_down_ratio", 0.5)
+    site_min = max(1, int(acfg.get("site_down_min", 50) or 1))
     pool_allow = [a for a in (cfg.get("control", {}).get("pool_allowlist") or []) if str(a).strip()]
     roster_age = cfg.get("scan", {}).get("roster_retention_days", 7)
     now = int(time.time())
@@ -243,7 +262,28 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         seg_total[seg] = seg_total.get(seg, 0) + 1
         if r["status"] == "offline":
             seg_off[seg] = seg_off.get(seg, 0) + 1
-    down_segments = set()
+    # —— 全场级：大部分已知真机同时掉线 = 断电/核心网络/监控电脑自身断网。只报一条，
+    # 不再按网段刷几十条 segment_down、更不逐台报掉线 ——
+    tot_all, off_all = sum(seg_total.values()), sum(seg_off.values())
+    unk_all = sum(seg_unknown.values())
+    site_active = bool(db.active_alert(conn, SITE_KEY, "site_down"))
+    if site_active:
+        site_raw = tot_all > 0 and off_all / tot_all >= site_ratio * 0.75
+    else:
+        site_raw = (bool(site_ratio) and tot_all > 0 and off_all >= site_min
+                    and off_all / tot_all >= site_ratio and len(seg_off) >= 2)
+    if site_raw:
+        first = site_since.setdefault(SITE_KEY, now)
+        if site_active or now - first >= off_confirm:
+            b.fire(SITE_KEY, "site_down", "crit",
+                   f"全场大面积掉线 {off_all}/{tot_all}（疑似断电/核心网络故障，"
+                   f"或监控电脑自身网络中断）", force=True)
+    else:
+        site_since.pop(SITE_KEY, None)
+        if site_active and tot_all > 0 and unk_all <= tot_all:
+            b.resolve(SITE_KEY, "site_down")
+
+    down_segments = set()   # 满足整段掉线条件的网段(含确认中)：段内单机告警一律静音
     active_segs = {a["ip"][:-2] for a in db.active_alerts_by_type(conn, "segment_down")
                    if a["ip"].endswith(".x")}
     clear_ratio = seg_ratio * 0.75
@@ -257,10 +297,17 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             is_down = off >= seg_min and tot > 0 and off / tot >= seg_ratio
         if is_down:
             down_segments.add(seg)
+            first = seg_since.setdefault(seg, now)
+            # 全场事件期间不再逐段报；交换机重启这类一两分钟的抖动等确认期过了才报
+            if site_raw or (seg not in active_segs and now - first < off_confirm):
+                continue
             # force：整段事件不受冷却限制。下面会用 down_segments 静音段内单机告警，
             # 若这条被冷却拦下，同一栋冷却期内第二次断电就既无网段告警也无单机告警
             b.fire(f"{seg}.x", "segment_down", "crit",
                    f"网段 {seg}.x 大面积掉线 {off}/{tot}（疑似交换机/断电）", force=True)
+    for seg in list(seg_since):
+        if seg not in down_segments:
+            seg_since.pop(seg, None)
     for a in db.active_alerts_by_type(conn, "segment_down"):   # 离线率回落 → 恢复
         seg = a["ip"][:-2] if a["ip"].endswith(".x") else a["ip"]
         tot = seg_total.get(seg, 0)
@@ -282,23 +329,33 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             peers[r.get("model") or "?"] = peers.get(r.get("model") or "?", 0) + 1
 
     for ip, r in cur.items():
+        seg = ".".join(ip.split(".")[:3])
         if r["status"] == "unknown":
             # 本轮扫描超时没来得及探测(miner_core.scan 的 overall_to 兜底)：
             # 既不是确认在线也不是确认离线，原样跳过——保留上一轮的告警状态不动，
             # 既不新报也不误清，等下一轮真正探测到再判断。
+            # 例外：端口连得上但接口一直读不到(alive)，连续 unresponsive_rounds 轮才按掉线报——
+            # 控制板卡死时也是这个样子，不能永远不报
+            if r.get("alive"):
+                n = alive_streak[ip] = alive_streak.get(ip, 0) + 1
+                if (n >= unresp_rounds and ip in roster and ip not in repair
+                        and ip not in rb_quiet and seg not in down_segments and not site_raw):
+                    b.fire(ip, "offline", "crit", f"{ip} 掉线(端口有响应但接口持续无应答 {n} 轮)")
             continue
-        seg = ".".join(ip.split(".")[:3])
+        alive_streak.pop(ip, None)
         if r["status"] == "offline":
             for t in ("zero", "reject", "low_hashrate", "overheat"):
                 b.resolve(ip, t, recovered=False)   # 掉线了读不到，不代表恢复
             streak.pop(ip, None)
             zero_since.pop(ip, None)
+            hot_streak.pop(ip, None)
+            first_off = offline_since.setdefault(ip, now)
             if ip in repair:
                 b.resolve(ip, "offline", recovered=False)   # 维修中 → 清掉单条(人已经知道了)
                 rebooting.pop(ip, None)
                 continue
-            if seg in down_segments:
-                # 整段事件期间不新报单机，但断电前就已坏、已在报的单机告警保留：那是另一个
+            if seg in down_segments or site_raw:
+                # 整段/全场事件期间不新报单机，但断电前就已坏、已在报的单机告警保留：那是另一个
                 # 独立的问题，消掉的话来电后它仍离线却没有活跃告警
                 rebooting.pop(ip, None)
                 continue
@@ -309,9 +366,10 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
                 b.fire(ip, "offline", "crit",
                        f"{ip} 重启后 {max(1, rb_grace // 60)} 分钟仍未上线")
                 continue
-            if ip in roster:
+            if ip in roster and now - first_off >= off_confirm:
                 b.fire(ip, "offline", "crit", f"{ip} 掉线")
             continue
+        offline_since.pop(ip, None)
         b.resolve(ip, "offline", recovered=ip not in repair)   # 维修中的机器上线不推"恢复"
         # 静默期结束时在线 → 重启完成。按时间戳现判，不用 rb_quiet：评估途中请求线程
         # 可能刚写入新标记，rb_quiet 里还没有它，会被误当成"已过期"清掉
@@ -333,7 +391,8 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         if hr == 0:                       # 明确为 0 才算零算力
             if muted or warming:
                 b.resolve(ip, "zero")
-            else:
+            elif now - zero_since[ip] >= zero_confirm:
+                # 实时算力(5秒值)换矿池/重连时会瞬间读到 0：持续 zero_confirm 秒仍为 0 才报
                 b.fire(ip, "zero", "warn", f"{ip} 零算力")
         elif hr is not None:              # 有正算力 → 消零算力警
             b.resolve(ip, "zero")
@@ -365,8 +424,13 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             # 高温只看维修静音、不跟整段掉线一起静音：部分断电时段内还在线的机器数据可信，
             # 高温是会烧机的 crit，恰恰不能被"同段别的机器掉线"压掉
             if temp >= hot_c and ip not in repair:
-                b.fire(ip, "overheat", "crit", f"{ip} 芯片温 {temp}℃ ≥ {hot_c}℃")
-            elif temp < hot_clear or ip in repair:
+                # 连续 overheat_rounds 轮都超温才报：单颗传感器偶发跳值不当高温
+                hot_streak[ip] = hot_streak.get(ip, 0) + 1
+                if hot_streak[ip] >= hot_rounds:
+                    b.fire(ip, "overheat", "crit", f"{ip} 芯片温 {temp}℃ ≥ {hot_c}℃")
+            else:
+                hot_streak.pop(ip, None)
+            if temp < hot_clear or ip in repair:
                 # 未静音：滞回消警(中间区间 [hot_clear, hot_c) 维持原状态)
                 # 维修中：无条件消掉已有高温告警(人已经知道了)
                 b.resolve(ip, "overheat", recovered=ip not in repair)
@@ -417,6 +481,10 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     for ip in list(zero_since):
         if ip not in cur:
             zero_since.pop(ip, None)
+    for d in (offline_since, alive_streak, hot_streak):
+        for ip in list(d):
+            if ip not in cur:
+                d.pop(ip, None)
     for ip in list(rebooting):  # 同理：静默期过了还没出现在样本里的(下架/换IP)
         if ip not in cur and rb_expired(ip):
             rebooting.pop(ip, None)

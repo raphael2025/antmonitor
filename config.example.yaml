@@ -22,6 +22,7 @@ scan:
   reconfirm_data_timeout: 6.0    # 二次确认的取数超时(秒)
   reconfirm_passes: 2            # 重探轮数(任一轮恢复即判在线)
   reconfirm_max: 800             # 疑似掉线超过此数=真实大面积事件，不重探(别在网络最脆弱时加压)
+  reconfirm_delay_sec: 20        # 每轮重探前等几秒(避开同一波交换机/ARP 抖动)；0=立即重探
   fetch_worker: true    # 在线机额外取矿工名(cgminer 4028 pools, 明文跨固件)
   container_offline_kick_sec: 86400  # 集装箱离线超过此秒数(默认24h)从记忆中踢除
   roster_retention_days: 7   # 机器名册保留天数(限电下线的机器在此期内仍会被巡检以抓恢复)
@@ -58,6 +59,16 @@ alerts:
   low_hashrate_min_peers: 5   # 同机型在线机少于此数不做基线(样本太少不可信)
   overheat_c: 95              # 芯片温 ≥ 此值(℃) → 高温告警；0=关
   overheat_clear_c: 90        # 回落到此值以下才消警(滞回，防临界抖动刷屏)
+  overheat_rounds: 2          # 连续 N 轮超温才报(防单颗传感器跳值)
+  # —— 防误报(大场地重点) ——
+  # 交换机重启/STP 收敛/ARP 刷新、矿机网页服务卡顿、换矿池瞬间 0 算力，通常一两分钟就过去。
+  # 持续这么多秒仍成立才报；默认 240 ≈ 跨到下一轮巡检(5分钟)再确认一次。0=当轮即报(旧行为)
+  offline_confirm_sec: 240    # 单机掉线 / 整段掉线 / 全场掉线
+  zero_confirm_sec: 240       # 零算力
+  unresponsive_rounds: 3      # 端口连得上但接口一直读不到数据：连续 N 轮才按掉线报
+  site_down_ratio: 0.5        # 全场已知真机掉线比例 ≥ 此值 且
+  site_down_min: 50           # 掉线台数 ≥ 此值(跨 2 个以上网段) → 只报一条"全场大面积掉线"，不逐段刷屏
+  container_offline_rounds: 3 # 集装箱控制器连续 N 轮(每轮约10秒)没采到才判离线
   # 集装箱：以下故障位不报警(仍在卡片显示)
   # supply_liquid_flow_low=供液流量低 liquid_level_high=液位高 supply_liquid_pressure_high=供液压力高
   # ⚠ 注意 leakage_fault(漏液) 属于 crit 级安全故障，除非确认是误报，否则不建议加进忽略列表

@@ -45,6 +45,8 @@ DEFAULTS = {
         "liveness_gate": True, "gate_timeout": 2.0, "max_pps": 300,
         "reconfirm_enabled": True, "reconfirm_online_timeout": 3.0,
         "reconfirm_data_timeout": 6.0, "reconfirm_passes": 2, "reconfirm_max": 800,
+        # 每轮二次确认前等几秒：紧接着重探碰上的还是同一波网络抖动
+        "reconfirm_delay_sec": 20,
         "fetch_worker": True,
         "container_offline_kick_sec": 86400,
         "roster_retention_days": 7,
@@ -70,6 +72,15 @@ DEFAULTS = {
         "low_hashrate_min_peers": 5,    # 同型号在线机少于此数不做基线(样本太少不可信)
         "overheat_c": 95,               # 芯片温 ≥ 此值 → 高温告警；0=关
         "overheat_clear_c": 90,         # 回落到此值以下才消警(滞回，防临界抖动刷屏)
+        "overheat_rounds": 2,           # 连续 N 轮超温才报(防单颗传感器跳值)
+        # 跨轮次确认(秒)：持续这么久仍成立才报，过滤交换机重启/网页卡顿/换池瞬间 0 算力。
+        # 默认 240 ≈ 跨到下一轮巡检；0=当轮即报(旧行为)
+        "offline_confirm_sec": 240,     # 单机掉线 / 整段掉线 / 全场掉线
+        "zero_confirm_sec": 240,        # 零算力
+        "unresponsive_rounds": 3,       # 端口通但接口一直读不到：连续 N 轮才按掉线报
+        # 全场级事件：已知真机掉线比例 ≥ ratio 且台数 ≥ min(跨 2 个以上网段) → 只报一条全场掉线
+        "site_down_ratio": 0.5, "site_down_min": 50,
+        "container_offline_rounds": 3,  # 集装箱控制器连续 N 轮(每轮约10秒)没采到才判离线
         "container_faults_ignore": [],
         "container_supply_pressure_min": 0,
         "container_return_pressure_min": 0,
@@ -236,6 +247,14 @@ def _validate(cfg):
     clamp("alerts", "overheat_clear_c", 0, 200)
     clamp("alerts", "low_hashrate_ratio", 0, 1)
     clamp("alerts", "segment_down_ratio", 0, 1)
+    clamp("alerts", "site_down_ratio", 0, 1)
+    clamp("alerts", "site_down_min", 1, 1000000, int)
+    clamp("alerts", "overheat_rounds", 1, 100, int)
+    clamp("alerts", "offline_confirm_sec", 0, 86400, int)
+    clamp("alerts", "zero_confirm_sec", 0, 86400, int)
+    clamp("alerts", "unresponsive_rounds", 1, 1000, int)
+    clamp("alerts", "container_offline_rounds", 1, 100, int)
+    clamp("scan", "reconfirm_delay_sec", 0, 300)
     clamp("alerts", "reject_pct", 0, 100)
     clamp("alerts", "reject_min_shares", 1, 1000000, int)
     clamp("alerts", "zero_grace_sec", 0, 86400, int)
@@ -465,10 +484,16 @@ def update_settings(patch):
 
 
 def _atomic_json(path, data):
-    """先写 .tmp 再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。"""
+    """先写 .tmp 再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。
+    以 0600 创建：settings.json 里有云端上报 token，同机其它用户不该读得到。"""
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        os.chmod(tmp, 0o600)   # 已存在的旧 .tmp 不受 O_CREAT 的 mode 影响
+    except OSError:
+        pass
     os.replace(tmp, path)
 
 

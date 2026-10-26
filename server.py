@@ -18,6 +18,7 @@ import html
 import hmac as _hmac
 import ipaddress
 import os
+import re
 import sys
 import threading
 import time
@@ -910,45 +911,92 @@ def api_settings_get(sess: dict = Depends(require_viewer)):
            "reboot_delay_sec": int(ctl.get("reboot_delay_sec", 8)),
            "reboot_max_per_day": int(ctl.get("reboot_max_per_day", 4) or 4),
            "reboot_min_interval_sec": int(ctl.get("reboot_min_interval_sec", 900))}
-    if auth.has_role(sess, "admin"):   # 云端上报配置含 token，只给 admin
+    if auth.has_role(sess, "admin"):   # 云端上报配置只给 admin
         c = CFG.get("cloud") or {}
+        tok = str(c.get("token") or "")
+        # token 不回传明文：只告诉前端"已填写"和末 4 位，留空保存=沿用原值。
+        # 浏览器缓存/截屏/肩窥都拿不到完整 token
         out["cloud"] = {"enabled": bool(c.get("enabled")), "url": c.get("url") or "",
-                        "token": c.get("token") or "", "site_name": c.get("site_name") or "",
-                        "site_type": c.get("site_type") or "air"}
+                        "token_set": bool(tok), "token_hint": tok[-4:] if len(tok) >= 12 else "",
+                        "site_name": c.get("site_name") or "",
+                        "site_type": c.get("site_type") or "air",
+                        "tls_fingerprint": c.get("tls_fingerprint") or ""}
         out["site_id"] = cloud_report.site_id(CFG)
     return out
+
+
+_SITE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+def _cloud_form(c, keep_token=True):
+    """校验网页提交的云端上报配置，返回 (配置, 错误)。token 留空 = 沿用已保存的。"""
+    cur = CFG.get("cloud") or {}
+    token = str(c.get("token") or "").strip()
+    if not token and keep_token:
+        token = str(cur.get("token") or "")
+    fp = cloud_report.normalize_fingerprint(
+        c["tls_fingerprint"] if "tls_fingerprint" in c else cur.get("tls_fingerprint"))
+    if fp is None:
+        return None, "证书指纹格式不对：应为 64 位十六进制(可带冒号)，从云端面板「场地接入」复制"
+    cl = {"enabled": c.get("enabled", False),
+          "url": str(c.get("url") or "").strip().rstrip("/"),
+          "token": token,
+          "site_name": str(c.get("site_name") or "").strip()[:64],
+          "site_type": c.get("site_type") if c.get("site_type") in ("air", "hydro", "mixed")
+          else "air",
+          "tls_fingerprint": fp}
+    # 场地 ID 一旦定下就别丢：表单没带时沿用当前值(否则重启后回落到 cloud_site_id.txt，云端变成新场地)
+    sid = str(c.get("site_id") or cur.get("site_id") or "").strip()
+    if sid:
+        if not _SITE_ID_RE.match(sid):
+            return None, "场地 ID 只能是 1~64 位字母/数字/._-"
+        cl["site_id"] = sid
+    if "enabled" in c and not isinstance(c["enabled"], bool):
+        return None, "cloud.enabled 须为布尔值"
+    if cl["enabled"] and not (cl["url"] and cl["token"] and cl["site_name"]):
+        return None, "启用上报需填写 云端地址/上报token/场地名"
+    if cl["url"] and not cl["url"].startswith(("http://", "https://")):
+        return None, "云端地址须以 http:// 或 https:// 开头"
+    if cl["url"].startswith("http://"):   # 明文上报会暴露 token 和场地数据；只放行内网调试地址
+        h = _host_name(cl["url"][7:].split("/", 1)[0])
+        try:
+            ip = ipaddress.ip_address(h)
+            private = ip.is_private or ip.is_loopback
+        except ValueError:
+            private = h == "localhost"
+        if not private:
+            return None, "公网云端地址必须用 https://(云端没有域名时用 https://IP:端口 + 证书指纹)"
+    return cl, ""
+
+
+@app.get("/api/cloud/status")
+def api_cloud_status(_: dict = Depends(require_admin)):
+    """云端上报状态：给设置面板显示，不用登机器翻日志。"""
+    c = CFG.get("cloud") or {}
+    st = cloud_report.status()
+    return {"ok": True, "enabled": cloud_report.enabled(CFG), "running": cloud_report.is_alive(),
+            "url": c.get("url") or "", "site_id": cloud_report.site_id(CFG),
+            "pinned": bool(c.get("tls_fingerprint")), **st}
+
+
+@app.post("/api/cloud/test")
+def api_cloud_test(body: dict = Body(default={}), _: dict = Depends(require_admin)):
+    """用表单里(还没保存)的地址/token/指纹试连云端一次，只校验不写数据。"""
+    c = body.get("cloud") if isinstance(body.get("cloud"), dict) else {}
+    cl, err = _cloud_form({**c, "enabled": False})
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    ok, msg = cloud_report.test(cl, cl.get("site_id") or cloud_report.site_id(CFG))
+    return {"ok": ok, "message": msg}
 
 
 @app.post("/api/settings")
 def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     s = {}
     if isinstance(body.get("cloud"), dict):   # 云端上报(网页配置, 存 settings.json, 即时生效)
-        c = body["cloud"]
-        if "enabled" in c and not isinstance(c["enabled"], bool):
-            return JSONResponse({"ok": False, "error": "cloud.enabled 须为布尔值"},
-                                status_code=400)
-        cl = {"enabled": c.get("enabled", False),
-              "url": str(c.get("url") or "").strip().rstrip("/"),
-              "token": str(c.get("token") or "").strip(),
-              "site_name": str(c.get("site_name") or "").strip()[:64],
-              "site_type": c.get("site_type") if c.get("site_type") in ("air", "hydro", "mixed")
-              else "air"}
-        if cl["enabled"] and not (cl["url"] and cl["token"] and cl["site_name"]):
-            return JSONResponse({"ok": False, "error": "启用上报需填写 云端地址/上报token/场地名"},
-                                status_code=400)
-        if cl["url"] and not cl["url"].startswith(("http://", "https://")):
-            return JSONResponse({"ok": False, "error": "云端地址须以 http:// 或 https:// 开头"},
-                                status_code=400)
-        if cl["url"].startswith("http://"):   # 明文上报会暴露 token 和场地数据；只放行内网调试地址
-            h = _host_name(cl["url"][7:].split("/", 1)[0])
-            try:
-                ip = ipaddress.ip_address(h)
-                private = ip.is_private or ip.is_loopback
-            except ValueError:
-                private = h == "localhost"
-            if not private:
-                return JSONResponse({"ok": False, "error": "公网云端地址必须用 https://"},
-                                    status_code=400)
+        cl, err = _cloud_form(body["cloud"])
+        if err:
+            return JSONResponse({"ok": False, "error": err}, status_code=400)
         s["cloud"] = cl
     # 与 appconfig._validate 的上下限保持一致(max_pps/discovery_workers 硬上限 500 = 三层 CoPP)。
     # 超范围直接拒绝而不是悄悄夹紧：以前网页清空 ARP 限速会存成 0、回显 0，实际被夹成 1 pps，

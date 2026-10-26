@@ -299,14 +299,13 @@ def probe_antbox(ip, online_to, data_to):
     return rec
 
 
-def fetch_pool(ip, timeout):
-    """cgminer 4028 端口 pools 命令：取矿工名 + 接受/拒绝/陈旧份额（明文、跨固件）。
-    返回 {worker, accepted, rejected, stale} 或 None。"""
+def _cgminer(ip, command, timeout):
+    """cgminer 4028 端口发一条命令，返回解析后的 dict；连不上/超时/不是 JSON 返回 None。"""
     s = None
     try:
         s = socket.create_connection((ip, 4028), timeout=timeout)
         s.settimeout(timeout)
-        s.sendall(b'{"command":"pools"}\n')
+        s.sendall(json.dumps({"command": command}).encode() + b"\n")
         buf = b""
         d = None
         # 整体(wall-clock)预算：settimeout 只保证单次 recv 不超时，对端若持续以低于
@@ -341,6 +340,24 @@ def fetch_pool(ip, timeout):
             if i < 0 or j <= i:
                 return None
             d = json.loads(txt[i:j + 1])
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+def fetch_pool(ip, timeout):
+    """cgminer 4028 端口 pools 命令：取矿工名 + 接受/拒绝/陈旧份额（明文、跨固件）。
+    返回 {worker, accepted, rejected, stale} 或 None。"""
+    d = _cgminer(ip, "pools", timeout)
+    if d is None:
+        return None
+    try:
         pools = d.get("POOLS") or []
         # 只统计活跃池(Status=Alive)：备用/失活池的历史拒绝份额会把拒绝率顶过阈值误报；
         # worker 也取活跃池中优先级最高(Priority 最小)的主池，避免归属到备用池的异名 worker。
@@ -369,12 +386,41 @@ def fetch_pool(ip, timeout):
                 "pools": [u for u in urls if u]}
     except Exception:
         return None
-    finally:
-        if s is not None:
-            try:
-                s.close()
-            except OSError:
-                pass
+
+
+def fetch_summary(ip, timeout):
+    """cgminer 4028 summary：网页接口卡死(lighttpd/CGI 忙)但挖矿程序还在跑时的兜底取数。
+    返回 {hr_rt, hr_avg, uptime} 或 None。"""
+    d = _cgminer(ip, "summary", timeout)
+    try:
+        sm = (d or {}).get("SUMMARY") or []
+        sm = sm[0] if isinstance(sm, list) and sm else None
+        if not isinstance(sm, dict):
+            return None
+
+        def rate(key):
+            if sm.get(f"GHS {key}") is not None:
+                return gh_to_th(sm.get(f"GHS {key}"))
+            n = _number(sm.get(f"MHS {key}"))
+            return round(n / 1e6, 2) if n is not None else None
+
+        hr = rate("5s")
+        if hr is None:
+            return None
+        return {"hr_rt": hr, "hr_avg": rate("av"),
+                "uptime": _number(sm.get("Elapsed"), integer=True)}
+    except Exception:
+        return None
+
+
+# 芯片温读数的可信区间：0/负数是空槽位，超过上限是传感器坏了或固件哨兵值(如 255)。
+# 不过滤的话一颗坏传感器就能让整机每轮报 crit 高温
+TEMP_MIN_C, TEMP_MAX_C = 1, 150
+
+
+def _temp(v):
+    n = _number(v)
+    return n if n is not None and TEMP_MIN_C <= n <= TEMP_MAX_C else None
 
 
 def reject_pct(accepted, rejected):
@@ -422,7 +468,7 @@ def probe_stock(ip, online_to, data_to, passwords, collect_identity=False):
             rec["uptime"] = _number(st.get("elapsed"), integer=True)
             temps = []
             for c in (st.get("chain") or []):
-                temps += [n for n in (_number(t) for t in (c.get("temp_chip") or []))
+                temps += [n for n in (_temp(t) for t in (c.get("temp_chip") or []))
                           if n is not None]
             rec["temp"] = max(temps) if temps else None
             # 6060 does not expose a MAC.  Only machines without a usable SN
@@ -468,7 +514,7 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False):
     rec["hr_rt"] = gh_to_th(m.get("hr_realtime"))
     rec["hr_avg"] = gh_to_th(m.get("hr_average"))
     rec["power"] = _number(m.get("power_consumption"), integer=True)
-    rec["temp"] = _number(ct.get("max"))
+    rec["temp"] = _temp(ct.get("max"))
     rec["eff"] = _number(m.get("power_efficiency"))  # J/TH
     rec["uptime"] = _number(
         (m.get("miner_status") or {}).get("miner_state_time"), integer=True)
@@ -489,14 +535,16 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False):
 
 
 def probe(ip, cfg, limiter=None):
-    """单机探测：先原厂(6060最快)，不通再第三方，都不通=离线。"""
+    """单机探测：先原厂(6060最快)，不通再第三方，都不通再看端口是否有响应：
+    有响应就从 4028 兜底取数(取不到=unknown，带 alive 标记)，完全连不上才是离线。"""
     if limiter is not None:
         limiter.acquire()   # 限速：控制每秒新建连接(≈ARP)速率，保护三层
     passwords = [tuple(p) for p in cfg.get("passwords", [["root", "root"]])]
     online_to = cfg.get("online_timeout", 0.5)
     data_to = cfg.get("data_timeout", 2.0)
     # 快速判活：三类设备(原厂/第三方/AntBox)都开 80；连不上直接判离线，死IP不白跑3个探测
-    if cfg.get("liveness_gate") and not tcp_open(ip, 80, cfg.get("gate_timeout", 0.4)):
+    gate = cfg.get("liveness_gate")
+    if gate and not tcp_open(ip, 80, cfg.get("gate_timeout", 0.4)):
         return _blank(ip, "offline")
     collect_identity = bool(cfg.get("collect_identity"))
     rec = probe_stock(ip, online_to, data_to, passwords, collect_identity)
@@ -507,7 +555,31 @@ def probe(ip, cfg, limiter=None):
         cont = probe_antbox(ip, max(online_to, 1.5), data_to)
         if cont is not None:
             return cont
-        return _blank(ip, "offline")
+        # 网页接口全部没应答，但设备明明连得上(判活闸门已通过，或二次确认时补测 80/4028)：
+        # 大场地最常见的是矿机网页服务(lighttpd/CGI)卡住而挖矿程序照常在跑。以前直接判离线，
+        # 一卡就报掉线、过一会儿自己好了又恢复——这是"误报掉线"的主要来源之一
+        alive = bool(gate) or (cfg.get("alive_probe") and (
+            tcp_open(ip, 80, cfg.get("gate_timeout", 0.4))
+            or tcp_open(ip, 4028, cfg.get("gate_timeout", 0.4))))
+        if not alive:
+            return _blank(ip, "offline")
+        sm = fetch_summary(ip, min(data_to, 3.0))
+        if sm is None:
+            # 连得上但什么都读不到：不是"确认离线"，交给告警层按连续轮数升级
+            rec = _blank(ip, "unknown")
+            rec["alive"] = True
+            rec["note"] = "端口有响应但接口无应答"
+            return rec
+        rec = _blank(ip, "online")
+        rec.update(sm)
+        rec["note"] = "网页接口无响应,经4028取数"
+    elif rec.get("hr_rt") is None and rec.get("status") == "online":
+        # 在线但 stats.cgi 超时/读不出：用 4028 补算力，免得"读不到算力"一直没数据
+        sm = fetch_summary(ip, min(data_to, 3.0))
+        if sm:
+            for k, v in sm.items():
+                if rec.get(k) is None:
+                    rec[k] = v
     # 在线机补取矿工名 + 矿池份额（4028 明文，跨固件通用）
     if cfg.get("fetch_worker", True):
         pi = fetch_pool(ip, min(data_to, 1.5))
