@@ -1034,7 +1034,10 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     if effective_full < effective_scan:
         return JSONResponse({"ok": False, "error": "全网发现间隔不能小于巡检间隔"},
                             status_code=400)
-    appconfig.update_settings(s)       # 读-合并-写在同一把锁内：两个 admin 同时保存不互相覆盖
+    try:   # 读-合并-写在同一把锁内：两个 admin 同时保存不互相覆盖
+        appconfig.update_settings(s)
+    except appconfig.SettingsError as e:   # 原文件读不了：不覆盖，原因告诉管理员
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     appconfig.apply_settings(CFG, s)   # 即时生效，无需重启
     SVC.wake()                         # 唤醒调度循环立即按新间隔重排
     out = {"ok": True, **s}

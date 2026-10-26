@@ -456,15 +456,30 @@ SETTINGS_FILE = _file_from_env("MINER_SETTINGS", "settings.json")
 _SETTINGS_LOCK = threading.RLock()
 
 
+class SettingsError(RuntimeError):
+    """settings.json 存在但读不了/是半截：写操作绝不能把它当空文件再整份覆盖回去
+    (会丢掉云端 token、重启参数等全部网页设置)。"""
+
+
+def _read_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return {}
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SettingsError(f"settings.json 读取失败({e})：常见原因是用 sudo/root 改过它、"
+                            f"服务账号读不了，改回属主后重试") from e
+    return d if isinstance(d, dict) else {}
+
+
 def load_settings():
     with _SETTINGS_LOCK:
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (OSError, ValueError) as e:
-                log.warning("settings.json 读取失败，忽略: %s", e)
-        return {}
+        try:
+            return _read_settings()
+        except SettingsError as e:
+            log.warning("%s；本次按空设置处理", e)
+            return {}
 
 
 def save_settings(s):
@@ -484,7 +499,7 @@ def update_settings(patch):
     锁内完成，多个管理员并发保存时不会互相覆盖。新代码请一律用这个函数。
     """
     with _SETTINGS_LOCK:
-        merged = {**load_settings(), **(patch or {})}
+        merged = {**_read_settings(), **(patch or {})}   # 读失败直接抛错，不覆盖原文件
         _atomic_json(SETTINGS_FILE, merged)
         return merged
 
