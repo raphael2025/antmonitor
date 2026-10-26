@@ -249,3 +249,14 @@ def test_hot_then_protective_shutdown_is_reported(conn, dcfg, clock):
     assert ("10.0.0.1", "overheat") in fired and ("10.0.0.2", "overheat") in fired
     detail = {a["ip"]: a["detail"] for a in db.active_alerts_by_type(conn, "overheat")}
     assert "高温保护" in detail["10.0.0.1"] and "高温保护" in detail["10.0.0.2"]
+
+
+def test_probe_timeouts_are_at_least_three_seconds():
+    """单台判活/在线判定至少等 3 秒：老配置里的 2.0/2.5 也会被抬到 3。"""
+    cfg = appconfig._validate(appconfig._merge(appconfig.DEFAULTS, {
+        "scan": {"online_timeout": 2.5, "gate_timeout": 2.0, "reconfirm_online_timeout": 1}}))
+    assert cfg["scan"]["online_timeout"] == 3.0
+    assert cfg["scan"]["gate_timeout"] == 3.0
+    assert cfg["scan"]["reconfirm_online_timeout"] == 3.0
+    d = appconfig._validate(appconfig._merge(appconfig.DEFAULTS, {}))["scan"]
+    assert d["online_timeout"] == 3.0 and d["gate_timeout"] == 3.0

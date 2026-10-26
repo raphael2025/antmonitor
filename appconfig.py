@@ -40,9 +40,10 @@ DEFAULTS = {
     "scan": {
         "segments": [], "host_start": 1, "host_end": 254,
         "base": "172.16", "lo": 100, "hi": 160,
-        "online_timeout": 2.5, "data_timeout": 5.0,
+        # 单台判活/在线判定统一等 3 秒：扫一轮会慢一点，但慢响应的矿机不会被当成掉线乱报警
+        "online_timeout": 3.0, "data_timeout": 5.0,
         "workers": 300, "discovery_workers": 300,
-        "liveness_gate": True, "gate_timeout": 2.0, "max_pps": 300,
+        "liveness_gate": True, "gate_timeout": 3.0, "max_pps": 300,
         "reconfirm_enabled": True, "reconfirm_online_timeout": 3.0,
         "reconfirm_data_timeout": 6.0, "reconfirm_passes": 2, "reconfirm_max": 800,
         # 每轮二次确认前等几秒：紧接着重探碰上的还是同一波网络抖动
@@ -180,6 +181,9 @@ def _merge(defaults, override):
     return out
 
 
+MIN_PROBE_TIMEOUT = 3.0
+
+
 def _validate(cfg):
     """把明显不合法的值纠正到安全范围并记日志(宁可跑起来也不要静默跑歪)。"""
     warn = []
@@ -227,9 +231,12 @@ def _validate(cfg):
     clamp("control", "max_batch", 1, 100000, int)
     # 超时类：0/负数会一路传到 socket.settimeout()/requests(timeout=)，
     # miner_core.tcp_open() 拿到负数直接抛未捕获 ValueError，整轮扫描线程挂掉。
-    for k in ("online_timeout", "data_timeout", "gate_timeout",
-              "reconfirm_online_timeout", "reconfirm_data_timeout"):
+    for k in ("data_timeout", "reconfirm_data_timeout"):
         clamp("scan", k, 0.1, 120)
+    # 判定"在不在线"的超时不低于 3 秒(老配置里的 2.0/2.5 也一起抬上来)：
+    # 设得太短，矿机网页稍慢一点就被判离线，大场地误报的主要来源之一
+    for k in ("online_timeout", "gate_timeout", "reconfirm_online_timeout"):
+        clamp("scan", k, MIN_PROBE_TIMEOUT, 120)
     clamp("control", "timeout", 0.1, 300)
     clamp("cloud", "timeout", 0.1, 300)
     clamp("cloud", "interval", 5, 86400, int)

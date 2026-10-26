@@ -70,7 +70,7 @@ while switching pools usually pass within a minute or two, so alerts now need co
 (`config.yaml > alerts`): `offline_confirm_sec: 240` (offline / segment / site-wide), `zero_confirm_sec: 240`,
 `overheat_rounds: 2` (readings ≤0 °C or >150 °C are dropped as broken sensors), `unresponsive_rounds: 3`
 (port open but API silent), `site_down_ratio: 0.5` + `site_down_min: 50` (one "site-wide outage" alert instead of
-dozens), `container_offline_rounds: 3`, `scan.reconfirm_delay_sec: 20`. If the miner web UI hangs while cgminer keeps
+dozens), `container_offline_rounds: 3`, `scan.reconfirm_delay_sec: 20`; each probe waits up to 3 s (`scan.online_timeout`/`gate_timeout`, values below 3 are raised to 3). If the miner web UI hangs while cgminer keeps
 mining, hashrate is read from port 4028 instead of reporting it offline.
 
 ---
