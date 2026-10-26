@@ -33,10 +33,10 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 （终端里输入；直接回车会自动生成强密码并在最后显示）→ 注册 systemd 服务 `antmonitor` 并启动。
 默认目录 `/opt/antmonitor`，面板 `http://<监控机IP>:8800`。
 
-**安装时顺便接入云端**（接入码在云端面板右上「🔌 场地接入」里复制）：
+**安装时顺便接入云端**（接入码在云端面板右上「🔌 场地接入」里复制；`-` 表示运行后按提示粘贴，接入码含 token，不写在命令里就不会被 `ps`/命令历史看到）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code 'AMC1-…' --site-name 内蒙一场
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code - --site-name 内蒙一场
 ```
 
 **再跑一次同样的命令**：出管理菜单（更新 / 修复 / 卸载 / 重置用户名和密码）；没有终端（自动化）时直接更新。

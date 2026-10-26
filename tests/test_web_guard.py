@@ -92,6 +92,13 @@ def test_cloud_token_is_never_echoed_and_blank_keeps_it(app, monkeypatch):
     assert server.CFG["cloud"]["token"] == "secret-token-123456"
     st = c.get("/api/cloud/status").json()
     assert st["ok"] and st["enabled"] is False and "token" not in st
+    # 保存接口的回显也不能带 token
+    r = c.post("/api/settings", json={"cloud": dict(cloud, token="")})
+    assert "secret-token-123456" not in r.text
+    # 改了地址还想沿用旧 token：拒绝(否则能把 token 发到任意服务器)
+    moved = dict(cloud, url="https://evil.example.com", token="")
+    assert c.post("/api/settings", json={"cloud": moved}).status_code == 400
+    assert c.post("/api/cloud/test", json={"cloud": moved}).status_code == 400
 
 
 def test_cloud_fingerprint_is_validated_and_normalized(app, monkeypatch):

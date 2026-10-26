@@ -69,10 +69,10 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 自动装依赖、下载代码、建服务并启动，安装时设置 admin 密码（直接回车会生成强密码并显示）。
 面板 `http://<监控机IP>:8800`。再跑一次同样的命令 = 管理菜单（更新 / 修复 / 卸载 / 重置账号）。
 
-装的时候顺便接入云端（接入码在云端面板「🔌 场地接入」里复制）：
+装的时候顺便接入云端（接入码在云端面板「🔌 场地接入」里复制，运行后按提示粘贴，不会留在命令历史里）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code 'AMC1-…' --site-name 内蒙一场
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code - --site-name 内蒙一场
 ```
 
 **Windows 10 / 11**（PowerShell 里执行，不需要管理员）

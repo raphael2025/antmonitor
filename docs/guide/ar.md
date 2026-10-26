@@ -29,7 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 
 يثبّت الحزم، ويجلب الشيفرة (git أو أرشيف المصدر)، وينشئ venv والإعدادات، ويطلب كلمة مرور admin
 (Enter = توليد كلمة قوية)، ويشغّل خدمة `antmonitor`. اللوحة: `http://<IP>:8800`.
-للربط بالسحابة أثناء التثبيت: `… | sudo bash -s -- --connect-code 'AMC1-…' --site-name Site-1`
+للربط بالسحابة أثناء التثبيت: `… | sudo bash -s -- --connect-code - --site-name Site-1`
 (الرمز من لوحة السحابة «🔌 ربط المواقع»). تشغيل الأمر مرة أخرى يعرض القائمة (تحديث/إصلاح/إزالة/إعادة تعيين الحساب).
 GitHub بطيء: `GH_PROXY=<بادئة المرآة>/` (مرايا موثوقة فقط).
 

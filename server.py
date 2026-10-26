@@ -932,14 +932,19 @@ def _cloud_form(c, keep_token=True):
     """校验网页提交的云端上报配置，返回 (配置, 错误)。token 留空 = 沿用已保存的。"""
     cur = CFG.get("cloud") or {}
     token = str(c.get("token") or "").strip()
-    if not token and keep_token:
-        token = str(cur.get("token") or "")
     fp = cloud_report.normalize_fingerprint(
         c["tls_fingerprint"] if "tls_fingerprint" in c else cur.get("tls_fingerprint"))
     if fp is None:
         return None, "证书指纹格式不对：应为 64 位十六进制(可带冒号)，从云端面板「场地接入」复制"
+    url = str(c.get("url") or "").strip().rstrip("/")
+    if not token and keep_token and cur.get("token"):
+        # 沿用已保存的 token 只限地址和指纹都没变：否则改个地址就能让本服务把 token
+        # 明文发到任意服务器——浏览器拿不到 token 的保护就白做了
+        if url != str(cur.get("url") or "").rstrip("/") or fp != (cur.get("tls_fingerprint") or ""):
+            return None, "云端地址或证书指纹改了，请重新填写上报 token(或粘贴新的接入码)"
+        token = str(cur.get("token") or "")
     cl = {"enabled": c.get("enabled", False),
-          "url": str(c.get("url") or "").strip().rstrip("/"),
+          "url": url,
           "token": token,
           "site_name": str(c.get("site_name") or "").strip()[:64],
           "site_type": c.get("site_type") if c.get("site_type") in ("air", "hydro", "mixed")
@@ -1033,6 +1038,10 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
     appconfig.apply_settings(CFG, s)   # 即时生效，无需重启
     SVC.wake()                         # 唤醒调度循环立即按新间隔重排
     out = {"ok": True, **s}
+    if "cloud" in out:                 # 回显也不能带 token 明文
+        tok = out["cloud"].get("token") or ""
+        out["cloud"] = {k: v for k, v in out["cloud"].items() if k != "token"}
+        out["cloud"].update(token_set=bool(tok), token_hint=tok[-4:] if len(tok) >= 12 else "")
     for k in ranges:                   # 回显实际生效的值
         if k not in s:
             continue

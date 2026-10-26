@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 
 Installiert Pakete, lädt den Code (git oder Quell-Tarball), legt venv und Konfiguration an, fragt das admin-Passwort ab
 (Enter = generieren) und startet den Dienst `antmonitor`. Panel: `http://<IP>:8800`.
-Direkt an die Cloud anbinden: `… | sudo bash -s -- --connect-code 'AMC1-…' --site-name Standort-1`
+Direkt an die Cloud anbinden: `… | sudo bash -s -- --connect-code - --site-name Standort-1`
 (Code im Cloud-Panel „🔌 Standorte anbinden“). Erneut ausführen = Menü (Update/Reparatur/Deinstallation/Konto).
 Langsames GitHub: `GH_PROXY=<Mirror-Präfix>/` (nur vertrauenswürdige Mirrors).
 

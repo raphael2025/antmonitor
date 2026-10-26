@@ -3,8 +3,8 @@
 #
 # 一行安装(不用先 git clone，没装 git 也行)：
 #   curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
-# 安装时顺便接入云端(接入码在云端面板「🔌 场地接入」里复制)：
-#   curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code 'AMC1-…' --site-name 内蒙一场
+# 安装时顺便接入云端(接入码在云端面板「🔌 场地接入」里复制；"-" = 在终端里粘贴，不留在命令历史里)：
+#   curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code - --site-name 内蒙一场
 #
 # 再跑一次：已安装时出管理菜单(更新 / 修复 / 卸载 / 重置账号)；没有终端时直接更新。
 # 也可直接指定：... | sudo bash -s -- install|update|repair|uninstall|reset-user|menu
@@ -301,11 +301,18 @@ sync_code() {
     fetch_tarball
   else
     if command -v git >/dev/null; then
+      # 先克隆到临时目录再搬过去：目标目录可能已存在且有别的东西(--dir /data)，
+      # 直接 clone 进去必然失败，失败后更不能 rm -rf 它
+      local tmpc
+      tmpc="$(mktemp -d)"
       info "git clone $REPO_URL"
-      if git clone -q --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"; then
+      if git clone -q --branch "$BRANCH" "$REPO_URL" "$tmpc/src"; then
+        mkdir -p "$INSTALL_DIR"
+        cp -a "$tmpc/src"/. "$INSTALL_DIR"/
+        rm -rf "$tmpc"
         return
       fi
-      rm -rf "$INSTALL_DIR"
+      rm -rf "$tmpc"
       warn "git clone 失败，改用源码包下载"
     fi
     fetch_tarball
@@ -355,7 +362,9 @@ sys.path.insert(0, ".")
 import appconfig, auth
 cfg = appconfig.load_config()
 u = next((u for u in cfg["auth"]["users"] if u.get("username") == "admin"), None)
-sys.exit(0 if u is None or auth._unusable(str(u.get("password") or ""))
+if u is None:   # admin 已改名/删掉：不归这里管(用菜单「重置用户名和密码」)
+    sys.exit(1)
+sys.exit(0 if auth._unusable(str(u.get("password") or ""))
          or "admin" in auth.weak_default_users(cfg) else 1)
 PY
   )
@@ -398,6 +407,13 @@ PY
 }
 
 apply_connect_code() {   # 把云端接入码写进 settings.json(与网页「☁ 云端上报」保存的是同一处)
+  # 接入码含 token：写在命令行里本机其他用户用 ps 能看到、也会留在 shell 历史里。
+  # --connect-code - 表示从终端输入；也可用环境变量 ANTMONITOR_CONNECT_CODE 传
+  [[ -z "$CONNECT_CODE" && -n "${ANTMONITOR_CONNECT_CODE:-}" ]] && CONNECT_CODE="$ANTMONITOR_CONNECT_CODE"
+  if [[ "$CONNECT_CODE" == "-" ]]; then
+    CONNECT_CODE=""
+    ask CONNECT_CODE "粘贴云端接入码(AMC1-…，输入不显示): " silent || true
+  fi
   [[ -n "$CONNECT_CODE" ]] || return 0
   local py; py="$(py_bin)"
   local name="${SITE_NAME:-$(hostname -s 2>/dev/null || echo site)}"

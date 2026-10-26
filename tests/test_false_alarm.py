@@ -204,3 +204,48 @@ def test_nothing_reachable_is_offline(monkeypatch):
     assert miner_core.probe("10.0.0.1", {"liveness_gate": False, "alive_probe": True})["status"] \
         == "offline"
     assert miner_core.probe("10.0.0.1", {"liveness_gate": True})["status"] == "offline"
+
+
+def test_one_building_outage_is_segment_not_site_and_others_still_alert(conn, dcfg, clock):
+    """只有一个网段整段断电：报整段掉线，不报全场；别的网段坏的单机照常报。"""
+    dcfg["alerts"]["site_down_min"] = 10
+    st = {}
+    big = _seg(30)
+    good = big + _seg(5, "10.0.2") + _seg(5, "10.0.3")
+    _round(conn, dcfg, clock, good, st)
+    outage = (_seg(30, status="offline") + [rec("10.0.2.1", status="offline")] + _seg(5, "10.0.2")[1:]
+              + _seg(5, "10.0.3"))
+    _round(conn, dcfg, clock, outage, st)
+    fired = _round(conn, dcfg, clock, outage, st)
+    assert ("10.0.1.x", "segment_down") in fired
+    assert ("10.0.2.1", "offline") in fired
+    assert not db.active_alerts_by_type(conn, "site_down")
+
+
+def test_site_alert_clears_when_ratio_set_to_zero(conn, dcfg, clock):
+    dcfg["alerts"]["site_down_min"] = 10
+    st = {}
+    good = _seg(10) + _seg(10, "10.0.2") + _seg(10, "10.0.3")
+    _round(conn, dcfg, clock, good, st)
+    allout = _seg(10, status="offline") + _seg(10, "10.0.2", status="offline") + _seg(10, "10.0.3")
+    _round(conn, dcfg, clock, allout, st)
+    _round(conn, dcfg, clock, allout, st)
+    assert db.active_alerts_by_type(conn, "site_down")
+    dcfg["alerts"]["site_down_ratio"] = 0
+    _round(conn, dcfg, clock, allout, st)
+    assert not db.active_alerts_by_type(conn, "site_down")
+
+
+def test_far_over_threshold_reports_overheat_immediately(conn, dcfg, clock):
+    st = {}
+    assert _round(conn, dcfg, clock, [rec("10.0.0.1", temp=101)], st) == [("10.0.0.1", "overheat")]
+
+
+def test_hot_then_protective_shutdown_is_reported(conn, dcfg, clock):
+    st = {}
+    assert _round(conn, dcfg, clock, [rec("10.0.0.1", temp=96), rec("10.0.0.2", temp=96)], st) == []
+    fired = _round(conn, dcfg, clock, [rec("10.0.0.1", status="offline"),
+                                       rec("10.0.0.2", temp=60, hr=0)], st)
+    assert ("10.0.0.1", "overheat") in fired and ("10.0.0.2", "overheat") in fired
+    detail = {a["ip"]: a["detail"] for a in db.active_alerts_by_type(conn, "overheat")}
+    assert "高温保护" in detail["10.0.0.1"] and "高温保护" in detail["10.0.0.2"]

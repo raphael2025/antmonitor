@@ -99,6 +99,13 @@ class _PinnedAdapter(HTTPAdapter):
         kw["assert_hostname"] = False
         return super().init_poolmanager(*a, **kw)
 
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        # 走代理(环境变量 HTTPS_PROXY / Windows 系统代理)时 requests 另建代理连接池，
+        # 不经过 init_poolmanager——不在这里也带上指纹，verify=False 就等于完全不校验证书
+        proxy_kwargs["assert_fingerprint"] = self._fp
+        proxy_kwargs["assert_hostname"] = False
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
 
 def _session(c):
     s = requests.Session()

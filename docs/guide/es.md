@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 
 Instala dependencias, descarga el código (git o tarball), crea venv y configuración, pide la contraseña de admin
 (Enter = generarla) y arranca el servicio `antmonitor`. Panel: `http://<IP>:8800`.
-Conectar a la nube en la instalación: `… | sudo bash -s -- --connect-code 'AMC1-…' --site-name Sitio-1`
+Conectar a la nube en la instalación: `… | sudo bash -s -- --connect-code - --site-name Sitio-1`
 (código en el panel de la nube «🔌 Alta de sitios»). Volver a ejecutar = menú (actualizar/reparar/desinstalar/restablecer).
 GitHub lento: `GH_PROXY=<prefijo de espejo>/` (solo espejos de confianza).
 

@@ -73,6 +73,7 @@ DEFAULTS = {
         "overheat_c": 95,               # 芯片温 ≥ 此值 → 高温告警；0=关
         "overheat_clear_c": 90,         # 回落到此值以下才消警(滞回，防临界抖动刷屏)
         "overheat_rounds": 2,           # 连续 N 轮超温才报(防单颗传感器跳值)
+        "overheat_fast_margin_c": 5,    # 超过阈值这么多度当轮就报；0=关
         # 跨轮次确认(秒)：持续这么久仍成立才报，过滤交换机重启/网页卡顿/换池瞬间 0 算力。
         # 默认 240 ≈ 跨到下一轮巡检；0=当轮即报(旧行为)
         "offline_confirm_sec": 240,     # 单机掉线 / 整段掉线 / 全场掉线
@@ -250,6 +251,7 @@ def _validate(cfg):
     clamp("alerts", "site_down_ratio", 0, 1)
     clamp("alerts", "site_down_min", 1, 1000000, int)
     clamp("alerts", "overheat_rounds", 1, 100, int)
+    clamp("alerts", "overheat_fast_margin_c", 0, 100)
     clamp("alerts", "offline_confirm_sec", 0, 86400, int)
     clamp("alerts", "zero_confirm_sec", 0, 86400, int)
     clamp("alerts", "unresponsive_rounds", 1, 1000, int)
@@ -432,6 +434,10 @@ def load_segments(cfg):
     if segs:
         return segs, hs, he
     base, lo, hi = sc.get("base", "172.16"), int(sc.get("lo", 100)), int(sc.get("hi", 160))
+    if not str(base or "").strip():
+        # 新装(config.example.yaml 里 base 留空)：没在网页填网段之前不扫描，免得一装好就对
+        # 172.16.100~160 这 1.5 万个地址发探测——那多半不是这个场地的网段
+        return [], hs, he
     return [f"{base}.{c}" for c in range(lo, hi + 1)], hs, he
 
 
