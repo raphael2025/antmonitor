@@ -34,7 +34,7 @@ asks for the admin password (Enter = generate a strong one, shown at the end) an
 systemd service. Panel: `http://<host>:8800`. Connect to the cloud during install with the code from the cloud
 panel (🔌 Site onboarding): `… | sudo bash -s -- --connect-code - --site-name Site-1`.
 Run the same command again for the menu (update / repair / uninstall / reset account), or pass `update` etc.
-Slow GitHub: set `GH_PROXY=<mirror prefix>/` (trusted mirrors only). Offline: unzip the source and run `sudo bash install.sh` inside it.
+Slow GitHub: set `GH_PROXY=<mirror prefix>/` (trusted mirrors only). No GitHub access: unzip the source and run `sudo bash install.sh` inside it (Python packages still need PyPI or a mirror).
 
 **Windows, one line** (PowerShell, no admin needed):
 

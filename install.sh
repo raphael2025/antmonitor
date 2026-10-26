@@ -10,7 +10,7 @@
 # 也可直接指定：... | sudo bash -s -- install|update|repair|uninstall|reset-user|menu
 # 选项：--lang zh|en|ru|es|de|ar  --dir 安装目录  --branch 分支
 #       --connect-code 接入码  --site-name 场地名  --site-type air|hydro|mixed
-# 从已下载/克隆的源码目录运行 sudo bash install.sh 时，直接用这份源码(离线安装)。
+# 从已下载/克隆的源码目录运行 sudo bash install.sh 时，直接用这份源码(不用访问 GitHub；pip 依赖仍需联网或镜像)。
 # 环境变量：GH_PROXY=https://镜像前缀/  访问 GitHub 很慢时用(镜像能看到并篡改下载内容，只用信得过的)
 set -euo pipefail
 

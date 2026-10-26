@@ -43,8 +43,8 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 也可直接指定：`… | sudo bash -s -- update`（或 `repair` / `uninstall` / `reset-user`）。
 
 GitHub 访问慢：`curl -fsSL <镜像前缀>/https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo GH_PROXY=<镜像前缀>/ bash`
-（镜像能看到并篡改下载内容，只用信得过的）。完全离线：把源码 ZIP 拷到监控机，解压后在目录里
-`sudo bash install.sh`，直接用这份源码安装。
+（镜像能看到并篡改下载内容，只用信得过的）。连不上 GitHub：把源码 ZIP 拷到监控机，解压后在目录里
+`sudo bash install.sh`，直接用这份源码安装（Python 依赖仍需能访问 PyPI 或国内镜像）。
 
 ### Windows：一行命令装好
 

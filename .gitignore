@@ -70,3 +70,4 @@ Thumbs.db
 
 # 本机 Claude/MCP 配置(机器相关)
 .mcp.json
+*.json.*.tmp

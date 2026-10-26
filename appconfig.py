@@ -514,15 +514,20 @@ def update_settings(patch):
 def _atomic_json(path, data):
     """先写 .tmp 再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。
     以 0600 创建：settings.json 里有云端上报 token，同机其它用户不该读得到。"""
-    tmp = path + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # mkstemp：随机名 + O_EXCL 新建，不会顺着别人预先放好的符号链接去改写别的文件
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(os.path.abspath(path)))
     try:
-        os.chmod(tmp, 0o600)   # 已存在的旧 .tmp 不受 O_CREAT 的 mode 影响
-    except OSError:
-        pass
-    os.replace(tmp, path)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 _INT_SETTINGS = ("scan_interval", "full_interval", "container_interval",
