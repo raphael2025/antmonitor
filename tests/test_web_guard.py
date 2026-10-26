@@ -78,6 +78,45 @@ def test_public_cloud_url_must_be_https(app):
     assert r.status_code == 200
 
 
+def test_cloud_token_is_never_echoed_and_blank_keeps_it(app, monkeypatch):
+    server, c = app
+    monkeypatch.setitem(server.CFG, "cloud", dict(server.CFG.get("cloud") or {}))
+    cloud = {"enabled": False, "url": "https://cloud.example.com", "site_name": "s",
+             "site_type": "air"}
+    assert c.post("/api/settings", json={"cloud": dict(cloud, token="secret-token-123456")}
+                  ).status_code == 200
+    got = c.get("/api/settings").json()["cloud"]
+    assert "token" not in got and got["token_set"] and got["token_hint"] == "3456"
+    # 留空保存 = 沿用原 token
+    assert c.post("/api/settings", json={"cloud": dict(cloud, token="")}).status_code == 200
+    assert server.CFG["cloud"]["token"] == "secret-token-123456"
+    st = c.get("/api/cloud/status").json()
+    assert st["ok"] and st["enabled"] is False and "token" not in st
+    # 保存接口的回显也不能带 token
+    r = c.post("/api/settings", json={"cloud": dict(cloud, token="")})
+    assert "secret-token-123456" not in r.text
+    # 改了地址还想沿用旧 token：拒绝(否则能把 token 发到任意服务器)
+    moved = dict(cloud, url="https://evil.example.com", token="")
+    assert c.post("/api/settings", json={"cloud": moved}).status_code == 400
+    assert c.post("/api/cloud/test", json={"cloud": moved}).status_code == 400
+
+
+def test_cloud_fingerprint_is_validated_and_normalized(app, monkeypatch):
+    server, c = app
+    monkeypatch.setitem(server.CFG, "cloud", dict(server.CFG.get("cloud") or {}))
+    cloud = {"enabled": False, "url": "https://1.2.3.4:8900", "token": "t" * 20,
+             "site_name": "s", "site_type": "air"}
+    r = c.post("/api/settings", json={"cloud": dict(cloud, tls_fingerprint="zz:11")})
+    assert r.status_code == 400
+    fp = ":".join(["AB"] * 32)
+    assert c.post("/api/settings", json={"cloud": dict(cloud, tls_fingerprint=fp)}).status_code == 200
+    assert server.CFG["cloud"]["tls_fingerprint"] == "ab" * 32
+    # config.yaml 里写成带冒号/大写的指纹：留空 token 保存不能被当成"指纹改了"
+    server.CFG["cloud"]["tls_fingerprint"] = fp
+    assert c.post("/api/settings", json={"cloud": dict(cloud, token="", tls_fingerprint=fp)}
+                  ).status_code == 200
+
+
 def test_csv_formula_injection_is_neutralized(app, monkeypatch):
     server, c = app
     monkeypatch.setattr(server.db, "customer_report", lambda conn, h: [

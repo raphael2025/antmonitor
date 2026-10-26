@@ -19,17 +19,35 @@ AntMonitor ist **lokales** Farm-Monitoring & Ops: Überblick, zuverlässige Alar
 
 ## Deployment
 
-**Ubuntu:** `sudo bash install.sh`（安装/更新/修复/卸载/重置账号）
+**Ubuntu in einer Zeile** (git/Python vorher nicht nötig):
 
 ```bash
-git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp config.example.yaml config.yaml
-python server.py
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
 ```
 
-Windows: `run.bat`. Siehe [SECURITY](../SECURITY.md).
+Installiert Pakete, lädt den Code (git oder Quell-Tarball), legt venv und Konfiguration an, fragt das admin-Passwort ab
+(Enter = generieren) und startet den Dienst `antmonitor`. Panel: `http://<IP>:8800`.
+Direkt an die Cloud anbinden: `… | sudo bash -s -- --connect-code - --site-name Standort-1`
+(Code im Cloud-Panel „🔌 Standorte anbinden“). Erneut ausführen = Menü (Update/Reparatur/Deinstallation/Konto).
+Langsames GitHub: `GH_PROXY=<Mirror-Präfix>/` (nur vertrauenswürdige Mirrors).
+
+**Windows in einer Zeile** (PowerShell, ohne Admin):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+```
+
+Code nach `%LOCALAPPDATA%\AntMonitor\antmonitor`, Desktop-Verknüpfung, Start von `run.bat`.
+
+**Danach:** ⚙ Segmente → Subnetze → speichern & scannen. Cloud: ☁ Cloud-Meldung → **Verbindungscode** einfügen →
+Übernehmen → Standortname → aktivieren → speichern. „🔌 Verbindung testen“ und die Statuszeile zeigen, ob gemeldet wird.
+Eine Cloud ohne Domain (`https://IP:Port`) braucht den **Zertifikat-Fingerabdruck**; er steckt im Code.
+
+**Weniger Fehlalarme auf großen Standorten:** Offline/Segment/Standort und Null-Hashrate werden in der nächsten Runde
+bestätigt (`alerts.offline_confirm_sec`, `zero_confirm_sec` = 240 s), Übertemperatur nach 2 Runden, ein Massenausfall
+ergibt einen einzigen Standort-Alarm. Hängt die Miner-Weboberfläche, wird die Hashrate über Port 4028 gelesen.
+
+Siehe [SECURITY](../SECURITY.md).
 
 ---
 

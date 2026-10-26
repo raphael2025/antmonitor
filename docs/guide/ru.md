@@ -19,17 +19,35 @@ AntMonitor — **локальный** мониторинг и управлени
 
 ## Развёртывание
 
-**Ubuntu:** `sudo bash install.sh`（安装/更新/修复/卸载/重置账号）
+**Ubuntu, одной командой** (git и Python заранее не нужны):
 
 ```bash
-git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp config.example.yaml config.yaml
-python server.py
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
 ```
 
-Windows: `run.bat`. См. [SECURITY](../SECURITY.md).
+Ставит зависимости, скачивает код (git или архив исходников), создаёт venv и конфиг, спрашивает пароль admin
+(Enter = сгенерировать) и запускает службу `antmonitor`. Панель: `http://<IP>:8800`.
+Сразу подключить к облаку: `… | sudo bash -s -- --connect-code - --site-name Площадка-1`
+(код — в облачной панели «🔌 Подключение площадок»). Повторный запуск — меню (обновить/починить/удалить/сбросить пароль).
+Медленный GitHub: `GH_PROXY=<префикс зеркала>/` (только доверенные зеркала).
+
+**Windows, одной командой** (PowerShell, без прав администратора):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+```
+
+Код в `%LOCALAPPDATA%\AntMonitor\antmonitor`, ярлык на рабочем столе, запуск `run.bat` (Python и зависимости ставятся сами).
+
+**После установки:** ⚙ Сегменты → подсети → сохранить и сканировать. Облако: ☁ Отправка в облако → вставить **код подключения** →
+«Применить» → имя площадки → включить → сохранить. «🔌 Проверить связь» и строка статуса показывают, работает ли отправка.
+Для облака без домена (`https://IP:порт`) нужен **отпечаток сертификата** — он уже в коде подключения.
+
+**Меньше ложных аварий на крупных площадках:** офлайн/сегмент/вся площадка и нулевой хешрейт подтверждаются
+в следующем цикле (`alerts.offline_confirm_sec`, `zero_confirm_sec` = 240 с), перегрев — 2 цикла подряд,
+массовое отключение — одна авария «вся площадка» вместо десятков. Если завис веб-интерфейс майнера, хешрейт берётся с порта 4028.
+
+См. [SECURITY](../SECURITY.md).
 
 ---
 

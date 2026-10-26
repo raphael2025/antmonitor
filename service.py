@@ -62,7 +62,7 @@ class MonitorService:
         self._container_thread_lock = threading.Lock()
         self._trigger_lock = threading.Lock()   # 手动扫描触发的判重(防两个请求都说"已启动")
         self._container_miss = {}     # 集装箱连续未采到次数(二次确认离线，防一次丢包误报)
-        self._container_miss_n = 2
+        self._container_miss_n = 3    # 默认值；alerts.container_offline_rounds 可改
         self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数、刚重启的机器)
         self._restore_rebooting()
         self._last_full = 0.0         # 上次全网发现完成的 monotonic 时刻
@@ -481,8 +481,10 @@ class MonitorService:
         prev_hr = {r["ip"]: r.get("hr_rt") for r in prev_recs}
         # 零算力/读不到算力只在"上一轮还有算力"时才算疑似：限电休眠、密码不对的一批机器
         # 一直是 0/None，每轮都算疑似会白白重探，数量一多还会顶破下面的熔断
+        # 端口连得上但接口没应答(alive)的也重探：宽松超时下往往能读到数据
         suspects = [r["ip"] for r in miners if r["ip"] in prev_online
                     and (r["status"] == "offline"
+                         or (r["status"] == "unknown" and r.get("alive"))
                          or (r.get("hr_rt") in (None, 0) and (prev_hr.get(r["ip"]) or 0) > 0))]
         if not suspects:
             return miners
@@ -508,6 +510,7 @@ class MonitorService:
         cc["data_timeout"] = max(sc.get("data_timeout", 2.0),
                                  sc.get("reconfirm_data_timeout", 5.0))
         cc["liveness_gate"] = False    # 不走判活闸门，给慢响应机器充分时间
+        cc["alive_probe"] = True       # 接口都没应答时补测 80/4028：连得上就不算离线
         cc["max_pps"] = sc.get("max_pps", 100)   # 保留限速，护住三层 ARP/CoPP
         def rank(r):   # 在线且有算力 > 在线 > 未探测 > 离线
             if r["status"] == "online":
@@ -519,7 +522,12 @@ class MonitorService:
         sus = set(suspects)   # 提到循环外：在推导式里每个元素重建一次集合，5000 台是 O(N²)
         fixed = {r["ip"]: r for r in miners if r["ip"] in sus}
         remaining = suspects
+        # 每轮重探前先等一会儿：紧接着主扫描立刻重探，碰上的还是同一波网络抖动
+        # (交换机重启/STP 收敛/ARP 表刷新通常持续十几秒到一两分钟)，等于没确认
+        delay = max(0.0, float(sc.get("reconfirm_delay_sec", 20) or 0))
         for _ in range(max(1, int(sc.get("reconfirm_passes", 1)))):
+            if delay and self._stop.wait(delay):
+                return miners
             if gen is not None and gen != self._scan_gen:
                 return miners
             self._beat(gen)
@@ -610,6 +618,10 @@ class MonitorService:
             for r in kept:
                 if r["ip"] in pools_by_ip:
                     r["pools"] = pools_by_ip[r["ip"]]
+            alive_ips = {r["ip"] for r in miners if r.get("alive")}
+            for r in kept:   # alive 同理不落库：告警层靠它区分"连得上但读不到"与扫描超时
+                if r["ip"] in alive_ips:
+                    r["alive"] = True
             self._publish(sid, ts, kind, kept)
             online_recs = [r for r in miners if r["status"] == "online"]
             online_ips = {r["ip"] for r in online_recs}
@@ -801,7 +813,9 @@ class MonitorService:
                     miss[ip] = 0
                 else:
                     miss[ip] = miss.get(ip, 0) + 1
-                    if miss[ip] >= self._container_miss_n:
+                    need = int((self.cfg.get("alerts") or {}).get("container_offline_rounds")
+                               or self._container_miss_n)
+                    if miss[ip] >= need:
                         confirmed_off.append(ip)
             for ip in list(miss):   # 清理已踢除的箱
                 if ip not in known:

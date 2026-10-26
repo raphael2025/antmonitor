@@ -40,11 +40,14 @@ DEFAULTS = {
     "scan": {
         "segments": [], "host_start": 1, "host_end": 254,
         "base": "172.16", "lo": 100, "hi": 160,
-        "online_timeout": 2.5, "data_timeout": 5.0,
+        # 单台判活/在线判定统一等 3 秒：扫一轮会慢一点，但慢响应的矿机不会被当成掉线乱报警
+        "online_timeout": 3.0, "data_timeout": 5.0,
         "workers": 300, "discovery_workers": 300,
-        "liveness_gate": True, "gate_timeout": 2.0, "max_pps": 300,
+        "liveness_gate": True, "gate_timeout": 3.0, "max_pps": 300,
         "reconfirm_enabled": True, "reconfirm_online_timeout": 3.0,
         "reconfirm_data_timeout": 6.0, "reconfirm_passes": 2, "reconfirm_max": 800,
+        # 每轮二次确认前等几秒：紧接着重探碰上的还是同一波网络抖动
+        "reconfirm_delay_sec": 20,
         "fetch_worker": True,
         "container_offline_kick_sec": 86400,
         "roster_retention_days": 7,
@@ -70,6 +73,16 @@ DEFAULTS = {
         "low_hashrate_min_peers": 5,    # 同型号在线机少于此数不做基线(样本太少不可信)
         "overheat_c": 95,               # 芯片温 ≥ 此值 → 高温告警；0=关
         "overheat_clear_c": 90,         # 回落到此值以下才消警(滞回，防临界抖动刷屏)
+        "overheat_rounds": 2,           # 连续 N 轮超温才报(防单颗传感器跳值)
+        "overheat_fast_margin_c": 5,    # 超过阈值这么多度当轮就报；0=关
+        # 跨轮次确认(秒)：持续这么久仍成立才报，过滤交换机重启/网页卡顿/换池瞬间 0 算力。
+        # 默认 240 ≈ 跨到下一轮巡检；0=当轮即报(旧行为)
+        "offline_confirm_sec": 240,     # 单机掉线 / 整段掉线 / 全场掉线
+        "zero_confirm_sec": 240,        # 零算力
+        "unresponsive_rounds": 3,       # 端口通但接口一直读不到：连续 N 轮才按掉线报
+        # 全场级事件：已知真机掉线比例 ≥ ratio 且台数 ≥ min(跨 2 个以上网段) → 只报一条全场掉线
+        "site_down_ratio": 0.5, "site_down_min": 50,
+        "container_offline_rounds": 3,  # 集装箱控制器连续 N 轮(每轮约10秒)没采到才判离线
         "container_faults_ignore": [],
         "container_supply_pressure_min": 0,
         "container_return_pressure_min": 0,
@@ -168,6 +181,9 @@ def _merge(defaults, override):
     return out
 
 
+MIN_PROBE_TIMEOUT = 3.0
+
+
 def _validate(cfg):
     """把明显不合法的值纠正到安全范围并记日志(宁可跑起来也不要静默跑歪)。"""
     warn = []
@@ -215,9 +231,12 @@ def _validate(cfg):
     clamp("control", "max_batch", 1, 100000, int)
     # 超时类：0/负数会一路传到 socket.settimeout()/requests(timeout=)，
     # miner_core.tcp_open() 拿到负数直接抛未捕获 ValueError，整轮扫描线程挂掉。
-    for k in ("online_timeout", "data_timeout", "gate_timeout",
-              "reconfirm_online_timeout", "reconfirm_data_timeout"):
+    for k in ("data_timeout", "reconfirm_data_timeout"):
         clamp("scan", k, 0.1, 120)
+    # 判定"在不在线"的超时不低于 3 秒(老配置里的 2.0/2.5 也一起抬上来)：
+    # 设得太短，矿机网页稍慢一点就被判离线，大场地误报的主要来源之一
+    for k in ("online_timeout", "gate_timeout", "reconfirm_online_timeout"):
+        clamp("scan", k, MIN_PROBE_TIMEOUT, 120)
     clamp("control", "timeout", 0.1, 300)
     clamp("cloud", "timeout", 0.1, 300)
     clamp("cloud", "interval", 5, 86400, int)
@@ -236,6 +255,15 @@ def _validate(cfg):
     clamp("alerts", "overheat_clear_c", 0, 200)
     clamp("alerts", "low_hashrate_ratio", 0, 1)
     clamp("alerts", "segment_down_ratio", 0, 1)
+    clamp("alerts", "site_down_ratio", 0, 1)
+    clamp("alerts", "site_down_min", 1, 1000000, int)
+    clamp("alerts", "overheat_rounds", 1, 100, int)
+    clamp("alerts", "overheat_fast_margin_c", 0, 100)
+    clamp("alerts", "offline_confirm_sec", 0, 86400, int)
+    clamp("alerts", "zero_confirm_sec", 0, 86400, int)
+    clamp("alerts", "unresponsive_rounds", 1, 1000, int)
+    clamp("alerts", "container_offline_rounds", 1, 100, int)
+    clamp("scan", "reconfirm_delay_sec", 0, 300)
     clamp("alerts", "reject_pct", 0, 100)
     clamp("alerts", "reject_min_shares", 1, 1000000, int)
     clamp("alerts", "zero_grace_sec", 0, 86400, int)
@@ -413,6 +441,10 @@ def load_segments(cfg):
     if segs:
         return segs, hs, he
     base, lo, hi = sc.get("base", "172.16"), int(sc.get("lo", 100)), int(sc.get("hi", 160))
+    if not str(base or "").strip():
+        # 新装(config.example.yaml 里 base 留空)：没在网页填网段之前不扫描，免得一装好就对
+        # 172.16.100~160 这 1.5 万个地址发探测——那多半不是这个场地的网段
+        return [], hs, he
     return [f"{base}.{c}" for c in range(lo, hi + 1)], hs, he
 
 
@@ -431,15 +463,30 @@ SETTINGS_FILE = _file_from_env("MINER_SETTINGS", "settings.json")
 _SETTINGS_LOCK = threading.RLock()
 
 
+class SettingsError(RuntimeError):
+    """settings.json 存在但读不了/是半截：写操作绝不能把它当空文件再整份覆盖回去
+    (会丢掉云端 token、重启参数等全部网页设置)。"""
+
+
+def _read_settings():
+    if not os.path.exists(SETTINGS_FILE):
+        return {}
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError) as e:
+        raise SettingsError(f"settings.json 读取失败({e})：常见原因是用 sudo/root 改过它、"
+                            f"服务账号读不了，改回属主后重试") from e
+    return d if isinstance(d, dict) else {}
+
+
 def load_settings():
     with _SETTINGS_LOCK:
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (OSError, ValueError) as e:
-                log.warning("settings.json 读取失败，忽略: %s", e)
-        return {}
+        try:
+            return _read_settings()
+        except SettingsError as e:
+            log.warning("%s；本次按空设置处理", e)
+            return {}
 
 
 def save_settings(s):
@@ -459,17 +506,28 @@ def update_settings(patch):
     锁内完成，多个管理员并发保存时不会互相覆盖。新代码请一律用这个函数。
     """
     with _SETTINGS_LOCK:
-        merged = {**load_settings(), **(patch or {})}
+        merged = {**_read_settings(), **(patch or {})}   # 读失败直接抛错，不覆盖原文件
         _atomic_json(SETTINGS_FILE, merged)
         return merged
 
 
 def _atomic_json(path, data):
-    """先写 .tmp 再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。"""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    """先写 .tmp 再 os.replace：断电/崩溃也不会留下半截 JSON 让下次启动读不出配置。
+    以 0600 创建：settings.json 里有云端上报 token，同机其它用户不该读得到。"""
+    # mkstemp：随机名 + O_EXCL 新建，不会顺着别人预先放好的符号链接去改写别的文件
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 _INT_SETTINGS = ("scan_interval", "full_interval", "container_interval",

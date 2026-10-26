@@ -33,9 +33,15 @@ def conn():
     c.close()
 
 
+# 大多数用例测的是"判定逻辑本身"，按单轮立即判定来写；跨轮次确认(防误报)由
+# test_false_alarm.py 用默认值专门覆盖
+IMMEDIATE = {"alerts": {"offline_confirm_sec": 0, "zero_confirm_sec": 0, "overheat_rounds": 1},
+             "scan": {"reconfirm_delay_sec": 0}}
+
+
 @pytest.fixture
 def cfg():
-    return appconfig._merge(appconfig.DEFAULTS, {})
+    return appconfig._merge(appconfig.DEFAULTS, IMMEDIATE)
 
 
 def rec(ip, status="online", hr=100.0, model="S19", **kw):

@@ -298,3 +298,15 @@ def test_settings_json_overrides_are_listed():
     cfg = appconfig._merge(appconfig.DEFAULTS, {})
     over = appconfig.settings_overrides(cfg, {"reboot_enabled": True, "scan_interval": 300})
     assert over == ["reboot_enabled: False → True"]
+
+
+def test_unreadable_settings_json_is_not_overwritten(tmp_path, monkeypatch):
+    """settings.json 是半截/读不了：保存要报错，不能当空文件把云端 token 等全部覆盖掉。"""
+    import pytest
+    p = tmp_path / "settings.json"
+    p.write_text('{"cloud": {"token": "keep-me"}, "x": ', encoding="utf-8")
+    monkeypatch.setattr(appconfig, "SETTINGS_FILE", str(p))
+    with pytest.raises(appconfig.SettingsError):
+        appconfig.update_settings({"scan_interval": 300})
+    assert p.read_text(encoding="utf-8").startswith('{"cloud": {"token": "keep-me"}')
+    assert appconfig.load_settings() == {}   # 读路径照常降级，服务能起来

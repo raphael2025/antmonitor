@@ -21,41 +21,86 @@ AntMonitor 是矿场**局域网**批量监控与运维系统：看清全场算�
 
 ## 部署
 
-**环境**：Python 3.8+；能访问矿机网段。
+**环境**：Ubuntu 20.04+ 或 Windows 10/11；监控机能访问矿机网段。不需要提前装 git / Python。
 
-**Ubuntu 一键（推荐）**：在仓库根目录执行 `sudo bash install.sh`  
-菜单可选语言，支持：首次安装 · 更新 · 修复 · 卸载 · 重置用户名和密码。默认目录 `/opt/antmonitor`，服务名 `antmonitor`。
+### Ubuntu：一行命令装好（推荐）
 
 ```bash
-# 也可手动
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
+```
+
+自动完成：装依赖 → 下载代码（有 git 用 git，没有就下源码包）→ 建虚拟环境 → 生成配置 → 设置 admin 密码
+（终端里输入；直接回车会自动生成强密码并在最后显示）→ 注册 systemd 服务 `antmonitor` 并启动。
+默认目录 `/opt/antmonitor`，面板 `http://<监控机IP>:8800`。
+
+**安装时顺便接入云端**（接入码在云端面板右上「🔌 场地接入」里复制；`-` 表示运行后按提示粘贴，接入码含 token，不写在命令里就不会被 `ps`/命令历史看到）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code - --site-name 内蒙一场
+```
+
+**再跑一次同样的命令**：出管理菜单（更新 / 修复 / 卸载 / 重置用户名和密码）；没有终端（自动化）时直接更新。
+也可直接指定：`… | sudo bash -s -- update`（或 `repair` / `uninstall` / `reset-user`）。
+
+GitHub 访问慢：`curl -fsSL <镜像前缀>/https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo GH_PROXY=<镜像前缀>/ bash`
+（镜像能看到并篡改下载内容，只用信得过的）。连不上 GitHub：把源码 ZIP 拷到监控机，解压后在目录里
+`sudo bash install.sh`，直接用这份源码安装（Python 依赖仍需能访问 PyPI 或国内镜像）。
+
+### Windows：一行命令装好
+
+在 PowerShell（不需要管理员）里执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+```
+
+下载源码到 `%LOCALAPPDATA%\AntMonitor\antmonitor`、在桌面建「AntMonitor」快捷方式并启动。首次启动自动：
+没有 Python 就从 python.org 下载并验证签名后按当前用户安装（不需要管理员、不改 PATH）→ 建 `.venv` 装依赖 →
+生成配置 → 提示设置 admin 密码 → 转成 git 部署（没装 Git 会下载校验过的便携 Git），之后在网页上一键更新。
+以后双击桌面快捷方式启动；窗口里按 Ctrl+C 停止。也可以照旧下载 ZIP 解压后双击 `run.bat`。
+
+首次安装、依赖变化时需要联网；Python 安装日志在 `%LOCALAPPDATA%\AntMonitor\python-install.log`。
+手动改密码：在项目目录 CMD 执行 `.venv\Scripts\python.exe auth.py passwd admin`。
+
+### 装好以后
+
+1. 浏览器打开面板，用 admin 登录 → 右上「⚙ 网段」填矿机网段 → 保存并全网扫描。
+2. 接入云端：同一页「☁ 云端上报」→ 把云端给的**接入码**粘贴进去点「填入」→ 填场地名 → 勾选启用 → 保存。
+   点「🔌 测试连接」立刻知道地址 / 证书 / token 对不对；下方一直显示上报状态（最近一次成功时间或失败原因），
+   不用登机器看日志。云端没有域名（`https://IP:端口`）时必须带**证书指纹**，接入码里已经包含。
+3. 上报 token 保存后不再明文显示（只显示末 4 位），输入框留空保存 = 沿用原 token。
+
+<details><summary>手动安装（开发/调试）</summary>
+
+```bash
 git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.yaml config.yaml    # 改网段、登录账号
+python auth.py passwd admin           # 设置 admin 密码
 python server.py                      # http://<IP>:8800
 ```
+</details>
 
-**Windows**：
-
-1. 在 Windows 10 / 11 将项目 ZIP 完整解压到本地可写目录（也可 `git clone`），双击 `run.bat`。
-2. 没有可用 Python 时，自动从 python.org 下载并验证官方安装包的签名，按当前用户安装到
-   `%LOCALAPPDATA%\AntMonitor\Python313`。不需要管理员权限，也不用修改 PATH 或重新打开窗口。
-   已有可用的标准 Python 3.8–3.14 会复用；没有加进 PATH 的常规 Python 安装也会通过注册表检测。
-3. 自动创建 `.venv`、安装 `requirements.txt` 中全部依赖、生成配置，按提示设置 admin 密码。
-4. 登录面板并配置矿机网段；已有的配置和密码不会被覆盖。
-
-首次安装、依赖变化或依赖损坏时需要联网；正常重复启动不会每次下载依赖。
-暂不使用 Python 3.15+ 或自由线程版，依赖只安装预编译 wheel，避免要求用户安装 C++ 编译工具。
-曾使用不兼容版本的 `.venv` 会自动保留到 `.venv.incompatible-*` 并重新创建；配置、密码和数据库不会被覆盖。
-启动失败时窗口保留报错，修复后再次双击即可。按 Ctrl+C 停止服务，不会触发自动重启。
-Python 安装失败时，可查看 `%LOCALAPPDATA%\AntMonitor\python-install.log`；网络无法访问
-python.org 或 PyPI 时需要恢复网络再试，或手动安装 Python 和依赖。
-需要手动设置密码时，在项目目录的 CMD 执行 `.venv\Scripts\python.exe auth.py passwd admin`。
-ZIP 部署首次启动时会自动转成 git 部署（没装 Git 会下载校验过的便携 Git），之后可在网页上更新；ZIP 里的文件被改过时无法识别版本，需改用 `git clone`。
-Windows 启动守护代码更新后，关闭旧启动窗口再双击即可使用新的守护逻辑。
 安全清单：[SECURITY](../SECURITY.md)。
 
-打开面板后用 admin 配置网段并触发一次全网发现。
+### 大场地防误报（默认已开启）
+
+交换机重启、STP 收敛、ARP 表刷新、矿机网页服务卡顿、换矿池瞬间读到 0 算力，通常一两分钟就过去。
+现在这些都要**跨轮次确认**才报，`config.yaml > alerts` 可调：
+
+| 项 | 默认 | 含义 |
+|---|---|---|
+| `offline_confirm_sec` | 240 | 掉线 / 整段掉线 / 全场掉线持续这么久（≈下一轮巡检）仍成立才报；0=当轮即报 |
+| `zero_confirm_sec` | 240 | 零算力持续这么久才报 |
+| `overheat_rounds` | 2 | 连续 N 轮超温才报；0℃/负数/超过 150℃ 的读数视为坏传感器直接丢弃 |
+| `unresponsive_rounds` | 3 | 端口连得上但接口一直读不到（控制板卡死）连续 N 轮才按掉线报 |
+| `site_down_ratio` / `site_down_min` | 0.5 / 50 | 全场过半已知机器同时掉线 → 只报一条「全场大面积掉线」，不逐段逐台刷屏 |
+| `container_offline_rounds` | 3 | 集装箱控制器连续 N 轮（每轮约 10 秒）没采到才判离线 |
+| `scan.reconfirm_delay_sec` | 20 | 二次确认每轮重探前先等几秒，避开同一波网络抖动 |
+| `scan.online_timeout` / `gate_timeout` | 3 | 单台判活/在线判定最多等 3 秒（低于 3 按 3）：扫描慢一点，但慢响应的矿机不会被当成掉线 |
+
+另外：矿机网页（lighttpd/CGI）卡住但挖矿程序还在跑时，改从 4028 端口取算力，不再当成掉线。
 
 ---
 

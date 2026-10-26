@@ -21,23 +21,57 @@ For hosting / colocation — one Windows or Ubuntu box on site.
 
 ## Deploy
 
-**Needs:** Python 3.8+, reachability to miner subnets.
+**Needs:** Ubuntu 20.04+ or Windows 10/11 that can reach the miner subnets. No git/Python needed beforehand.
 
-**Ubuntu one-click (recommended):** from the repo root run `sudo bash install.sh`  
-Pick a language, then: Install · Update · Repair · Uninstall · Reset username & password. Default path `/opt/antmonitor`, unit `antmonitor`.
+**Ubuntu, one line (recommended):**
 
 ```bash
-# manual
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
+```
+
+Installs packages, fetches the code (git if available, otherwise a source tarball), creates the venv and config,
+asks for the admin password (Enter = generate a strong one, shown at the end) and starts the `antmonitor`
+systemd service. Panel: `http://<host>:8800`. Connect to the cloud during install with the code from the cloud
+panel (🔌 Site onboarding): `… | sudo bash -s -- --connect-code - --site-name Site-1`.
+Run the same command again for the menu (update / repair / uninstall / reset account), or pass `update` etc.
+Slow GitHub: set `GH_PROXY=<mirror prefix>/` (trusted mirrors only). No GitHub access: unzip the source and run `sudo bash install.sh` inside it (Python packages still need PyPI or a mirror).
+
+**Windows, one line** (PowerShell, no admin needed):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+```
+
+Downloads to `%LOCALAPPDATA%\AntMonitor\antmonitor`, adds a desktop shortcut and starts `run.bat`
+(installs Python/venv/deps on first run and enables web updates). The old way — unzip and double-click `run.bat` — still works.
+
+**After install:** log in as admin → ⚙ Segments → add subnets → save & full scan. Cloud: ☁ Cloud reporting →
+paste the **connect code** → Apply → site name → enable → save. "🔌 Test connection" checks URL/certificate/token,
+and the last report status (time of last success or the reason it failed) is shown right there.
+A cloud without a domain (`https://IP:port`) needs the **certificate fingerprint**; the connect code includes it.
+Saved tokens are never shown again in full (last 4 chars only); leave the field empty to keep the token.
+
+<details><summary>Manual install</summary>
+
+```bash
 git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp config.example.yaml config.yaml
+python auth.py passwd admin
 python server.py
 ```
+</details>
 
-Windows: `run.bat`. Security: [SECURITY](../SECURITY.md).
+Security: [SECURITY](../SECURITY.md).
 
-As admin, configure subnets and run a full discovery once.
+**Fewer false alarms on large sites (on by default).** Switch reboots, STP/ARP churn, a hung miner web UI or a 0 reading
+while switching pools usually pass within a minute or two, so alerts now need confirmation across rounds
+(`config.yaml > alerts`): `offline_confirm_sec: 240` (offline / segment / site-wide), `zero_confirm_sec: 240`,
+`overheat_rounds: 2` (readings ≤0 °C or >150 °C are dropped as broken sensors), `unresponsive_rounds: 3`
+(port open but API silent), `site_down_ratio: 0.5` + `site_down_min: 50` (one "site-wide outage" alert instead of
+dozens), `container_offline_rounds: 3`, `scan.reconfirm_delay_sec: 20`; each probe waits up to 3 s (`scan.online_timeout`/`gate_timeout`, values below 3 are raised to 3). If the miner web UI hangs while cgminer keeps
+mining, hashrate is read from port 4028 instead of reporting it offline.
 
 ---
 
