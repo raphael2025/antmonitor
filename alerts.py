@@ -268,11 +268,14 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     active_segs = {a["ip"][:-2] for a in db.active_alerts_by_type(conn, "segment_down")
                    if a["ip"].endswith(".x")}
     clear_ratio = seg_ratio * 0.75
+    site_active = bool(db.active_alert(conn, SITE_KEY, "site_down"))
     for seg, off in seg_off.items():
         tot = seg_total.get(seg, 0)
         # 回差：超过 seg_ratio 才报；已在报的降到 seg_ratio×0.75 以下才消。否则离线率在阈值
-        # 附近来回时每轮"消—报"一次(整段事件 force 不受冷却)，值班群被刷屏
-        if seg in active_segs:
+        # 附近来回时每轮"消—报"一次(整段事件 force 不受冷却)，值班群被刷屏。
+        # 全场告警在报时同样按回差判：整段告警已并进全场告警(不在 active_segs 里了)，
+        # 不这样的话部分恢复到两个比例之间，全场告警一消，段内单机掉线立刻刷屏
+        if seg in active_segs or site_active:
             is_down = tot > 0 and off / tot >= clear_ratio
         else:
             is_down = off >= seg_min and tot > 0 and off / tot >= seg_ratio
@@ -284,7 +287,6 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     # 没整段掉线的网段里的单机告警照常报，不跟着静音 ——
     tot_all, off_all = sum(seg_total.values()), sum(seg_off.values())
     unk_all = sum(seg_unknown.values())
-    site_active = bool(db.active_alert(conn, SITE_KEY, "site_down"))
     if not site_ratio or tot_all <= 0:
         site_raw = False
     elif site_active:

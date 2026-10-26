@@ -276,3 +276,21 @@ def test_segment_alert_merges_into_site_alert(conn, dcfg, clock):
     _round(conn, dcfg, clock, two, st)
     assert db.active_alerts_by_type(conn, "site_down")
     assert not db.active_alerts_by_type(conn, "segment_down")
+
+
+def test_site_alert_keeps_segment_hysteresis_on_partial_recovery(conn, dcfg, clock):
+    """全场告警在报时两段各恢复到 50% 离线(介于 0.45 和 0.6 之间)：全场告警不消，
+    也不会因为全场告警消掉而让段内单机掉线一下子刷出来。"""
+    dcfg["alerts"]["site_down_min"] = 10
+    st = {}
+    good = _seg(20) + _seg(20, "10.0.2") + _seg(4, "10.0.3")
+    _round(conn, dcfg, clock, good, st)
+    two = _seg(20, status="offline") + _seg(20, "10.0.2", status="offline") + _seg(4, "10.0.3")
+    _round(conn, dcfg, clock, two, st)
+    _round(conn, dcfg, clock, two, st)
+    assert db.active_alerts_by_type(conn, "site_down")
+    half = (_seg(10, status="offline") + [rec(f"10.0.1.{i}") for i in range(11, 21)]
+            + [rec(f"10.0.2.{i}", status="offline") for i in range(1, 11)]
+            + [rec(f"10.0.2.{i}") for i in range(11, 21)] + _seg(4, "10.0.3"))
+    assert _round(conn, dcfg, clock, half, st) == []      # 全场离线 20/44 ≥ 0.375
+    assert db.active_alerts_by_type(conn, "site_down")
