@@ -138,6 +138,9 @@ body.viewer #btnFull, body.viewer #btnQuick, body.viewer #btnScanContainers { di
 .seg-host input { width: 70px; background: #0d1117; border: 1px solid #30363d; color: #e6e6e6; padding: 6px 8px; border-radius: 5px; }
 .seg-host input[type=text] { width: 260px; }
 .seg-host input[type=checkbox] { width: auto; }
+/* 云端上报：地址/接入码/token/指纹都是长串，占满整行 */
+#cloudCode, #cloudUrl, #cloudToken, #cloudFp { flex: 1; min-width: 0; width: auto; }
+#cloudFp { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
 .seg-host select { background: #0d1117; border: 1px solid #30363d; color: #e6e6e6; padding: 6px 8px; border-radius: 5px; }
 .seg-divider { border: 0; border-top: 1px solid #30363d; margin: 12px 0; }
 #cloudSiteId { color: #58a6ff; }
