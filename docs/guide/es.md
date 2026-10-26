@@ -19,17 +19,35 @@ AntMonitor es monitoreo y operación **en LAN**: visibilidad del parque, alertas
 
 ## Despliegue
 
-**Ubuntu:** `sudo bash install.sh`（安装/更新/修复/卸载/重置账号）
+**Ubuntu, en una línea** (no hace falta git ni Python previos):
 
 ```bash
-git clone https://github.com/raphael2025/antmonitor.git && cd antmonitor
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp config.example.yaml config.yaml
-python server.py
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
 ```
 
-Windows: `run.bat`. Ver [SECURITY](../SECURITY.md).
+Instala dependencias, descarga el código (git o tarball), crea venv y configuración, pide la contraseña de admin
+(Enter = generarla) y arranca el servicio `antmonitor`. Panel: `http://<IP>:8800`.
+Conectar a la nube en la instalación: `… | sudo bash -s -- --connect-code 'AMC1-…' --site-name Sitio-1`
+(código en el panel de la nube «🔌 Alta de sitios»). Volver a ejecutar = menú (actualizar/reparar/desinstalar/restablecer).
+GitHub lento: `GH_PROXY=<prefijo de espejo>/` (solo espejos de confianza).
+
+**Windows, en una línea** (PowerShell, sin administrador):
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+```
+
+Código en `%LOCALAPPDATA%\AntMonitor\antmonitor`, acceso directo en el escritorio y arranque de `run.bat`.
+
+**Después:** ⚙ Segmentos → subredes → guardar y escanear. Nube: ☁ Envío a la nube → pegar el **código de conexión** →
+Aplicar → nombre del sitio → activar → guardar. «🔌 Probar conexión» y la línea de estado muestran si el envío funciona.
+Una nube sin dominio (`https://IP:puerto`) requiere la **huella del certificado**; ya va en el código.
+
+**Menos falsas alarmas en sitios grandes:** desconexión/segmento/sitio completo y hashrate cero se confirman en la
+ronda siguiente (`alerts.offline_confirm_sec`, `zero_confirm_sec` = 240 s), sobretemperatura 2 rondas seguidas y una
+caída masiva da una sola alarma de sitio. Si la web del minero se cuelga, el hashrate se lee por el puerto 4028.
+
+Ver [SECURITY](../SECURITY.md).
 
 ---
 

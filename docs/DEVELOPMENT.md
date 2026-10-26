@@ -59,6 +59,7 @@
 | `db.py` | SQLite 存储层（共享连接 + `RLock`） | `init_db` `save_scan` `roster_ips` `upsert_known_miners` `raise/resolve_alert` `active_alerts_by_type` `customer_report` `prune` |
 | `alerts.py` | 告警规则评估 + 恢复 + Telegram | `evaluate` `evaluate_containers` `_push_batch` |
 | `cloud_alert_summary.py` | 活跃告警按类型+客户聚合（只读，只给云端上报用，不含单机IP） | `build` |
+| `cloud_report.py` | 云端上报线程；上报状态(`status`)、测试连接(`test`→`/api/ingest/ping`)、证书指纹钉扎(`_PinnedAdapter`) | `start` `status` `test` `normalize_fingerprint` |
 | `control.py` | 远程命令（写设备，双固件） | `run_batch` `run_one` `_stock` `_uniplus` |
 | `auth.py` | 登录 + RBAC + pbkdf2 + 失败限流 | `login` `current` `has_role` `hash_password` `locked` |
 | `service.py` | 扫描编排 + 后台调度线程 | `MonitorService` `_do_scan` `_loop` `_container_loop` `_watchdog_loop` `_reconfirm` `scan_full` |
@@ -96,7 +97,8 @@
 ### 5.1 扫描周期 `service._do_scan`
 1. `_scan_lock.acquire(blocking=False)`——拿不到锁（已有扫描或集装箱循环在跑）直接 `return None`。
 2. `miner_core.scan(ips, ...)`：线程池并发 `probe`，`RateLimiter` 限 `max_pps`。
-3. `_reconfirm(miners)`：对"上次在线、本次掉线/零算力"的机器用宽松超时（连接2s/数据5s、关闭判活闸门、**保留 max_pps**）重探，恢复的覆盖回来——治网络抖动误判。`reconfirm_max` 上限防大面积掉线时无限速冲击三层。
+3. `_reconfirm(miners)`：对"上次在线、本次掉线/零算力/连得上但读不到(alive)"的机器，每轮先等 `reconfirm_delay_sec`(默认20s，避开同一波抖动)，再用宽松超时（关闭判活闸门、开 `alive_probe` 补测 80/4028、**保留 max_pps**）重探，恢复的覆盖回来——治网络抖动误判。`reconfirm_max` 上限防大面积掉线时无限速冲击三层。
+   探测层(`miner_core.probe`)：网页接口全没应答但端口连得上 → 先用 4028 `summary` 兜底取算力；仍读不到返回 `status=unknown` + `alive=True`(不落库字段，`_do_scan` 带回 kept)。
 4. `save_scan(keep_ips=roster)`：只落库在线机 + 名册内机（见 §6）。
 5. `upsert_known_miners`：在线机写回名册。
 6. `last_finished` 立即更新（看门狗据此判活），后续各步包 try/except 不互相影响。
@@ -106,12 +108,14 @@
 ### 5.2 告警状态机 `alerts.evaluate`
 - 对比**同类**上一次扫描（`prev_scan_id(kind)`，避免 quick/full 混排污染基准）。
 - **segment_down**：基于**当前绝对离线率**（不是"本轮新跌落"），分母只数 `roster` 内真机；离线率回落→恢复，但**只对"本轮有样本(seg_total>0)"的段判恢复**（整段掉出名册时保持告警，防长期断电被误恢复）。
-- **offline**：维修中 / 被网段事件覆盖 → 不报；否则"上次在线本次离线"→ crit。
+- **跨轮次确认**(防误报)：`offline_since` / `seg_down_since` / `site_down_since` / `zero_since` 记首次成立时间，持续 `offline_confirm_sec` / `zero_confirm_sec`(默认 240≈下一轮)才 fire；确认期内的网段照样静音段内单机。状态在 `_alert_state` 内存里，服务重启后重新计时。
+- **site_down**：名册真机掉线比例 ≥ `site_down_ratio` 且台数 ≥ `site_down_min`、跨 ≥2 个网段 → 只报一条 `__site__` 告警，同时压掉逐段 segment_down 和逐台 offline(回差 ×0.75 消警)。
+- **offline**：维修中 / 被网段或全场事件覆盖 → 不报；否则名册内持续离线满确认期 → crit。`unknown`+`alive` 连续 `unresponsive_rounds` 轮 → 按掉线报(控制板卡死)；扫描超时的 unknown(无 alive) 永远原样跳过。
 - **zero**：`hr_rt==0` 才算（`None`=读不到，不动）；维修中 / `uptime<grace`（刚开机升频）→ 不报。
 - **low_hashrate**：低于同机型在线机中位数的 `low_hashrate_ratio`，连续 `low_hashrate_rounds` 轮成立才报。
   基线由 `miner_core.model_baselines` 算，**只取有正算力的机器**（零算力机算进去会把基线拉低导致漏报）；
   同机型样本 < `low_hashrate_min_peers` 不做判定。连续计数存在 `MonitorService._alert_state`（跨轮内存态）。
-- **overheat**：`temp >= overheat_c` → crit，`temp < overheat_clear_c` 才消（滞回）。
+- **overheat**：连续 `overheat_rounds` 轮 `temp >= overheat_c` → crit，`temp < overheat_clear_c` 才消（滞回）。芯片温读数 ≤0 或 >150℃ 在探测层就丢弃(`miner_core._temp`)。
 - **reject**：只在 accepted/rejected 非空时算，拒绝率 ≥ 阈值 → warn。
 - **cooldown**：刚恢复不久（`< cooldown`）的同机同类抖动不再报。
 

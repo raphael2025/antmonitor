@@ -40,7 +40,7 @@
 | **水冷 / 风冷** | 集装箱冷却状态与矿机一起盯 |
 | **多场地老板** | 本地值班 + [云端总览](https://github.com/raphael2025/antmonitor-cloud) 随时扫一眼全网 |
 
-不需要会写代码。Ubuntu 一键安装，或 Windows 双击启动。
+不需要会写代码。Ubuntu / Windows 都是一行命令装好。
 
 ---
 
@@ -58,36 +58,41 @@
 
 ## 三分钟上手
 
+不用先 `git clone`，没装 git / Python 也行，一行命令装好：
+
 **Ubuntu（推荐）**
 
 ```bash
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
 ```
 
-选语言 → 首次安装 / 更新 / 修复 / 卸载 / 重置账号。
+自动装依赖、下载代码、建服务并启动，安装时设置 admin 密码（直接回车会生成强密码并显示）。
+面板 `http://<监控机IP>:8800`。再跑一次同样的命令 = 管理菜单（更新 / 修复 / 卸载 / 重置账号）。
 
-**或手动**
+装的时候顺便接入云端（接入码在云端面板「🔌 场地接入」里复制）：
 
 ```bash
-git clone https://github.com/raphael2025/antmonitor.git
-cd antmonitor
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp config.example.yaml config.yaml   # 填网段与账号
-python server.py                     # 浏览器打开 :8800
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code 'AMC1-…' --site-name 内蒙一场
 ```
 
-**Windows 10 / 11**：把项目解压到本地可写目录，双击 `run.bat`。
-没有 Python 时会自动从 python.org 下载并验证官方签名，安装到当前用户的
-`%LOCALAPPDATA%\AntMonitor\Python313`，不需要管理员权限或手动配置 PATH。
-已有可用的标准 Python 3.8–3.14 会直接复用；暂不选用更新版本或自由线程版，
-以免依赖缺少预编译安装包而要求安装 C++ 编译工具。
-随后自动创建 `.venv`、安装全部依赖、生成 `config.yaml`，并提示设置 admin 密码。
-首次安装需要联网；之后依赖没有变化时可离线启动。已有配置和密码会保留。
-旧 `.venv` 若使用不兼容版本，会保留为 `.venv.incompatible-*` 并自动重建。
-启动后在面板配置矿机网段。遇到错误会保留窗口显示原因；按 Ctrl+C 可停止服务。
+**Windows 10 / 11**（PowerShell 里执行，不需要管理员）
 
-ZIP 下载可直接运行，网页更新也能用：首次启动时会自动转成 git 部署——没装 Git 就下载固定版本的便携 Git（校验 SHA-256，放在 `%LOCALAPPDATA%\AntMonitor`），按文件内容找到 ZIP 对应的版本，之后在网页上检查/更新。需要能访问 github.com；ZIP 里的文件被改过时无法识别版本，会提示改用 `git clone`。设置环境变量 `MINER_NO_GIT_BOOTSTRAP=1` 可关闭。
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+```
+
+下载到 `%LOCALAPPDATA%\AntMonitor\antmonitor`，桌面生成「AntMonitor」快捷方式并启动；没有 Python 会自动从
+python.org 下载并验证签名后安装（当前用户，不需要管理员），之后可在网页上一键更新。
+也可以照旧下载 ZIP 解压后双击 `run.bat`。
+
+**装好以后**：admin 登录 →「⚙ 网段」填矿机网段 → 保存并全网扫描；要接云端就在同一页「☁ 云端上报」粘贴接入码，
+点「🔌 测试连接」，下面会一直显示上报状态（最近一次成功 / 失败原因），不用登机器看日志。
+
+GitHub 访问慢可设镜像前缀 `GH_PROXY`；完全离线可把源码 ZIP 拷过去，解压后在目录里 `sudo bash install.sh`。
+
+**大场地防误报**：掉线、整段掉线、零算力都要跨到下一轮巡检再确认才报；高温连续 2 轮才报；全场同时大面积掉线
+只报一条「全场掉线」；矿机网页卡住但还在挖矿时改从 4028 端口取数，不再误报掉线。参数见
+[中文指南 · 大场地防误报](docs/guide/zh.md#大场地防误报默认已开启)。
 
 完整「简介 · 部署 · 使用」→ [选语言阅读](docs/guide/README.md)
 
