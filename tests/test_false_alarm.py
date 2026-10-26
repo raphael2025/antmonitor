@@ -294,3 +294,20 @@ def test_site_alert_keeps_segment_hysteresis_on_partial_recovery(conn, dcfg, clo
             + [rec(f"10.0.2.{i}") for i in range(11, 21)] + _seg(4, "10.0.3"))
     assert _round(conn, dcfg, clock, half, st) == []      # 全场离线 20/44 ≥ 0.375
     assert db.active_alerts_by_type(conn, "site_down")
+
+
+def test_site_alert_does_not_mute_uninvolved_subnets(conn, dcfg, clock):
+    """全场告警期间，没参与断电的网段里掉线 50% 的机器照常逐台报(不被回差顺带静音)。"""
+    dcfg["alerts"]["site_down_min"] = 10
+    st = {}
+    good = _seg(20) + _seg(20, "10.0.2") + _seg(4, "10.0.3")
+    _round(conn, dcfg, clock, good, st)
+    two = _seg(20, status="offline") + _seg(20, "10.0.2", status="offline") + _seg(4, "10.0.3")
+    _round(conn, dcfg, clock, two, st)
+    _round(conn, dcfg, clock, two, st)
+    third = (_seg(20, status="offline") + _seg(20, "10.0.2", status="offline")
+             + [rec("10.0.3.1", status="offline"), rec("10.0.3.2", status="offline")]
+             + _seg(4, "10.0.3")[2:])
+    _round(conn, dcfg, clock, third, st)
+    fired = _round(conn, dcfg, clock, third, st)
+    assert ("10.0.3.1", "offline") in fired and ("10.0.3.2", "offline") in fired

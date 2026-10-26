@@ -205,6 +205,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     offline_since = state.setdefault("offline_since", {})   # ip → 首次确认离线时间
     seg_since = state.setdefault("seg_down_since", {})      # 网段 → 首次满足整段掉线时间
     site_since = state.setdefault("site_down_since", {})    # SITE_KEY → 首次满足全场掉线时间
+    site_segs = state.setdefault("site_segs", set())         # 全场告警涉及的网段(并进去的整段)
     alive_streak = state.setdefault("alive_streak", {})     # ip → 连续"连得上但读不到"轮数
     hot_streak = state.setdefault("hot_streak", {})         # ip → 连续高温轮数
     hot_last = state.setdefault("hot_last", {})             # ip → 上一轮的超温读数
@@ -273,9 +274,10 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         tot = seg_total.get(seg, 0)
         # 回差：超过 seg_ratio 才报；已在报的降到 seg_ratio×0.75 以下才消。否则离线率在阈值
         # 附近来回时每轮"消—报"一次(整段事件 force 不受冷却)，值班群被刷屏。
-        # 全场告警在报时同样按回差判：整段告警已并进全场告警(不在 active_segs 里了)，
-        # 不这样的话部分恢复到两个比例之间，全场告警一消，段内单机掉线立刻刷屏
-        if seg in active_segs or site_active:
+        # 全场告警涉及的网段同样按回差判：它们的整段告警已并进全场告警(不在 active_segs 里了)，
+        # 不这样的话部分恢复到两个比例之间，全场告警一消，段内单机掉线立刻刷屏。
+        # 没参与全场事件的网段照常按触发条件判，不能被顺带静音
+        if seg in active_segs or (site_active and seg in site_segs):
             is_down = tot > 0 and off / tot >= clear_ratio
         else:
             is_down = off >= seg_min and tot > 0 and off / tot >= seg_ratio
@@ -299,6 +301,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         first = site_since.setdefault(SITE_KEY, now)
         if site_active or now - first >= off_confirm:
             site_on = True
+            site_segs |= down_segments
             segs = sorted(down_segments)
             more = f" 等 {len(segs)} 个" if len(segs) > 8 else ""
             b.fire(SITE_KEY, "site_down", "crit",
@@ -309,6 +312,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         site_since.pop(SITE_KEY, None)
         if site_active and (not site_ratio or (tot_all > 0 and unk_all <= tot_all)):
             b.resolve(SITE_KEY, "site_down")
+            site_segs.clear()
 
     for seg in down_segments:
         off, tot = seg_off.get(seg, 0), seg_total.get(seg, 0)
