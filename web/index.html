@@ -77,7 +77,7 @@
         <textarea id="segText" rows="8" placeholder="172.16.101&#10;172.16.102&#10;..."></textarea>
         <div class="seg-host"><span data-i18n="seg.host">主机号</span> <input id="segHs" type="number" min="1" max="254"> – <input id="segHe" type="number" min="1" max="254"></div>
         <div class="seg-host"><span data-i18n="seg.interval">巡检间隔(秒)</span> <input id="setInterval" type="number" min="30">
-          <span class="muted" data-i18n="seg.interval_hint">只探已知机器，抓上线/掉线，日常主力</span></div>
+          <span class="muted" data-i18n="seg.interval_hint">扫完一轮后等这么久再扫下一轮；只探已知机器</span></div>
         <div class="seg-host"><span data-i18n="seg.full_interval">全网发现间隔(秒)</span> <input id="setFullInterval" type="number" min="60">
           <span class="muted" data-i18n="seg.full_hint">展开全部网段找新机(慢)，建议 3600</span></div>
         <div class="seg-host"><span data-i18n="seg.pps">ARP限速 max_pps</span> <input id="setPps" type="number" min="1" max="500"> <span class="muted" data-i18n="seg.pps_hint">(三层CoPP限制下，建议≤500的一半)</span></div>

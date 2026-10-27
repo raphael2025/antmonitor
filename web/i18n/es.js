@@ -33,7 +33,7 @@ I18N.register('es', {
   "seg.hint": "Una subred por línea (p. ej. 172.16.119).",
   "seg.host": "Rango de hosts",
   "seg.interval": "Intervalo quick (s)",
-  "seg.interval_hint": "Solo roster — detección diaria",
+  "seg.interval_hint": "Espera tras terminar cada escaneo — solo roster",
   "seg.full_interval": "Descubrimiento full (s)",
   "seg.full_hint": "Todas las subredes (lento); sugerido 3600",
   "seg.pps": "Límite ARP max_pps",

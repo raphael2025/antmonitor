@@ -33,7 +33,7 @@ I18N.register('en', {
   "seg.hint": "One subnet per line (e.g. 172.16.119 or 172.16.119.x).",
   "seg.host": "Host range",
   "seg.interval": "Quick interval (s)",
-  "seg.interval_hint": "Roster only — daily offline detection",
+  "seg.interval_hint": "Wait this long after each scan finishes — roster only",
   "seg.full_interval": "Full discovery (s)",
   "seg.full_hint": "Scan all subnets for new miners (slow); suggest 3600",
   "seg.pps": "ARP rate max_pps",
