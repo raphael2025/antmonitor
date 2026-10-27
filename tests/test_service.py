@@ -506,3 +506,47 @@ def test_mass_offline_does_not_request_early_discovery(svc, monkeypatch):
     monkeypatch.setattr(miner_core, "scan", fake_scan([]))
     svc.scan_quick()
     assert svc._early_full is False
+
+
+def test_scattered_offline_is_reconfirmed_then_alerted_same_scan(svc, monkeypatch):
+    """零散掉线：先二次确认重探，重探仍离线 → 同一轮就报掉线，不用等下一轮扫描。"""
+    monkeypatch.setattr(service.appconfig, "load_segments", lambda _c: (["10.9.1"], 1, 10))
+    good = [rec(f"10.9.1.{i}") for i in range(1, 11)]
+    calls = []
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        calls.append(list(ips))
+        if len(calls) == 1:
+            by_ip = {r["ip"]: r for r in good}
+        else:   # 之后 10.9.1.3 一直不在
+            by_ip = {r["ip"]: r for r in good if r["ip"] != "10.9.1.3"}
+        return [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    svc.scan_full("full")
+    svc.scan_full("full")
+    assert ["10.9.1.3"] in calls[2:]                    # 做过二次确认重探
+    assert db.active_alert(svc.conn, "10.9.1.3", "offline")
+
+
+def test_whole_segment_outage_skips_reconfirm_and_alerts_same_scan(svc, monkeypatch):
+    """整段掉线(交换机/断电)不重探，当轮直接报整段掉线；别的网段零散掉线照样二次确认。"""
+    monkeypatch.setattr(service.appconfig, "load_segments",
+                        lambda _c: (["10.9.2", "10.9.3"], 1, 20))
+    seg1 = [rec(f"10.9.2.{i}") for i in range(1, 21)]
+    seg2 = [rec(f"10.9.3.{i}") for i in range(1, 21)]
+    calls = []
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        calls.append(list(ips))
+        alive = seg1 + seg2 if len(calls) == 1 else [r for r in seg2 if r["ip"] != "10.9.3.5"]
+        by_ip = {r["ip"]: r for r in alive}
+        return [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    svc.scan_full("full")
+    svc.scan_full("full")
+    reprobed = {ip for c in calls[2:] for ip in c}
+    assert reprobed == {"10.9.3.5"}                     # 整段的 20 台没有重探
+    assert db.active_alert(svc.conn, "10.9.2.x", "segment_down")
+    assert db.active_alert(svc.conn, "10.9.3.5", "offline")

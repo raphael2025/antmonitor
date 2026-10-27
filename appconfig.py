@@ -75,10 +75,11 @@ DEFAULTS = {
         "overheat_clear_c": 90,         # 回落到此值以下才消警(滞回，防临界抖动刷屏)
         "overheat_rounds": 2,           # 连续 N 轮超温才报(防单颗传感器跳值)
         "overheat_fast_margin_c": 5,    # 超过阈值这么多度当轮就报；0=关
-        # 跨轮次确认(秒)：持续这么久仍成立才报，过滤交换机重启/网页卡顿/换池瞬间 0 算力。
-        # 默认 240 ≈ 跨到下一轮巡检；0=当轮即报(旧行为)
-        "offline_confirm_sec": 240,     # 单机掉线 / 整段掉线 / 全场掉线
-        "zero_confirm_sec": 240,        # 零算力
+        # 额外的跨轮次确认(秒)。默认 0：扫描里发现掉线/零算力先二次确认(等 reconfirm_delay_sec
+        # 后宽松超时重探)，重探仍不行当轮就报；整段掉线不重探、当轮直接报。
+        # 现场交换机经常闪断时可设 240(≈下一轮巡检仍成立才报)
+        "offline_confirm_sec": 0,       # 单机掉线 / 整段掉线 / 全场掉线
+        "zero_confirm_sec": 0,          # 零算力
         "unresponsive_rounds": 3,       # 端口通但接口一直读不到：连续 N 轮才按掉线报
         # 全场级事件：已知真机掉线比例 ≥ ratio 且台数 ≥ min(跨 2 个以上网段) → 只报一条全场掉线
         "site_down_ratio": 0.5, "site_down_min": 50,

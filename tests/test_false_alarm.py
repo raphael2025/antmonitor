@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""大场地防误报：跨轮次确认、全场事件合并、"连得上但读不到"不算离线。
+"""大场地防误报：二次确认后当轮报、可选的跨轮次确认、全场事件合并、"连得上但读不到"不算离线。
 
-大场地最常见的误报都是一两分钟就过去的事：交换机重启 / STP 收敛 / ARP 表刷新、矿机网页服务
-(lighttpd/CGI)卡顿、换矿池瞬间读到 0 算力、单颗温度传感器跳值。这些用例用默认配置
-(offline_confirm_sec=240 等)跑，确认"抖一下不报，持续才报"。
+默认：扫描里的二次确认(service._reconfirm)就是确认，评估时收到的掉线/零算力都是重探过的，当轮就报。
+交换机经常闪断的场地可以再开跨轮次确认(offline_confirm_sec / zero_confirm_sec = 240)，
+dcfg 夹具就是这种配置，用来测"抖一下不报，持续才报"。
 """
 import time
 
@@ -37,8 +37,32 @@ def clock(monkeypatch):
 
 @pytest.fixture
 def dcfg():
-    """出厂默认配置(带防误报确认)。"""
+    """出厂默认 + 打开跨轮次确认(offline/zero 各 240 秒)。"""
+    return appconfig._validate(appconfig._merge(appconfig.DEFAULTS, {
+        "alerts": {"offline_confirm_sec": 240, "zero_confirm_sec": 240}}))
+
+
+@pytest.fixture
+def factory():
+    """纯出厂默认配置。"""
     return appconfig._validate(appconfig._merge(appconfig.DEFAULTS, {}))
+
+
+def test_default_reports_reconfirmed_offline_and_zero_in_same_round(conn, factory, clock):
+    """出厂默认：评估收到的掉线/零算力已经过扫描内二次确认，当轮就报，不再等下一轮。"""
+    st = {}
+    _round(conn, factory, clock, [rec("10.0.0.1"), rec("10.0.0.2"), rec("10.0.0.3")], st)
+    fired = _round(conn, factory, clock, [rec("10.0.0.1", status="offline"), rec("10.0.0.2", hr=0),
+                                          rec("10.0.0.3")], st)
+    assert fired == [("10.0.0.1", "offline"), ("10.0.0.2", "zero")]
+
+
+def test_default_reports_whole_segment_outage_in_same_round(conn, factory, clock):
+    st = {}
+    good = _seg(10) + _seg(10, "10.0.2")
+    _round(conn, factory, clock, good, st)
+    assert _round(conn, factory, clock, _seg(10, status="offline") + _seg(10, "10.0.2"), st) \
+        == [("10.0.1.x", "segment_down")]
 
 
 def _round(conn, cfg, clock, records, state, sec=300):
