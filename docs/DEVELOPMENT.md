@@ -45,7 +45,8 @@
                                                          矿机 / AntBox 集装箱
 ```
 
-**数据流（一次扫描）**：`service._loop` 每 `scan_interval` → `miner_core.scan(全部IP)` 并发探测
+**数据流（一次扫描）**：`service._loop` 上一轮扫完后等满 `scan_interval` → `miner_core.scan` 并发探测
+（全网发现先探名册、再探其余空地址，两段不混在一起）
 → `_reconfirm` 二次确认 → `db.save_scan`（只落库真机，见 §6 H7）→ `db.upsert_known_miners`
 → `alerts.evaluate`（产/消告警）→ 集装箱评估/踢除 → `db.prune` → WS 推送 `{type:refresh}`。
 
@@ -149,7 +150,9 @@
 
 - **两档扫描**。`quick` 只探名册（约5千台，`scan_interval` 300s），`full` 展开全网段发现新机
   （约1.5万地址，`full_interval` 3600s）。合成一档 = 扫描耗时逼近间隔 = 系统"永远在扫"，
-  既压三层也让 WAL checkpoint 追不上。单轮耗时超过巡检间隔时 `_do_scan` 会打 warning。
+  既压三层也让 WAL checkpoint 追不上。间隔从上一轮**扫完**开始算(不扣本轮耗时)，单轮再慢也不会
+  连轴扫。全网发现分两段：先用巡检并发探名册内机器，再用 `discovery_workers` 探其余空地址——
+  混在一起时空地址等满判活超时、让三层交换机狂发 ARP，同时在探的真机跟着超时，每小时一轮误报。
 - **H7：死 IP 不落库**。全扫地址里大部分是从未是矿机的死 IP；`save_scan(keep_ips=roster)` 只存
   "在线机 + 名册内（曾在线/维修）的离线机"。`scans.total/online/offline` 随之表示**真实机器**口径。
   只有**全新部署的第一轮**退化为全量落库（否则 offline 恒 0、面板误显示全在线）；

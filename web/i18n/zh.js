@@ -33,7 +33,7 @@ I18N.register('zh', {
   "seg.hint": "每行一个网段（如 172.16.119 或 172.16.119.x）。",
   "seg.host": "主机号",
   "seg.interval": "巡检间隔(秒)",
-  "seg.interval_hint": "只探已知机器，抓上线/掉线，日常主力",
+  "seg.interval_hint": "扫完一轮后等这么久再扫下一轮；只探已知机器",
   "seg.full_interval": "全网发现间隔(秒)",
   "seg.full_hint": "展开全部网段找新机(慢)，建议 3600",
   "seg.pps": "ARP限速 max_pps",

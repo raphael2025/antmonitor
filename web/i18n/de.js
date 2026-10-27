@@ -33,7 +33,7 @@ I18N.register('de', {
   "seg.hint": "Ein Subnetz pro Zeile (z. B. 172.16.119).",
   "seg.host": "Host-Bereich",
   "seg.interval": "Quick-Intervall (s)",
-  "seg.interval_hint": "Nur Roster — tägliche Offline-Erkennung",
+  "seg.interval_hint": "Pause nach Ende jedes Scans — nur Roster",
   "seg.full_interval": "Full-Discovery (s)",
   "seg.full_hint": "Alle Subnetze (langsam); Empfehlung 3600",
   "seg.pps": "ARP-Limit max_pps",

@@ -247,7 +247,7 @@ def test_reconfirm_keeps_the_best_result_across_passes(svc, monkeypatch):
     svc.cfg["scan"]["reconfirm_passes"] = 2
     rounds = iter([
         [rec(A)],                                          # 第一次全扫：在线
-        [],                                                # 第二次主扫：没探到
+        [],                                                # 巡检：没探到
         [rec(A, hr=None, note="stats.cgi 超时")],          # 重探第 1 轮：在线，算力读不到
         [],                                                # 重探第 2 轮：瞬时丢包
     ])
@@ -258,7 +258,7 @@ def test_reconfirm_keeps_the_best_result_across_passes(svc, monkeypatch):
 
     monkeypatch.setattr(miner_core, "scan", _scan)
     svc.scan_full("full")
-    svc.scan_full("full")
+    svc.scan_quick()
     _m, records = svc.latest()
     assert {r["ip"]: r["status"] for r in records}[A] == "online"
     assert db.active_alert(svc.conn, A, "offline") is None
@@ -468,8 +468,9 @@ def test_machine_unknown_last_round_still_gets_reconfirmed(svc, monkeypatch):
         return [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
 
     monkeypatch.setattr(miner_core, "scan", _scan)
-    for _ in range(3):
-        svc.scan_full("full")
+    svc.scan_full("full")
+    for _ in range(2):
+        svc.scan_quick()
     assert db.active_alert(svc.conn, A, "offline") is None
     _m, records = svc.latest()
     assert {r["ip"]: r["status"] for r in records}[A] == "online"
@@ -550,3 +551,59 @@ def test_whole_segment_outage_skips_reconfirm_and_alerts_same_scan(svc, monkeypa
     assert reprobed == {"10.9.3.5"}                     # 整段的 20 台没有重探
     assert db.active_alert(svc.conn, "10.9.2.x", "segment_down")
     assert db.active_alert(svc.conn, "10.9.3.5", "offline")
+
+
+def test_full_scan_probes_roster_before_dead_addresses(svc, monkeypatch):
+    """全网发现分两段：名册机器按巡检并发先探，空地址之后再探，两批不混在同一次并发里
+    (混在一起时空地址等满判活超时、交换机狂发 ARP，真机跟着超时误报)。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2"), rec("10.9.0.4")]))
+    svc.scan_full("full")                       # 首轮建名册
+    svc.cfg["scan"].update(workers=111, discovery_workers=22, reconfirm_enabled=False)
+    calls = []
+    inner = fake_scan([rec("10.9.0.2"), rec("10.9.0.4")])
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        calls.append((list(ips), workers))
+        return inner(ips, cfg, progress_cb)
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    out = svc.scan_full("full")
+    assert calls == [(["10.9.0.2", "10.9.0.4"], 111),
+                     (["10.9.0.1", "10.9.0.3", "10.9.0.5"], 22)]
+    assert out["online"] == 2
+    assert svc.progress["done"] == svc.progress["total"] == 5
+
+
+def test_loop_waits_full_interval_after_scan_finishes(svc, monkeypatch):
+    """扫完再等满 scan_interval：单轮耗时比间隔还长也不能紧接着开下一轮。"""
+    clock = {"t": 1000.0}
+
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            return clock["t"]
+
+        @staticmethod
+        def time():
+            return time.time()
+
+    monkeypatch.setattr(service, "time", FakeTime)
+    svc.cfg["schedule"]["scan_interval"] = 300
+    svc._last_full = clock["t"]
+
+    def slow_quick(kind="quick"):
+        clock["t"] += 420                       # 这一轮扫了 7 分钟
+        return {"kind": "quick"}
+
+    waits = []
+
+    def fake_wait(timeout=None):
+        waits.append(timeout)
+        svc._stop.set()
+        return True
+
+    monkeypatch.setattr(svc, "scan_quick", slow_quick)
+    monkeypatch.setattr(svc, "_ensure_watchdog", lambda: None)
+    monkeypatch.setattr(svc._wake, "wait", fake_wait)
+    svc._loop()
+    assert waits == [300.0]

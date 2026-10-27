@@ -372,7 +372,9 @@ def api_summary(_: dict = Depends(require_viewer)):
     # stale_after：前端"数据过期"横幅用服务端看门狗同一阈值(以前写死 900 秒，巡检间隔调大后每轮都误报)
     # 下限 2 个巡检间隔+2 分钟：watchdog_minutes 显式配得比巡检间隔还小时，横幅别每轮都闪
     sch = CFG["schedule"]
-    stale_after = max(SVC._stale_threshold(), sch.get("scan_interval", 300) * 2 + 120)
+    # 扫完才开始等间隔：一轮周期 = 耗时 + 间隔
+    stale_after = max(SVC._stale_threshold(),
+                      (sch.get("scan_interval", 300) + SVC.last_took) * 2 + 120)
     extra = {"progress": SVC.progress, "stale_after": int(stale_after)}
     if not ls:
         return {"scanned": False, **extra}

@@ -3,7 +3,7 @@
 """监控服务：扫描编排 + 后台定时巡检 / 看门狗 / 数据库维护线程。
 
 扫描分两档（这是容量设计的核心，别再合成一档）：
-  - quick：只探"名册"内的已知真机(约5千台)，每 schedule.scan_interval(默认300s)一轮。
+  - quick：只探"名册"内的已知真机(约5千台)，每轮扫完后再等 schedule.scan_interval(默认300s)开始下一轮。
            抓上线/下线/掉算力/温度，是日常监控的主力。
   - full ：展开全部网段(约1.5万地址)做发现，每 schedule.full_interval(默认3600s)一轮。
            抓新装机/换网段。死 IP 的判活超时是全扫的主要耗时来源。
@@ -66,6 +66,7 @@ class MonitorService:
         self._alert_state = {}        # 跨轮次告警状态(掉算力连续计数、刚重启的机器)
         self._restore_rebooting()
         self._last_full = 0.0         # 上次全网发现完成的 monotonic 时刻
+        self.last_took = 0.0          # 上一轮扫描耗时(秒)：实际周期 = 耗时 + scan_interval
         self._early_full = False      # 巡检发现疑似 IP 迁移 → 下一轮提前做全网发现
         self._last_checkpoint = 0.0
         self._last_rollup = 0.0
@@ -389,7 +390,7 @@ class MonitorService:
         if cfgd:
             return max(120, float(cfgd) * 60)
         # 下限 20 分钟：高于 miner_core 整体超时 15 分钟，避免全网发现还在跑就被判停滞
-        return max(1200.0, sch.get("scan_interval", 300) * 3.0)
+        return max(1200.0, (sch.get("scan_interval", 300) + self.last_took) * 3.0)
 
     def is_stale(self, now=None):
         """扫描中看进度心跳；空闲时看上次完成时间与调度线程心跳。"""
@@ -475,7 +476,9 @@ class MonitorService:
         prev_online = set(db.online_ips(self.conn))
         # 上一轮扫描超时没探到(unknown)的机器也算"上一轮在线"：它们的 last_online 停在再上一轮。
         # 否则这一轮一次丢包就直接报掉线，二次确认恰好漏掉了刚经历过拥堵的那批机器
-        recent = int(time.time()) - 2 * int(self.cfg["schedule"].get("scan_interval", 300)) - 60
+        # 一轮周期 = 扫描耗时 + 间隔(扫完才开始等)，大场地单轮可能就要好几分钟
+        cycle = int(self.cfg["schedule"].get("scan_interval", 300)) + int(self.last_took)
+        recent = int(time.time()) - 2 * cycle - 60
         prev_online |= {ip for ip, i in db.known_identity(self.conn).items()
                         if i.get("state") == "active" and int(i.get("last_online") or 0) >= recent}
         _m, prev_recs = self.latest()
@@ -566,14 +569,16 @@ class MonitorService:
                 break
         return [fixed.get(r["ip"], r) for r in miners]
 
-    def _do_scan(self, kind, ips, workers=None):
+    def _do_scan(self, kind, ips, workers=None, discover=(), discover_workers=None):
+        """ips 是名册机器；discover 是要做发现的其余地址，在名册探完之后才探(见 scan_full)。"""
         lock = self._scan_lock   # 局部引用：即便 recover 换了 self._scan_lock，也只释放自己那把
         if not lock.acquire(blocking=False):
             return None          # 已有扫描在跑
         gen = self._scan_gen
         try:
             now = int(time.time())
-            self.progress.update({"running": True, "done": 0, "total": len(ips),
+            total = len(ips) + len(discover)
+            self.progress.update({"running": True, "done": 0, "total": total,
                                   "kind": kind, "started": now, "progress_ts": now,
                                   "loop_beat": now})
             t0 = time.monotonic()
@@ -590,7 +595,16 @@ class MonitorService:
             # MAC is a stable fallback identity for firmware that cannot expose
             # an SN.  Fetch it on discovery scans, not every five-minute patrol.
             scan_cfg["collect_identity"] = kind in {"full", "manual"}
-            records = miner_core.scan(ips, scan_cfg, progress_cb=cb, workers=workers)
+            records = miner_core.scan(ips, scan_cfg, progress_cb=cb, workers=workers) if ips else []
+            if discover and gen == self._scan_gen:
+                base = len(ips)
+                records += miner_core.scan(discover, scan_cfg,
+                                           progress_cb=lambda d, _t: cb(base + d, total),
+                                           workers=discover_workers)
+                try:
+                    records.sort(key=miner_core._ip_sort_key)
+                except Exception:  # noqa: BLE001
+                    pass
             # 看门狗恢复会递增世代并启动新扫描。旧线程苏醒后必须在任何进度更新、
             # 二次探测或落库前退出，否则会覆盖新扫描的进度/快照。
             if gen != self._scan_gen:
@@ -693,13 +707,14 @@ class MonitorService:
                     self._container_lock.release()
 
             took = time.monotonic() - t0
+            self.last_took = took
             log.info("%s 扫描完成: %d 台在线 / %d 落库 (地址 %d), 集装箱 %d, 新告警 %d, 耗时 %.1fs",
-                     kind, len(online_ips), len(kept), len(ips), len(containers),
+                     kind, len(online_ips), len(kept), total, len(containers),
                      len(fired) + len(cfired), took)
             if took > self.cfg["schedule"].get("scan_interval", 300):
-                log.warning("本轮扫描耗时 %.0fs 已超过巡检间隔 %ds —— 系统将长期处于"
-                            "持续扫描状态，建议下调网段范围/提高并发/放宽间隔",
-                            took, self.cfg["schedule"].get("scan_interval", 300))
+                log.info("本轮扫描耗时 %.0fs 超过巡检间隔 %ds：扫完才开始计时，实际每轮约 %.0fs",
+                         took, self.cfg["schedule"].get("scan_interval", 300),
+                         took + self.cfg["schedule"].get("scan_interval", 300))
             if self.notify:
                 try:
                     self.notify({"type": "refresh", "fired": len(fired) + len(cfired)})
@@ -787,11 +802,19 @@ class MonitorService:
             return miners
 
     def scan_full(self, kind="full"):
-        """全网发现：展开所有网段的全部主机号。"""
+        """全网发现：展开所有网段的全部主机号。
+
+        分两段探：先按巡检的并发探名册里的机器(告警只看它们)，再探其余上万个空地址找新机。
+        以前混在一起探，几百个并发里大半是空地址，每个都要等满判活超时、让三层交换机狂发 ARP，
+        同一时刻在探的真机跟着丢包超时——每小时这一轮的误报(整段掉线/单台掉线)主要来自这里。"""
         segs, hs, he = appconfig.load_segments(self.cfg)
         ips = miner_core.gen_ips_seg(segs, hs, he)
-        workers = self.cfg["scan"].get("discovery_workers", 300)
-        return self._do_scan(kind, ips, workers=workers)
+        roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
+        known = [ip for ip in ips if ip in roster]
+        rest = [ip for ip in ips if ip not in roster]
+        return self._do_scan(kind, known, workers=self.cfg["scan"].get("workers", 300),
+                             discover=rest,
+                             discover_workers=self.cfg["scan"].get("discovery_workers", 300))
 
     def scan_quick(self, kind="quick"):
         """名册巡检：只探已知真机(在线过的 + 维修中的)，抓上线/下线。"""
@@ -881,10 +904,12 @@ class MonitorService:
                 log.exception("scan loop error: %s", e)
             if self._stop.is_set():
                 break
-            # 固定周期：真实间隔≈scan_interval(扣掉本轮扫描耗时)。每轮重读间隔→网页改后即时生效。
+            # 扫完再等满 scan_interval 才开下一轮(不扣本轮耗时)。以前按固定周期扣耗时，大场地
+            # 3 秒超时下一轮扫得比间隔还久，就变成一轮接一轮不停扫，网络一直满载、丢包误报更多。
+            # 每轮重读间隔→网页改后即时生效。
             try:
                 iv = self.cfg["schedule"].get("scan_interval", 300)
-                wait = 15.0 if skipped else max(0.0, float(iv) - (time.monotonic() - start))
+                wait = 15.0 if skipped else float(iv)
                 self._wake.wait(wait)
                 self._wake.clear()
             except Exception as e:  # noqa: BLE001

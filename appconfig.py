@@ -58,7 +58,7 @@ DEFAULTS = {
     },
     "schedule": {
         "enabled": True,
-        "scan_interval": 300,      # 名册巡检间隔(秒)
+        "scan_interval": 300,      # 名册巡检间隔(秒)，从上一轮扫完开始算
         "full_interval": 3600,     # 全网发现间隔(秒)；发现新机/新网段
         "watchdog_minutes": 0,     # 0=自动取 max(20分钟, 巡检间隔×3)，高于扫描整体超时15分钟
         "container_interval": 10,
