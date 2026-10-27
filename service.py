@@ -569,6 +569,50 @@ class MonitorService:
                 break
         return [fixed.get(r["ip"], r) for r in miners]
 
+    def _discover_blocked(self, miners):
+        """名册阶段已经是大面积掉线时，本轮不再探空地址。
+
+        二次确认对这种情况会直接放弃重探(真实的交换机/断电)。接着再对上万个空地址
+        发 ARP，只会在已经故障的网络上再加压。新机留到下一轮全网发现。"""
+        limit = int(self.cfg["scan"].get("reconfirm_max", 800) or 0)
+        if limit <= 0:
+            return False
+        prev_online = set(db.online_ips(self.conn))
+        went_off = sum(1 for r in miners
+                       if r["ip"] in prev_online and r["status"] == "offline")
+        if went_off > limit:
+            log.info("全网发现: %d 台同时掉线，超过上限 %d，本轮不探空地址", went_off, limit)
+            return True
+        return False
+
+    def _scan_discover(self, ips, scan_cfg, workers, progress_cb, base, total, gen):
+        """分批探空地址。批间停顿，避免连续 ARP 把交换机打满后误伤真机。"""
+        ips = list(ips)
+        sc = self.cfg["scan"]
+        batch = max(1, int(sc.get("discovery_batch", 1000) or 1000))
+        pause = max(0.0, float(sc.get("discovery_pause_sec", 5) or 0))
+        found = []
+        for i in range(0, len(ips), batch):
+            if gen != self._scan_gen:
+                break
+            chunk = ips[i:i + batch]
+            offset = i
+
+            def cb(done, _t, off=offset):
+                progress_cb(base + off + done, total)
+
+            found += miner_core.scan(chunk, scan_cfg, progress_cb=cb, workers=workers)
+            if i + batch >= len(ips):
+                break
+            if gen != self._scan_gen:
+                break
+            self._beat(gen)
+            if pause and self._stop.wait(pause):
+                log.info("全网发现在批间停顿时被停止，已探 %d/%d 个空地址",
+                         i + len(chunk), len(ips))
+                break
+        return found
+
     def _do_scan(self, kind, ips, workers=None, discover=(), discover_workers=None):
         """ips 是名册机器；discover 是要做发现的其余地址，在名册探完之后才探(见 scan_full)。"""
         lock = self._scan_lock   # 局部引用：即便 recover 换了 self._scan_lock，也只释放自己那把
@@ -596,15 +640,6 @@ class MonitorService:
             # an SN.  Fetch it on discovery scans, not every five-minute patrol.
             scan_cfg["collect_identity"] = kind in {"full", "manual"}
             records = miner_core.scan(ips, scan_cfg, progress_cb=cb, workers=workers) if ips else []
-            if discover and gen == self._scan_gen:
-                base = len(ips)
-                records += miner_core.scan(discover, scan_cfg,
-                                           progress_cb=lambda d, _t: cb(base + d, total),
-                                           workers=discover_workers)
-                try:
-                    records.sort(key=miner_core._ip_sort_key)
-                except Exception:  # noqa: BLE001
-                    pass
             # 看门狗恢复会递增世代并启动新扫描。旧线程苏醒后必须在任何进度更新、
             # 二次探测或落库前退出，否则会覆盖新扫描的进度/快照。
             if gen != self._scan_gen:
@@ -613,12 +648,28 @@ class MonitorService:
             self._beat(gen)
             miners = [r for r in records if r.get("device") != "container"]
             containers = [r for r in records if r.get("device") == "container"]
+            # 名册先二次确认，再探空地址。空地址连续探会把交换机 ARP 打满(实测约 1 分钟后
+            # 旁边的真机成批读失败)。确认放在那之后，重探会把名册阶段的抖动坐实成掉线。
             miners = self._reconfirm(miners, gen)
-
             if gen != self._scan_gen:
                 log.warning("扫描世代 %d 已作废(期间发生强制恢复)，丢弃本轮 %d 条结果不落库",
                             gen, len(miners))
                 return None
+            if discover and gen == self._scan_gen:
+                if self._discover_blocked(miners):
+                    self.progress["done"] = total
+                else:
+                    found = self._scan_discover(discover, scan_cfg, discover_workers,
+                                                cb, len(ips), total, gen)
+                    if gen != self._scan_gen:
+                        log.warning("扫描世代 %d 已作废，丢弃本轮发现结果不落库", gen)
+                        return None
+                    miners.extend(r for r in found if r.get("device") != "container")
+                    containers.extend(r for r in found if r.get("device") == "container")
+                    try:
+                        miners.sort(key=miner_core._ip_sort_key)
+                    except Exception:  # noqa: BLE001
+                        pass
 
             # 回填离线机的最后已知身份：掉线机不再只剩光秃秃 IP，仍能按客户名/型号/SN 搜到
             ident = db.known_identity(self.conn)
@@ -804,9 +855,11 @@ class MonitorService:
     def scan_full(self, kind="full"):
         """全网发现：展开所有网段的全部主机号。
 
-        分两段探：先按巡检的并发探名册里的机器(告警只看它们)，再探其余上万个空地址找新机。
+        分两段探：先按巡检的并发探名册里的机器并做二次确认，再分批探其余空地址找新机。
         以前混在一起探，几百个并发里大半是空地址，每个都要等满判活超时、让三层交换机狂发 ARP，
-        同一时刻在探的真机跟着丢包超时——每小时这一轮的误报(整段掉线/单台掉线)主要来自这里。"""
+        同一时刻在探的真机跟着丢包超时——每小时这一轮的误报(整段掉线/单台掉线)主要来自这里。
+        空地址即使单独再探，连续一两分钟也会把 ARP 打满，所以按 discovery_batch 分批、批间停顿。
+        名册阶段已经大面积掉线时，本轮不再探空地址。"""
         segs, hs, he = appconfig.load_segments(self.cfg)
         ips = miner_core.gen_ips_seg(segs, hs, he)
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))

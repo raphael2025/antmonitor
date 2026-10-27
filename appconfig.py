@@ -43,6 +43,9 @@ DEFAULTS = {
         # 单台判活/在线判定统一等 3 秒：扫一轮会慢一点，但慢响应的矿机不会被当成掉线乱报警
         "online_timeout": 3.0, "data_timeout": 5.0,
         "workers": 300, "discovery_workers": 300,
+        # 空地址连续用 discovery_workers 探一两分钟，交换机会把 ARP 打满，旁边的真机跟着读失败。
+        # 每批 discovery_batch 个，批间停 discovery_pause_sec 秒，让 ARP 表喘口气。
+        "discovery_batch": 1000, "discovery_pause_sec": 5,
         "liveness_gate": True, "gate_timeout": 3.0, "max_pps": 300,
         "reconfirm_enabled": True, "reconfirm_online_timeout": 3.0,
         "reconfirm_data_timeout": 6.0, "reconfirm_passes": 2, "reconfirm_max": 800,
@@ -222,6 +225,8 @@ def _validate(cfg):
     clamp("scan", "max_pps", 1, 500, int)
     clamp("scan", "workers", 1, 500, int)
     clamp("scan", "discovery_workers", 1, 500, int)
+    clamp("scan", "discovery_batch", 1, 100000, int)
+    clamp("scan", "discovery_pause_sec", 0, 120)
     clamp("scan", "host_start", 1, 254, int)
     clamp("scan", "host_end", 1, 254, int)
     clamp("db", "retention_days", 1, 3650, int)

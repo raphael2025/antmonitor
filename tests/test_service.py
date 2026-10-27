@@ -574,6 +574,76 @@ def test_full_scan_probes_roster_before_dead_addresses(svc, monkeypatch):
     assert svc.progress["done"] == svc.progress["total"] == 5
 
 
+def test_reconfirm_runs_before_dead_address_scan(svc, monkeypatch):
+    """二次确认在空地址之前。空地址会把交换机打满，确认放在后面会把抖动坐实成掉线。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2"), rec("10.9.0.4")]))
+    svc.scan_full("full")
+    svc.cfg["scan"]["reconfirm_passes"] = 1
+    calls = []
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        calls.append(list(ips))
+        if len(calls) == 1:                 # 名册：.2 看起来掉了
+            alive = [rec("10.9.0.4")]
+        else:                               # 重探：其实在线。空地址没有这台
+            alive = [rec("10.9.0.2")]
+        by_ip = {r["ip"]: r for r in alive}
+        out = [by_ip.get(ip) or miner_core._blank(ip, "offline") for ip in ips]
+        if progress_cb:
+            progress_cb(len(out), len(out))
+        return out
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    svc.scan_full("full")
+    assert calls[0] == ["10.9.0.2", "10.9.0.4"]
+    assert calls[1] == ["10.9.0.2"]
+    assert calls[2] == ["10.9.0.1", "10.9.0.3", "10.9.0.5"]
+    assert db.active_alert(svc.conn, "10.9.0.2", "offline") is None
+
+
+def test_dead_address_scan_pauses_between_batches(svc, monkeypatch):
+    """空地址按 discovery_batch 切开，批与批之间停 discovery_pause_sec。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2"), rec("10.9.0.4")]))
+    svc.scan_full("full")
+    svc.cfg["scan"].update(reconfirm_enabled=False, discovery_batch=2, discovery_pause_sec=5)
+    calls, pauses = [], []
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        calls.append(list(ips))
+        return fake_scan([rec("10.9.0.2"), rec("10.9.0.4")])(ips, cfg, progress_cb, workers)
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    monkeypatch.setattr(svc._stop, "wait", lambda timeout=None: pauses.append(timeout) or False)
+    out = svc.scan_full("full")
+    assert calls == [["10.9.0.2", "10.9.0.4"],
+                     ["10.9.0.1", "10.9.0.3"],
+                     ["10.9.0.5"]]
+    assert pauses == [5.0]
+    assert out["online"] == 2
+    assert svc.progress["done"] == svc.progress["total"] == 5
+
+
+def test_mass_offline_skips_dead_address_scan(svc, monkeypatch):
+    """名册阶段已经大面积掉线：不再对空地址发 ARP。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2"), rec("10.9.0.4")]))
+    svc.scan_full("full")
+    svc.cfg["scan"].update(reconfirm_max=1, reconfirm_passes=1)
+    calls = []
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        calls.append(list(ips))
+        out = [miner_core._blank(ip, "offline") for ip in ips]
+        if progress_cb:
+            progress_cb(len(out), len(out))
+        return out
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    out = svc.scan_full("full")
+    assert calls == [["10.9.0.2", "10.9.0.4"]]
+    assert out["online"] == 0
+    assert svc.progress["done"] == svc.progress["total"] == 5
+
+
 def test_loop_waits_full_interval_after_scan_finishes(svc, monkeypatch):
     """扫完再等满 scan_interval：单轮耗时比间隔还长也不能紧接着开下一轮。"""
     clock = {"t": 1000.0}

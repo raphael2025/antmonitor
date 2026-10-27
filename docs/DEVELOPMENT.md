@@ -97,14 +97,15 @@
 
 ### 5.1 扫描周期 `service._do_scan`
 1. `_scan_lock.acquire(blocking=False)`——拿不到锁（已有扫描或集装箱循环在跑）直接 `return None`。
-2. `miner_core.scan(ips, ...)`：线程池并发 `probe`，`RateLimiter` 限 `max_pps`。
-3. `_reconfirm(miners)`：整段掉线(达到 segment_down 条件)的网段不重探；其余"上次在线、本次掉线/零算力/连得上但读不到(alive)"的机器，每轮先等 `reconfirm_delay_sec`(默认20s，避开同一波抖动)，再用宽松超时（关闭判活闸门、开 `alive_probe` 补测 80/4028、**保留 max_pps**）重探，恢复的覆盖回来——治网络抖动误判。`reconfirm_max` 上限防大面积掉线时无限速冲击三层。
+2. `miner_core.scan(ips, ...)`：先探名册。线程池并发 `probe`，`RateLimiter` 限 `max_pps`。
+3. `_reconfirm(miners)`：紧接名册结果、在空地址扫描之前。整段掉线(达到 segment_down 条件)的网段不重探；其余"上次在线、本次掉线/零算力/连得上但读不到(alive)"的机器，每轮先等 `reconfirm_delay_sec`(默认20s，避开同一波抖动)，再用宽松超时（关闭判活闸门、开 `alive_probe` 补测 80/4028、**保留 max_pps**）重探，恢复的覆盖回来——治网络抖动误判。`reconfirm_max` 上限防大面积掉线时无限速冲击三层；超过这个数时本轮也不再探空地址。
    探测层(`miner_core.probe`)：网页接口全没应答但端口连得上 → 先用 4028 `summary` 兜底取算力；仍读不到返回 `status=unknown` + `alive=True`(不落库字段，`_do_scan` 带回 kept)。
-4. `save_scan(keep_ips=roster)`：只落库在线机 + 名册内机（见 §6）。
-5. `upsert_known_miners`：在线机写回名册。
-6. `last_finished` 立即更新（看门狗据此判活），后续各步包 try/except 不互相影响。
-7. `alerts.evaluate` / 集装箱评估 / `kick_offline_containers` / `prune`。
-8. WS 推送。
+4. 空地址分批探(`discovery_batch`，默认 1000；批间 `discovery_pause_sec`，默认 5 秒)。连续一两分钟满速探死地址会把交换机 ARP 打满，旁边的真机跟着读失败。
+5. `save_scan(keep_ips=roster)`：只落库在线机 + 名册内机（见 §6）。
+6. `upsert_known_miners`：在线机写回名册。
+7. `last_finished` 立即更新（看门狗据此判活），后续各步包 try/except 不互相影响。
+8. `alerts.evaluate` / 集装箱评估 / `kick_offline_containers` / `prune`。
+9. WS 推送。
 
 ### 5.2 告警状态机 `alerts.evaluate`
 - 对比**同类**上一次扫描（`prev_scan_id(kind)`，避免 quick/full 混排污染基准）。
@@ -151,8 +152,9 @@
 - **两档扫描**。`quick` 只探名册（约5千台，`scan_interval` 300s），`full` 展开全网段发现新机
   （约1.5万地址，`full_interval` 3600s）。合成一档 = 扫描耗时逼近间隔 = 系统"永远在扫"，
   既压三层也让 WAL checkpoint 追不上。间隔从上一轮**扫完**开始算(不扣本轮耗时)，单轮再慢也不会
-  连轴扫。全网发现分两段：先用巡检并发探名册内机器，再用 `discovery_workers` 探其余空地址——
-  混在一起时空地址等满判活超时、让三层交换机狂发 ARP，同时在探的真机跟着超时，每小时一轮误报。
+  连轴扫。全网发现分两段：先用巡检并发探名册内机器并二次确认，再用 `discovery_workers` 分批探其余空地址
+  （每批 `discovery_batch`，批间停 `discovery_pause_sec`）。混在一起、或空地址连续探一两分钟，都会让三层交换机
+  狂发 ARP，同时在探的真机跟着超时，每小时一轮误报。名册阶段已大面积掉线时，本轮跳过空地址。
 - **H7：死 IP 不落库**。全扫地址里大部分是从未是矿机的死 IP；`save_scan(keep_ips=roster)` 只存
   "在线机 + 名册内（曾在线/维修）的离线机"。`scans.total/online/offline` 随之表示**真实机器**口径。
   只有**全新部署的第一轮**退化为全量落库（否则 offline 恒 0、面板误显示全在线）；

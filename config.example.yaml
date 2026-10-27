@@ -12,7 +12,11 @@ scan:
   online_timeout: 3.0   # 在线判定超时(秒)：单台最多等 3 秒，扫描慢一点但不会把慢响应的矿机误报掉线；低于 3 按 3
   data_timeout: 5.0     # 取算力超时(秒)
   workers: 300          # 名册巡检并发(已知真机,可高)
-  discovery_workers: 300 # 全网发现并发
+  discovery_workers: 300 # 全网发现并发(只用于空地址这一段)
+  # 空地址不要一口气探完：连续一两分钟、每秒上百个死地址 ARP，交换机会把真机一起读丢。
+  # 每批这么多个，批与批之间停一下。pause 设 0 就是连续探(大场地容易误伤在线机)。
+  discovery_batch: 1000
+  discovery_pause_sec: 5
   liveness_gate: true   # 发现时先快速 TCP 连 80 判活(三类设备都开80)，死IP不再白跑3个探测
   gate_timeout: 3.0     # 判活连接超时(秒)；低于 3 按 3(太短会把慢响应的矿机判成离线)
   max_pps: 300          # 每秒新建连接上限(≈死IP的ARP速率)，保护三层500pps CoPP；代码强制上限500，不可配更高
