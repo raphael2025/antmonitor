@@ -43,8 +43,9 @@ Code nach `%LOCALAPPDATA%\AntMonitor\antmonitor`, Desktop-Verknüpfung, Start vo
 Übernehmen → Standortname → aktivieren → speichern. „🔌 Verbindung testen“ und die Statuszeile zeigen, ob gemeldet wird.
 Eine Cloud ohne Domain (`https://IP:Port`) braucht den **Zertifikat-Fingerabdruck**; er steckt im Code.
 
-**Weniger Fehlalarme auf großen Standorten:** Offline/Segment/Standort und Null-Hashrate werden in der nächsten Runde
-bestätigt (`alerts.offline_confirm_sec`, `zero_confirm_sec` = 240 s), Übertemperatur nach 2 Runden, ein Massenausfall
+**Weniger Fehlalarme auf großen Standorten:** ein Miner offline oder mit Null-Hashrate wird nach 20 s mit längerem Timeout
+erneut abgefragt und erst dann (in derselben Runde) gemeldet; ein komplett ausgefallenes Segment wird nicht erneut abgefragt und sofort
+als ein Alarm gemeldet (`alerts.offline_confirm_sec` / `zero_confirm_sec` = 240 wartet zusätzlich die nächste Runde ab), Übertemperatur nach 2 Runden, ein Massenausfall
 ergibt einen einzigen Standort-Alarm. Hängt die Miner-Weboberfläche, wird die Hashrate über Port 4028 gelesen.
 
 Siehe [SECURITY](../SECURITY.md).

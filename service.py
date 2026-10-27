@@ -465,7 +465,8 @@ class MonitorService:
         self.progress["loop_beat"] = self.progress["progress_ts"] = ts
 
     def _reconfirm(self, miners, gen=None):
-        """对"上次在线、本次掉线/零算力"的机器二次确认：宽松超时重探(可多轮)。"""
+        """对"上次在线、本次掉线/零算力"的机器二次确认：等一会儿再用宽松超时重探(可多轮)，
+        重探后仍掉线/零算力的当轮就报警(不再等下一轮)。整段掉线的网段不重探。"""
         if gen is not None and gen != self._scan_gen:
             return miners
         sc = self.cfg["scan"]
@@ -494,6 +495,29 @@ class MonitorService:
         if went_off > sc.get("reconfirm_max", 800):
             log.info("二次确认跳过: %d 台同时掉线超过上限，判定为真实的大面积事件", went_off)
             return miners
+        # 整段掉线(交换机/断电)不重探：这段的机器直接按本轮结果报整段掉线，二次确认只给零散
+        # 掉线的机器。以前整段 200 多台每台都要等宽松超时重探两遍，一轮拖慢好几分钟才报出来
+        acfg = self.cfg.get("alerts") or {}
+        seg_ratio = float(acfg.get("segment_down_ratio", 0.6) or 0)
+        seg_min = int(acfg.get("segment_down_min", 5) or 1)
+        seg_prev, seg_off = {}, {}
+        for r in miners:
+            if r["ip"] not in prev_online:
+                continue
+            seg = ".".join(r["ip"].split(".")[:3])
+            seg_prev[seg] = seg_prev.get(seg, 0) + 1
+            if r["status"] == "offline":
+                seg_off[seg] = seg_off.get(seg, 0) + 1
+        whole = {seg for seg, off in seg_off.items()
+                 if seg_ratio and off >= seg_min and off / seg_prev[seg] >= seg_ratio}
+        if whole:
+            log.info("二次确认: 网段 %s 整段掉线，不重探(直接报整段掉线)",
+                     "、".join(sorted(whole)[:10]))
+            off_ips = {r["ip"] for r in miners if r["status"] == "offline"}
+            suspects = [ip for ip in suspects
+                        if not (ip in off_ips and ".".join(ip.split(".")[:3]) in whole)]
+            if not suspects:
+                return miners
         # 零算力类疑似单独设上限：全场同时掉算力(矿池故障/限电开始那一轮)时别用宽松超时把
         # 全场重探一遍——那是真实的大面积事件，重探也不会变好，只会压网络、拖长这一轮
         sus0 = set(suspects)

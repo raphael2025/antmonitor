@@ -43,8 +43,9 @@ Código en `%LOCALAPPDATA%\AntMonitor\antmonitor`, acceso directo en el escritor
 Aplicar → nombre del sitio → activar → guardar. «🔌 Probar conexión» y la línea de estado muestran si el envío funciona.
 Una nube sin dominio (`https://IP:puerto`) requiere la **huella del certificado**; ya va en el código.
 
-**Menos falsas alarmas en sitios grandes:** desconexión/segmento/sitio completo y hashrate cero se confirman en la
-ronda siguiente (`alerts.offline_confirm_sec`, `zero_confirm_sec` = 240 s), sobretemperatura 2 rondas seguidas y una
+**Menos falsas alarmas en sitios grandes:** un minero desconectado o con hashrate cero se vuelve a sondear a los 20 s con
+más tiempo de espera y solo entonces alarma (en la misma ronda); un segmento caído entero no se re-sondea y da una sola alarma
+(`alerts.offline_confirm_sec` / `zero_confirm_sec` = 240 para esperar además a la ronda siguiente), sobretemperatura 2 rondas seguidas y una
 caída masiva da una sola alarma de sitio. Si la web del minero se cuelga, el hashrate se lee por el puerto 4028.
 
 Ver [SECURITY](../SECURITY.md).
