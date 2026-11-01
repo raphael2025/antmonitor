@@ -101,17 +101,21 @@
     <form id="cloudBindingForm" class="modal-box cloud-box" novalidate>
       <div class="modal-head"><span id="cloudTitle" data-i18n="header.cloud">☁ 连接云端</span><button id="cloudClose" type="button" data-i18n-title="cloud.close" aria-label="Close">×</button></div>
       <div class="cloud-body">
-        <p class="muted" data-i18n="cloud.intro">在云端面板「场地接入」复制接入码，粘贴到这里，点一次「连接云端」即可。</p>
+        <p class="muted" data-i18n="cloud.intro">复制云端给出的整份场地接入信息，点击「粘贴接入信息并连接」即可。地址、上报凭据和场地信息会一起填好。</p>
         <fieldset id="cloudFields">
-          <label class="cloud-field" for="cloudCode"><span data-i18n="seg.connect_code">接入码</span>
+          <button id="cloudPaste" type="button" class="primary cloud-paste" data-i18n="cloud.paste_connect">粘贴接入信息并连接</button>
+          <label class="cloud-field" for="cloudCode"><span data-i18n="cloud.connection_info">场地接入信息</span>
             <input id="cloudCode" type="password" autocomplete="off" spellcheck="false" maxlength="16384" placeholder="AMC1-…" aria-describedby="cloudCodeHint"></label>
           <p id="cloudCodeHint" class="cloud-hint muted"></p>
-          <div class="cloud-site-row">
+          <details id="cloudSiteDetails" class="cloud-site-details">
+            <summary><span data-i18n="cloud.site_details">场地信息（自动填写）</span> <strong id="cloudSiteSummary"></strong></summary>
+            <div class="cloud-site-row">
             <label class="cloud-field" for="cloudName"><span data-i18n="seg.site_name">场地名</span>
               <input id="cloudName" type="text" maxlength="64" autocomplete="off" data-i18n-placeholder="seg.site_name_ph" placeholder="云端显示名，如 内蒙一场"></label>
             <label class="cloud-field" for="cloudType"><span data-i18n="seg.site_type">类型</span>
               <select id="cloudType"><option value="air" data-i18n="seg.type_air">❄ 风冷</option><option value="hydro" data-i18n="seg.type_hydro">💧 水冷</option><option value="mixed" data-i18n="seg.type_mixed">🌀 混合</option></select></label>
-          </div>
+            </div>
+          </details>
           <details id="cloudAdvanced" class="cloud-advanced">
             <summary data-i18n="cloud.advanced">高级设置 / 手动填写</summary>
             <label class="cloud-field" for="cloudUrl"><span data-i18n="seg.cloud_url">云端地址</span><input id="cloudUrl" type="url" autocomplete="off" placeholder="https://overview.example.com"></label>
@@ -126,7 +130,6 @@
         <div class="cloud-status-card">
           <strong data-i18n="cloud.current_status">当前上报状态</strong>
           <p id="cloudStatus" class="muted" role="status" aria-live="polite"></p>
-          <a id="cloudOpen" class="hidden" target="_blank" rel="noopener noreferrer" data-i18n="cloud.open">打开云端面板 ↗</a>
         </div>
       </div>
       <div class="modal-foot"><button id="cloudCancel" type="button" data-i18n="cloud.close">关闭</button><button id="cloudConnect" type="submit" class="primary" data-i18n="header.cloud">☁ 连接云端</button></div>

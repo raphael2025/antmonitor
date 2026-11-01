@@ -50,6 +50,7 @@ function Find-RepairPython([string]$Base) {
 $temporary = $null
 $oldPath = $env:PATH
 $oldUtf8 = $env:PYTHONUTF8
+$oldDownloadSource = $env:MINER_DOWNLOAD_SOURCE
 # Windows PowerShell 5.1 can start its provider in PSHOME when the native
 # working directory contains '['. Capture the real process directory before
 # running Python: a native invocation can synchronize it to the provider path.
@@ -105,6 +106,7 @@ try {
     $resultFile = Join-Path $temporary 'result.json'
     $prefix = $python.Prefix
     $env:PYTHONUTF8 = '1'
+    $env:MINER_DOWNLOAD_SOURCE = $Source
     # PowerShell 5.1 can turn native stderr into terminating errors under Stop.
     # Let Python print its precise error, then check its actual exit status.
     $ErrorActionPreference = 'Continue'
@@ -140,5 +142,6 @@ try {
 } finally {
     $env:PATH = $oldPath
     $env:PYTHONUTF8 = $oldUtf8
+    $env:MINER_DOWNLOAD_SOURCE = $oldDownloadSource
     if ($temporary) { Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue }
 }

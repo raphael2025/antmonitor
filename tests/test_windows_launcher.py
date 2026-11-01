@@ -62,6 +62,29 @@ def test_missing_module_repaired_even_when_requirements_unchanged(tmp_path, monk
     assert any("install" in c and "--force-reinstall" in c for c in calls)
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_local_dependency_wheels_disable_index_access(tmp_path, monkeypatch, explicit):
+    environment(tmp_path)
+    wheels = tmp_path / ("my wheels" if explicit else "offline/wheels")
+    wheels.mkdir(parents=True)
+    if explicit:
+        monkeypatch.setenv("MINER_WHEELHOUSE", "my wheels")
+    else:
+        monkeypatch.delenv("MINER_WHEELHOUSE", raising=False)
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append([str(arg) for arg in args])
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(launcher.subprocess, "run", run)
+    launcher.prepare_environment(tmp_path)
+    install = next(call for call in calls if "install" in call)
+    assert "--no-index" in install
+    assert install[install.index("--find-links") + 1] == str(wheels)
+    assert "--only-binary=:all:" in install
+
+
 def test_failed_install_not_marked_successful(tmp_path, monkeypatch):
     """首次安装(依赖还 import 不了)失败：必须报错停下，不能标记为已安装。"""
     environment(tmp_path)

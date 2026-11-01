@@ -16,6 +16,11 @@
       const d = JSON.parse(text);
       if (!d || Array.isArray(d) || typeof d.u !== "string" || !d.u.trim()
           || typeof d.t !== "string" || !d.t.trim()) return null;
+      if (/[\s\u0000-\u001f\u007f]/.test(d.u.trim()) || /[\u0000-\u001f\u007f]/.test(d.t.trim())) return null;
+      if (!/^https?:\/\//i.test(d.u.trim())) return null;
+      const url = new URL(d.u.trim());
+      if (!["http:", "https:"].includes(url.protocol) || !url.hostname
+          || url.username || url.password || url.search || url.hash) return null;
       for (const key of ["f", "s", "n", "y"]) {
         if (d[key] != null && typeof d[key] !== "string") return null;
       }
@@ -25,7 +30,7 @@
       if (sid && ([...sid].length > 64 || /[\u0000-\u001f\u007f]/.test(sid)
           || /^\p{White_Space}|\p{White_Space}$/u.test(sid))) return null;
       if (d.y && !TYPES.includes(d.y)) return null;
-      if (d.n && [...d.n.trim()].length > 64) return null;
+      if (d.n && ([...d.n.trim()].length > 64 || /[\u0000-\u001f\u007f]/.test(d.n))) return null;
       return { u: d.u.trim(), t: d.t.trim(), f: d.f || "", s: sid,
                n: (d.n || "").trim(), y: d.y || "" };
     } catch (e) { return null; }

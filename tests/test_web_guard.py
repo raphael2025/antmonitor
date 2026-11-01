@@ -80,6 +80,25 @@ def test_public_cloud_url_must_be_https(app):
     assert r.status_code == 200
 
 
+@pytest.mark.parametrize("url", [
+    "https://user:secret@cloud.example.test", "https://cloud.example.test?token=secret",
+    "https://cloud.example.test#fragment", "https://cloud .example.test",
+    "https://cloud.example.test/a b", "https://cloud.example.test:bad",
+])
+def test_cloud_url_rules_match_terminal_before_testing_or_saving(app, monkeypatch, url):
+    server, c = app
+    current = dict(server.appconfig.DEFAULTS["cloud"])
+    monkeypatch.setitem(server.CFG, "cloud", current.copy())
+    calls = []
+    monkeypatch.setattr(server.cloud_report, "test", lambda *args: calls.append("test"))
+    monkeypatch.setattr(server.appconfig, "update_settings", lambda body: calls.append("save"))
+    body = {"cloud": {"enabled": True, "url": url, "token": "new-test-token",
+                       "site_name": "New site", "site_id": "site-new"}}
+    assert c.post("/api/cloud/test", json=body).status_code == 400
+    assert c.post("/api/settings", json=body).status_code == 400
+    assert not calls and server.CFG["cloud"] == current
+
+
 def test_cloud_token_is_never_echoed_and_blank_keeps_it(app, monkeypatch):
     server, c = app
     monkeypatch.setitem(server.CFG, "cloud", dict(server.CFG.get("cloud") or {}))

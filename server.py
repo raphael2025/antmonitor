@@ -35,6 +35,7 @@ import alerts
 import appconfig
 import auth
 import cloud_alert_summary
+import cloud_connect
 import cloud_report
 import control
 import db
@@ -948,6 +949,11 @@ def _cloud_form(c, keep_token=True):
     if fp is None:
         return None, "证书指纹格式不对：应为 64 位十六进制(可带冒号)，从云端面板「场地接入」复制"
     url = str(c.get("url") or "").strip().rstrip("/")
+    if url:
+        try:
+            url = cloud_connect.validate_url(url)
+        except cloud_connect.SetupError as error:
+            return None, str(error)
     if not token and keep_token and cur.get("token"):
         # 沿用已保存的 token 只限地址和指纹都没变：否则改个地址就能让本服务把 token
         # 明文发到任意服务器——浏览器拿不到 token 的保护就白做了
@@ -955,6 +961,8 @@ def _cloud_form(c, keep_token=True):
         if url != str(cur.get("url") or "").rstrip("/") or fp != saved_fp:
             return None, "云端地址或证书指纹改了，请重新填写上报 token(或粘贴新的接入码)"
         token = str(cur.get("token") or "")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in token):
+        return None, "上报 token 格式不对，请重新复制完整接入信息"
     cl = {"enabled": c.get("enabled", False),
           "url": url,
           "token": token,
@@ -980,17 +988,6 @@ def _cloud_form(c, keep_token=True):
         return None, "cloud.enabled 须为布尔值"
     if cl["enabled"] and not (cl["url"] and cl["token"] and cl["site_name"]):
         return None, "启用上报需填写 云端地址/上报token/场地名"
-    if cl["url"] and not cl["url"].startswith(("http://", "https://")):
-        return None, "云端地址须以 http:// 或 https:// 开头"
-    if cl["url"].startswith("http://"):   # 明文上报会暴露 token 和场地数据；只放行内网调试地址
-        h = _host_name(cl["url"][7:].split("/", 1)[0])
-        try:
-            ip = ipaddress.ip_address(h)
-            private = ip.is_private or ip.is_loopback
-        except ValueError:
-            private = h == "localhost"
-        if not private:
-            return None, "公网云端地址必须用 https://(云端没有域名时用 https://IP:端口 + 证书指纹)"
     return cl, ""
 
 

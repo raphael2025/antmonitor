@@ -230,6 +230,9 @@ class CloudSetupTests(unittest.TestCase):
                    connect_code(u="http://public.example.invalid"), connect_code(f="bad-fingerprint"),
                    connect_code(s="x" * 65), connect_code(s="\n\x7f"), connect_code(s=" site "),
                    connect_code(s="云海\n 二期"),
+                   connect_code(s=123), connect_code(f=42), connect_code(y=["air"]),
+                   connect_code(u="https://cloud. example.invalid"), connect_code(t="token\nvalue"),
+                   connect_code(n="bad\nname"), connect_code(n="x" * 65),
                    connect_code(n=["wrong"]), connect_code(y="water")]
         before = self.settings.read_bytes()
         for code in invalid:
@@ -238,6 +241,24 @@ class CloudSetupTests(unittest.TestCase):
                 self.assertEqual(status, 1)
                 ping.assert_not_called()
                 self.assertEqual(self.settings.read_bytes(), before)
+
+    def test_connection_error_redacts_code_and_report_token(self):
+        code = connect_code(n="site", y="air")
+        before = self.settings.read_bytes()
+        status, output, _ping = self.run_setup(code, result=(False, "test-token-only " + code))
+        self.assertEqual(status, 1)
+        self.assertNotIn("test-token-only", output)
+        self.assertNotIn(code, output)
+        self.assertEqual(self.settings.read_bytes(), before)
+
+    def test_yaml_parse_error_does_not_echo_config_secrets(self):
+        self.config.write_text("cloud: [token: hidden-secret\n")
+        before = self.settings.read_bytes()
+        status, output, ping = self.run_setup(connect_code(n="site", y="air"))
+        self.assertEqual(status, 1)
+        self.assertNotIn("hidden-secret", output)
+        ping.assert_not_called()
+        self.assertEqual(self.settings.read_bytes(), before)
 
     def test_corrupt_settings_are_not_replaced(self):
         self.settings.write_text('{"cloud":')

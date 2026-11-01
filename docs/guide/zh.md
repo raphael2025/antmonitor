@@ -25,7 +25,9 @@ AntMonitor 是矿场**局域网**批量监控与运维系统：看清全场算�
 ## 部署
 
 **环境**：Ubuntu 20.04+ 或 Windows 10/11；监控机能访问矿机网段。
-Ubuntu 的 GitHub / Gitee 安装命令都会自动准备 Git / Python；Windows Gitee 方式需要系统先装好 Git for Windows。
+GitHub / Gitee 是代码下载网站，无需注册账号，也无需安装这两个网站的客户端。
+Ubuntu 和 Windows 的两种安装入口都会自动准备 Git / Python。
+Ubuntu 的下载命令需要 `curl`；系统没有时先运行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`。
 
 ### Ubuntu：一键安装
 
@@ -83,7 +85,9 @@ curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bas
 ```
 
 已有官方 Git 部署时，显式 `--source github` / `--source gitee` 会将 `origin` 切换到对应官方仓库，
-网页「⬆ 版本」也会从该来源更新。原来不带 `--source` 的命令仍可用：新装默认 GitHub，已有安装保留 `origin`；自维护仓库或 fork 不会被自动改写，
+网页「⬆ 版本」也会从该来源更新。原来不带 `--source` 的命令仍可用：新装默认 `auto`，先尝试 GitHub，失败再尝试 Gitee。
+已有安装保留 `origin`；自动模式中，官方来源 fetch 网络失败时可临时从另一平台同分支获取更新，只接受快进，不回退到旧版本。
+自维护仓库或 fork 不会自动切到官方仓库，
 使用这类仓库时请省略 `--source`，沿用原来源。两个平台的分支与提交以仓库实际发布内容为准。
 
 自定义安装目录仍需补 `--dir '/实际安装目录'`。使用安装目录的属主用户核对来源：
@@ -182,24 +186,25 @@ sudo journalctl -u antmonitor -n 50 --no-pager
 
 在 PowerShell（不需要管理员）里执行，按下载源选一条：
 
-**GitHub（无需提前安装 Git）：**
+**GitHub：**
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1'))) -Source github
 ```
 
-**Gitee（系统先安装 Git for Windows，且 `git --version` 可用）：**
+**Gitee（无需先安装 Git）：**
 
 ```powershell
 & ([scriptblock]::Create((irm 'https://gitee.com/raphael01/antmonitor/raw/main/install.ps1'))) -Source gitee
 ```
 
-Gitee 方式会自动克隆源码，无需自己执行 `git clone`。如果提示找不到 Git，请安装 Git for Windows，
-重新打开 PowerShell 后重试；Gitee 模式不会自动下载 Git，也不使用仓库 ZIP 下载页。
+Gitee 方式先自动准备可用的 Git，再从 Gitee 克隆源码；这一准备过程使用 PowerShell，不依赖尚未安装的 Python。
+便携 Git 优先从 SourceForge 下载，并校验与官方固定版本一致的 SHA256；不需要先成功访问 GitHub。
+显式 `-Source gitee` 不会切到 GitHub 下载项目源码，也不会把 Gitee 的归档网页当 ZIP 解压。
 
 两种方式默认安装到 `%LOCALAPPDATA%\AntMonitor\antmonitor`，在桌面创建「AntMonitor」快捷方式并启动。
 没有 Python 时会从 python.org 下载并验证签名后按当前用户安装，再创建虚拟环境、安装依赖并提示设置 admin 密码。
-GitHub ZIP 安装会自动准备 Git 部署以支持网页更新；Gitee 安装直接保留克隆仓库的 `origin`。
+正常安装会优先创建 Git 部署以支持网页更新；Gitee 安装保留 Gitee 的 `origin`。
 以后双击桌面快捷方式启动，窗口里按 Ctrl+C 停止；日常版本更新使用网页入口。
 
 **已有 Windows 安装**：再次运行任一安装脚本只会启动已有程序，`-Source gitee` 不会改变已有 `origin`。
@@ -248,18 +253,62 @@ git remote get-url origin
 请保存本地改动后再处理；不要删除配置和数据库来绕过提示。
 
 **下载源说明：** `-Source gitee` 从 Gitee 下载恢复程序，没有 `.git` 的源码 ZIP 会以 Gitee 为更新源；
-已有 Git 仓库的 `origin` 始终保留，不会借修复切换来源。需要自动安装便携 Git 时，两种恢复入口都使用
-Git for Windows 的官方 GitHub 发布包，并验证固定 SHA256；Gitee 入口不会代理这个下载。
-若电脑无法访问该发布地址，可先安装可用的 Git for Windows、重新打开 PowerShell，再运行恢复命令。
+已有 Git 仓库的 `origin` 始终保留，不会借修复切换来源。需要自动安装便携 Git 时，Gitee 入口优先使用 SourceForge 镜像，
+再尝试官方 GitHub；GitHub 入口顺序相反。两个来源均须符合内置的固定版本 SHA256。
+也可先设置 `$env:MINER_MINGIT_ZIP='D:\packages\MinGit-2.56.0-64-bit.zip'` 使用已拷入的对应架构文件，再执行恢复命令。
 
 管理员排查时可以添加 `-NoStart` 只修复而不启动。旧启动器可能还不认识新缓存位置，之后应再次运行不带
 `-NoStart` 的同一命令启动，再完成网页更新。以 Windows 服务运行的部署需使用该服务的运行用户处理 Git 路径并重启服务。
 
+### 无法访问代码托管平台
+
+**只有 GitHub 不通**：直接选上面的 Gitee 一键命令。**不确定哪边能通**：使用 [README 的自动选择命令](../../README.md#三分钟上手)，
+脚本和源码都会尝试可用来源。`--source auto` / `-Source auto` 是默认行为；显式指定 `github` / `gitee` 会固定项目源码来源。
+如果最前面的脚本下载已经失败，脚本内部自然无法运行，因此自动入口会先完整下载到临时文件或变量，成功后才执行一次。
+
+**两个网站都不通，但已取得源码**：在能访问仓库的电脑下载完整 ZIP，拷到监控机。
+
+```bash
+# Ubuntu：解压并进入源码目录后执行，不要附加 --source
+sudo bash install.sh --dir /opt/antmonitor
+```
+
+```powershell
+# Windows：在解压后的完整源码目录执行，自动使用这份本地源码
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
+
+# 或明确指定另一份本地源码目录 / ZIP
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -SourcePath 'D:\packages\antmonitor.zip'
+```
+
+本地安装不会为获取项目源码再访问 GitHub / Gitee。默认目标目录不变；Windows 可事先设置 `ANTMONITOR_HOME`，
+安装中断留下的非完整目录会明确报错，不能把只有 `server.py` 的半份源码误当成成功安装。
+已有完整 Windows 安装只启动原程序，不覆盖其配置、数据库或更新来源。
+
+**完全离线还需要准备运行环境和依赖**。普通源码 ZIP 没有打包系统软件、Python 安装器或所有 wheels；请按目标系统、CPU 架构和 Python 版本提前准备：
+
+| 环境 | 本地文件入口 |
+|---|---|
+| Windows 便携 Git | `MINER_MINGIT_ZIP` 指向固定 2.56.0 对应架构的 MinGit ZIP，仍校验 SHA256；Git 主要供在线更新使用。 |
+| Windows Python | `MINER_PYTHON_INSTALLER` 指向 Python 安装器，仍校验 Python Software Foundation 的签名；也可已有兼容的 Python。 |
+| Windows Python 依赖 | `MINER_WHEELHOUSE` 指向 wheels 目录，或放到项目 `offline\wheels`；使用 `--no-index`，不会转去在线索引补包。 |
+| Ubuntu Python 依赖 | `ANTMONITOR_WHEELHOUSE` 指向 wheels 目录，或放到项目 `offline/wheels`；使用 `--no-index`。 |
+
+Windows 也会自动识别项目 `offline\MinGit-2.56.0-64-bit.zip`（按架构换成 `32-bit` / `arm64`）和
+`offline\python-3.13.16-amd64.exe`（按架构选择官方文件名）。请使用绝对路径设置环境变量。
+Ubuntu 的 Git、Python、venv、pip、curl、CA 证书等系统包仍需系统软件源或管理员预先准备的安装资源；
+有本地 wheels 只解决 Python 包下载，不会自动解决系统包安装。
+未准备本地文件时，Windows 仍需能访问 Python 下载站和 pip 下载源；Gitee 并不代理这些网站。
+
+无 `.git` 的源码包能用于安装和运行；两个平台都无法访问时不能凭空恢复网页 Git 更新。
+网络恢复后再运行 Git 恢复入口或使用管理员保留的源码更新流程，不要删除配置或数据库来处理网络问题。
+
 ### 装好以后
 
 1. 浏览器打开面板，用 admin 登录 → 右上「⚙ 网段」填矿机网段 → 保存并全网扫描。
-2. 接入云端：从云端面板「🔌 场地接入」复制**接入码**，回到本地顶部独立的 **「☁ 连接云端」** 窗口粘贴。
-   新码会自动显示场地名、风冷 / 水冷 / 混合类型，核对后点一次 **「连接云端」**，程序自动测试、保存并启用上报。
+2. 接入云端：云端「🔌 场地接入」填好场地名称和类型，确认管理员密码，点 **「生成并复制接入信息」**。
+   回到本地顶部 **「☁ 连接云端」**，点 **「粘贴接入信息并连接」**。局域网 HTTP 页面若提示无法自动读取剪贴板，直接按 **Ctrl+V**，程序就会继续验证和保存。
+   地址、token、名称、风冷 / 水冷 / 混合类型及证书指纹（需要时）自动带入，不用逐项填写。本地连接窗口不再提供跳转云端面板的链接。
    旧码仍可使用，缺少名称时补填一次；已有场地信息会保留，可直接编辑。连接过程不会改变网段或扫描设置。
 3. 连接窗口持续显示真实状态：**未连接 → 测试中 → 已保存等待首扫 / 首次上报 → 上报成功**。
    本地尚未扫描时，设置矿机网段并开始全网扫描，完成后自动上报；网络或云端异常会显示失败原因并自动重试。
@@ -269,6 +318,17 @@ Git for Windows 的官方 GitHub 发布包，并验证固定 SHA256；Gitee 入�
    需要暂时停止时，点高级设置内的 **「暂停当前上报」**，连接信息会保留；再点「连接云端」即可恢复。
 5. 上报 token 保存后不再明文显示（只提示已填写，较长 token 显示末 4 位）；云端地址和证书指纹未改变时，
    输入框留空保存会沿用原 token。更换地址或指纹后，需要重新填写 token 或粘贴新的接入码。
+
+**同一份接入信息也能在命令界面使用：**
+
+| 场地系统 | 已安装后的操作 |
+|---|---|
+| Ubuntu | 在安装目录运行 `sudo bash install.sh connect --dir .`，按提示粘贴并回车；验证通过后保存并重启原服务。 |
+| Windows | 双击安装目录的 `connect-cloud.bat`，或在该目录 PowerShell 运行 `.\connect-cloud.bat`，按提示粘贴并回车。 |
+
+Windows 命令会隐藏粘贴内容。验证失败不会保存；成功后若原监控端口空闲，会打开原 `run.bat`。
+若原监控仍在运行或无法确认端口空闲，会明确提示「配置已保存，请重启原监控」，不会强行结束进程或启动第二个监控实例。
+Ubuntu 旧版本尚无最新脚本时，使用上方 GitHub / Gitee 的 `connect` 一键入口即可。
 
 ### 日间与夜间主题
 

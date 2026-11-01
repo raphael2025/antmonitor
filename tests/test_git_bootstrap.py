@@ -177,6 +177,51 @@ def test_portable_git_reuses_working_legacy_install(portable_archive):
     assert downloads == []
 
 
+def test_portable_git_uses_verified_mirror_when_github_is_unreachable(monkeypatch, portable_archive):
+    data, downloads = portable_archive
+
+    def download(url, timeout):
+        downloads.append(url)
+        if "github.com" in url:
+            raise OSError("GitHub blocked")
+        return io.BytesIO(data)
+
+    monkeypatch.setattr(git_bootstrap.urllib.request, "urlopen", download)
+    assert git_bootstrap.find_git() is None
+    git = git_bootstrap.install_mingit()
+    assert git_bootstrap.find_git() == git
+    assert [url.split('/')[2] for url in downloads] == ["github.com", "sourceforge.net"]
+
+
+def test_gitee_portable_git_needs_no_github_request(monkeypatch, portable_archive):
+    _, downloads = portable_archive
+    monkeypatch.setenv("MINER_DOWNLOAD_SOURCE", "gitee")
+    git = git_bootstrap.install_mingit()
+    assert git_bootstrap.find_git() == git
+    assert len(downloads) == 1 and downloads[0].startswith("https://sourceforge.net/")
+
+
+def test_offline_git_zip_is_verified_without_network(monkeypatch, portable_archive, tmp_path):
+    data, downloads = portable_archive
+    local = tmp_path / "local-mingit.zip"
+    local.write_bytes(data)
+    monkeypatch.setenv("MINER_MINGIT_ZIP", str(local))
+    git = git_bootstrap.install_mingit()
+    assert git_bootstrap.find_git() == git
+    assert downloads == []
+
+
+def test_bad_offline_git_zip_never_installs_or_silently_downloads(monkeypatch, portable_archive, tmp_path):
+    _, downloads = portable_archive
+    local = tmp_path / "local-mingit.zip"
+    local.write_bytes(b"untrusted local bytes")
+    monkeypatch.setenv("MINER_MINGIT_ZIP", str(local))
+    with pytest.raises(RuntimeError, match="local.*sha256"):
+        git_bootstrap.install_mingit()
+    assert git_bootstrap.find_git() is None
+    assert downloads == []
+
+
 def test_portable_git_never_renames_or_replaces_existing_cache(monkeypatch, portable_archive):
     data, downloads = portable_archive
     legacy = git_bootstrap._mingit_dir()

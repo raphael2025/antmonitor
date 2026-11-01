@@ -55,20 +55,28 @@ while i < len(args) and args[i] in ("-c", "-C"):
 action = args[i]
 real = os.environ["TEST_REAL_GIT"]
 if action == "clone":
-    if os.environ.get("TEST_CLONE_FAIL"):
+    if os.environ.get("TEST_CLONE_FAIL") or (os.environ.get("TEST_GITHUB_FAIL") and "github.com" in args[-2]):
         sys.exit(1)
     repo, dest = args[-2:]
     subprocess.run([real, "clone", "-q", "--branch", "main", os.environ["TEST_TEMPLATE"], dest], check=True)
     subprocess.run([real, "-C", dest, "remote", "set-url", "origin", repo], check=True)
     sys.exit(0)
 if action in ("fetch", "pull"):
-    sys.exit(1 if os.environ.get("TEST_UPDATE_FAIL") else 0)
+    if os.environ.get("TEST_UPDATE_FAIL"):
+        sys.exit(1)
+    if os.environ.get("TEST_ORIGIN_FAIL") and "origin" in args:
+        sys.exit(1)
+    if action == "fetch" and any("gitee.com" in arg or "github.com" in arg for arg in args):
+        sys.exit(subprocess.run([real, *args[:i], "fetch", os.environ["TEST_TEMPLATE"], "main"]).returncode)
+    sys.exit(0)
 sys.exit(subprocess.run([real, *args]).returncode)
 ''')
         self.tool("curl", r'''
 import json, os, sys
 with open(os.environ["TEST_LOG"], "a") as out:
     out.write(json.dumps(["curl", *sys.argv[1:]]) + "\n")
+if os.environ.get("TEST_CURL_FAIL"):
+    sys.exit(22)
 with open(os.environ["TEST_ARCHIVE"], "rb") as archive:
     sys.stdout.buffer.write(archive.read())
 ''')
@@ -103,7 +111,7 @@ sys.exit(1 if os.environ.get("TEST_APT_GIT_FAIL") and sys.argv[-1:] == ["git"] e
         rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return [row for row in rows if tool is None or row[0] == tool]
 
-    def run_installer(self, *args, missing_git=False, local_source=False, operation="sync_code", **extra):
+    def run_installer(self, *args, missing_git=False, local_source=False, local_archive=False, operation="sync_code", **extra):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertEqual(text.count('\nmain "$@"'), 1)
         # Run the real argument parsing and selected installer function, never main's
@@ -113,6 +121,8 @@ sys.exit(1 if os.environ.get("TEST_APT_GIT_FAIL") and sys.argv[-1:] == ["git"] e
             source_dir = self.root / "source"
             shutil.copytree(self.template, source_dir)
             self.git("-C", str(source_dir), "remote", "add", "origin", GITHUB)
+            if local_archive:
+                shutil.rmtree(source_dir / ".git")
             runner = source_dir / "install.sh"
         runner.write_text(text.rsplit('\nmain "$@"', 1)[0] + "\n" + operation + "\n", encoding="utf-8")
         env = {key: value for key, value in os.environ.items()
@@ -152,6 +162,32 @@ sys.exit(1 if os.environ.get("TEST_APT_GIT_FAIL") and sys.argv[-1:] == ["git"] e
         self.assertFalse(any("clone" in row for row in self.calls("git")))
         self.assertFalse(self.calls("curl"))
 
+    @unittest.skipUnless(shutil.which("rsync"), "requires real rsync to check destination preservation")
+    def test_local_archive_updates_source_without_deleting_custom_database_or_other_files(self):
+        self.install.mkdir()
+        (self.install / "server.py").write_text("# old archive installation\n")
+        original = {
+            "config.yaml": b"db:\n  path: other.db\n",
+            "settings.json": b'{"max_pps": 200}\n',
+            "other.db": b"SQLite format 3\x00\xffcustomer database",
+            "other.db-wal": b"customer write-ahead log\x00\xff",
+            "business/notes.txt": b"customer file not shipped with AntMonitor\n",
+        }
+        for name, contents in original.items():
+            target = self.install / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(contents)
+        # A downloaded package can also contain example/local configuration. It
+        # must not overwrite this installation's existing configuration.
+        (self.template / "config.yaml").write_text("db:\n  path: replacement.db\n")
+        result = self.run_installer(local_source=True, local_archive=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.install / "server.py").read_text(), "# fixture\n")
+        for name, contents in original.items():
+            self.assertEqual((self.install / name).read_bytes(), contents, name)
+        self.assertFalse((self.install / ".git").exists())
+        self.assertFalse(self.calls("curl"))
+
     def test_gitee_uses_existing_git_when_apt_git_install_fails(self):
         result = self.run_installer("--source", "gitee", operation="ensure_packages\nsync_code",
                                     TEST_APT_GIT_FAIL="1")
@@ -162,6 +198,57 @@ sys.exit(1 if os.environ.get("TEST_APT_GIT_FAIL") and sys.argv[-1:] == ["git"] e
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.origin(), GITHUB)
+
+    def test_auto_uses_gitee_after_github_clone_failure(self):
+        result = self.run_installer(TEST_GITHUB_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.origin(), GITEE)
+        self.assertFalse(self.calls("curl"))
+        clones = [row for row in self.calls("git") if "clone" in row]
+        self.assertEqual([row[-2] for row in clones], [GITHUB, GITEE])
+
+    def test_explicit_github_never_clones_gitee(self):
+        result = self.run_installer("--source", "github", TEST_GITHUB_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(GITEE in row for row in self.calls("git")))
+        self.assertTrue(self.calls("curl"))
+
+    def test_auto_existing_fallback_keeps_origin_config_and_database(self):
+        self.existing(GITHUB)
+        for name in ("config.yaml", "settings.json", "miner_monitor.db"):
+            (self.install / name).write_bytes(b"keep data\x00\xff")
+        result = self.run_installer(TEST_ORIGIN_FAIL="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.origin(), GITHUB)
+        self.assertTrue(any("fetch" in row and GITEE in row for row in self.calls("git")))
+        for name in ("config.yaml", "settings.json", "miner_monitor.db"):
+            self.assertEqual((self.install / name).read_bytes(), b"keep data\x00\xff")
+
+    def test_auto_never_falls_back_for_custom_origin_or_dirty_tree(self):
+        self.existing(FORK)
+        result = self.run_installer(TEST_ORIGIN_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.origin(), FORK)
+        self.assertFalse(any(GITEE in row for row in self.calls("git")))
+        self.git("-C", str(self.install), "remote", "set-url", "origin", GITHUB)
+        (self.install / "server.py").write_text("# local edits\n")
+        result = self.run_installer(TEST_ORIGIN_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.install / "server.py").read_text(), "# local edits\n")
+        self.assertFalse(any(GITEE in row for row in self.calls("git")))
+
+    def test_both_sources_and_archive_unavailable_preserve_existing_files(self):
+        self.install.mkdir()
+        (self.install / "settings.json").write_bytes(b"keep settings")
+        result = self.run_installer(TEST_CLONE_FAIL="1", TEST_CURL_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.install / "settings.json").read_bytes(), b"keep settings")
+        self.assertFalse((self.install / "server.py").exists())
+
+    def test_relative_directory_is_bound_to_entry_directory(self):
+        result = self.run_installer("--dir", ".", operation='cd /\nprintf "%s" "$INSTALL_DIR"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(Path(result.stdout).resolve(), self.root.resolve())
 
     def test_gitee_clone_failure_never_downloads_an_archive(self):
         result = self.run_installer("--source", "gitee", TEST_CLONE_FAIL="1")
