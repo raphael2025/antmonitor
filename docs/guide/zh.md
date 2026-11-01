@@ -218,6 +218,43 @@ git remote get-url origin
 首次安装、依赖变化时仍需能访问 Python 与 pip 下载源；Python 安装日志在 `%LOCALAPPDATA%\AntMonitor\python-install.log`。
 手动改密码：在项目目录 CMD 执行 `.venv\Scripts\python.exe auth.py passwd admin`。
 
+<a id="windows-web-update-recovery"></a>
+
+### Windows 网页更新恢复
+
+如果 `run.bat` 已能启动监控，但网页显示「找不到 git」，或者控制台显示安装 MinGit 时
+`WinError 5 / 拒绝访问`，可用下面的命令修复更新能力。重新运行普通安装命令只会启动旧程序，不能修复旧启动器。
+
+1. 在原 AntMonitor 控制台按 **Ctrl+C**，等待退出；这会暂时停止监控，不会重启矿机。
+2. 用平时启动监控的同一个 Windows 用户打开 **PowerShell**，不需要管理员，按网络情况选择一条：
+
+```powershell
+# GitHub
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/raphael2025/antmonitor/main/repair-web-updates.ps1')))
+
+# Gitee
+& ([scriptblock]::Create((irm 'https://gitee.com/raphael01/antmonitor/raw/main/repair-web-updates.ps1'))) -Source gitee
+```
+
+3. 脚本会显示所选安装目录。如果不在默认目录，先进入原目录再执行，或在命令末尾添加
+   `-Directory 'D:\我的场地\AntMonitor'`。没有找到安装时，会提示粘贴含 `run.bat` 和 `server.py` 的原文件夹路径。
+   已设置 `ANTMONITOR_HOME` 时优先使用该目录；不要选择另一个新建空目录。
+4. 看到「已恢复 Git 和仓库信息」后，脚本会打开新的监控窗口。登录网页，点击右上角 **「更新」** 安装最新版本。
+   原来已运行的进程不会自动获得新 Git 路径，所以需要上述关闭、重新启动步骤。
+
+恢复过程把辅助程序放到临时目录，不覆盖原项目文件，不重装依赖，也不修改系统 PATH。
+`config.yaml`、`settings.json` 和历史数据库保留；源码 ZIP 会先匹配它原来的历史提交，之后由网页执行正常更新。
+如果程序源码被手动修改，或目录中有会阻挡更新的额外文件，脚本会列出原因并停止，不会删除文件或强制覆盖。
+请保存本地改动后再处理；不要删除配置和数据库来绕过提示。
+
+**下载源说明：** `-Source gitee` 从 Gitee 下载恢复程序，没有 `.git` 的源码 ZIP 会以 Gitee 为更新源；
+已有 Git 仓库的 `origin` 始终保留，不会借修复切换来源。需要自动安装便携 Git 时，两种恢复入口都使用
+Git for Windows 的官方 GitHub 发布包，并验证固定 SHA256；Gitee 入口不会代理这个下载。
+若电脑无法访问该发布地址，可先安装可用的 Git for Windows、重新打开 PowerShell，再运行恢复命令。
+
+管理员排查时可以添加 `-NoStart` 只修复而不启动。旧启动器可能还不认识新缓存位置，之后应再次运行不带
+`-NoStart` 的同一命令启动，再完成网页更新。以 Windows 服务运行的部署需使用该服务的运行用户处理 Git 路径并重启服务。
+
 ### 装好以后
 
 1. 浏览器打开面板，用 admin 登录 → 右上「⚙ 网段」填矿机网段 → 保存并全网扫描。

@@ -146,6 +146,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubus
 python.org 下载并验证签名后安装（当前用户，不需要管理员），之后可在网页上一键更新。
 Windows 已有安装再次运行脚本只会启动程序，保留原来的更新源；换源说明见[中文指南](docs/guide/zh.md#windows一键安装)。
 
+<a id="windows-web-update-recovery"></a>
+
+### Windows 网页提示找不到 Git：一键恢复
+
+适用于已能正常监控，但网页更新提示「找不到 git」，或启动时安装便携 Git 出现 `WinError 5 / 拒绝访问` 的旧版本。
+**先在原 AntMonitor 控制台按 Ctrl+C，等程序停止，再用同一 Windows 用户打开 PowerShell，选一条执行：**
+
+```powershell
+# GitHub
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/raphael2025/antmonitor/main/repair-web-updates.ps1')))
+
+# Gitee
+& ([scriptblock]::Create((irm 'https://gitee.com/raphael01/antmonitor/raw/main/repair-web-updates.ps1'))) -Source gitee
+```
+
+脚本会寻找当前目录或默认安装目录；找不到时提示粘贴含有 `run.bat` 的原文件夹路径。
+恢复成功会自动启动新窗口，随后登录网页点击「更新」，安装最新版本。
+脚本保留原源码、配置和数据库；旧 ZIP 会匹配它原来的发布版本，已有 Git 仓库保留原 `origin`。
+Gitee 选择的是恢复脚本来源，以及无 `.git` 时的仓库来源；缺少 Git 时，便携 MinGit 仍从官方 GitHub 下载并校验。
+自定义目录、网络失败或本地改动的处理见[中文指南 · Windows 网页更新恢复](docs/guide/zh.md#windows-web-update-recovery)。
+
 ### 后续更新与换源
 
 Ubuntu 更新代码、依赖并重启，按希望使用的来源选一条：

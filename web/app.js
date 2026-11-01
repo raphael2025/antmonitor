@@ -1424,8 +1424,15 @@ function renderUpdate(d) {
   _updForce = false;
   if (!d) { b.innerHTML = `<div class="upd-err">${esc(t("upd.check_fail_net"))}</div>`; return; }
   if (d.git === false) {
+    const hint = d.windows_repair ? "upd.windows_repair" :
+      (d.reason === "git_missing" ? "upd.install_git" : "upd.need_git");
     b.innerHTML = `<div class="upd-err">${esc(d.error || t("upd.not_git"))}</div>
-      <div class="upd-note">${esc(t("upd.need_git"))}</div>`;
+      <div class="upd-note">${esc(t(hint))}</div>`;
+    if (d.windows_repair) {
+      b.innerHTML += `<div class="upd-note">${esc(t("upd.repair_docs"))}:
+        <a href="https://github.com/raphael2025/antmonitor#windows-web-update-recovery" target="_blank" rel="noopener noreferrer">GitHub</a>
+        · <a href="https://gitee.com/raphael01/antmonitor#windows-web-update-recovery" target="_blank" rel="noopener noreferrer">Gitee</a></div>`;
+    }
     return;
   }
   if (d.error) {
