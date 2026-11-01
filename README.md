@@ -76,9 +76,10 @@ curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bas
 
 Gitee 命令会自动安装 Git，并从 Gitee 拉取源码；后续网页更新使用同一仓库来源。
 
-自动装依赖、下载代码、建服务并启动，安装时设置 admin 密码（直接回车会生成强密码并显示）。
+自动装依赖、下载代码、建服务并启动，安装时设置 admin 密码（直接回车会生成强密码并显示），
+随后可直接粘贴云端接入码，暂时不接云端就按回车跳过。
 默认安装目录 `/opt/antmonitor`，服务名 `antmonitor`，面板端口 `8800`。
-已安装后再次运行安装入口、不指定 `update` 等动作，有交互终端时会进入管理菜单（更新 / 修复 / 卸载 / 重置账号）。
+已安装后再次运行同一安装入口，有交互终端时会进入管理菜单；选 **6「连接 / 更换云端」** 即可补接云端。
 
 #### Ubuntu 没有桌面，怎样打开面板？
 
@@ -88,9 +89,10 @@ Gitee 命令会自动安装 Git，并从 Gitee 拉取源码；后续网页更新
 1. 在 Ubuntu 终端执行 `hostname -I`，找到另一台电脑能访问的局域网 IP（可能显示多个地址）。
 2. 在 Windows / Mac / 其他电脑的浏览器打开 `http://<Ubuntu监控机IP>:8800`，
    例如 `http://192.168.1.50:8800`，替换成你自己的 Ubuntu IP。
-3. 用 **admin** 登录 → 右上「⚙ 网段」→「☁ 云端上报」。
-4. 从**云端面板「🔌 场地接入」**复制接入码 → 回到本地面板粘贴并点「填入」→ 填场地名、选择类型、勾选启用
-   →「🔌 测试连接」→ **保存**。测试连接不会保存配置；保存后查看下方最近上报成功时间或失败原因。
+3. 用 **admin** 登录 → 顶部 **「☁ 连接云端」**（未连接时会突出显示）。
+4. 从**云端面板「🔌 场地接入」**复制接入码 → 粘贴 → 点 **「连接云端」**。
+   新码会自动填好场地名与类型；旧码缺名称时补填一次。程序自动测试、保存并启用上报，失败时保留原配置和输入。
+   下方状态会持续更新；显示「等待首轮扫描」时，在「⚙ 网段」设置矿机网段并开始全网扫描，完成后自动上报。
 
 **只有 SSH 能访问 Ubuntu？** 在有浏览器的电脑上运行（把用户名和 IP 换成实际 SSH 登录信息）：
 
@@ -103,31 +105,22 @@ ssh -N -L 18800:127.0.0.1:8800 用户名@Ubuntu监控机IP
 
 #### 通过终端接入云端
 
-接入码从**云端面板「🔌 场地接入」**复制。`--connect-code -` 表示运行后在交互终端中隐藏输入，
-不要把包含 token 的接入码直接写进命令。
+从**云端面板「🔌 场地接入」**复制接入码。首次运行上方一键安装命令时，按提示粘贴即可，输入不会显示；
+新码自带场地名和类型，旧码会提示补填。暂时没有接入码，可以回车跳过。
 
-**首次安装时接入云端，按下载源选一条：**
-
-```bash
-# GitHub
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --source github --connect-code - --site-name '你的场地名' --site-type hydro
-
-# Gitee
-curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- --source gitee --connect-code - --site-name '你的场地名' --site-type hydro
-```
-
-**已经安装后接入或更换云端：**当前脚本通过 `update` 处理接入码，
-**会同时更新代码和依赖、保存云端配置并重启服务**。只想修改配置时，使用上面的 Web 面板。
+**已经安装后接入或更换云端：**重跑同一条安装命令，选菜单 **6「连接 / 更换云端」**。
+也可以按脚本下载源选一条，直接进入接入提示：
 
 ```bash
 # GitHub
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- update --source github --connect-code - --site-name '你的场地名' --site-type hydro
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- connect
 
 # Gitee
-curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- update --source gitee --connect-code - --site-name '你的场地名' --site-type hydro
+curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- connect
 ```
 
-把场地名换成实际名称；`hydro` 为水冷，风冷用 `air`，混合用 `mixed`。
+`connect` 只验证连接、保存云端配置并重启现有服务，不更新代码或依赖，也不改变原来的更新源。
+接入码格式或连接测试失败时保留原配置，可立即重试。
 如果原来使用自定义安装目录，还需补 `--dir '/实际安装目录'`。
 接入后核对具体连接测试结果及云端是否出现本场地；详细排查见
 [中文指南 · Ubuntu 无桌面访问与云端配置](docs/guide/zh.md#ubuntu-无桌面访问与云端配置)。
@@ -172,8 +165,12 @@ Windows 日常从网页更新；GitHub / Gitee 仓库是否已有新版本，取
 
 ### 装好以后
 
-admin 登录 →「⚙ 网段」填矿机网段 → 保存并全网扫描。接云端就在同一页「☁ 云端上报」粘贴接入码并点「填入」，
-填场地名、选择类型、勾选启用 →「🔌 测试连接」→ **保存**。保存后查看下方上报状态（最近一次成功 / 失败原因）。
+admin 登录 →「⚙ 网段」填矿机网段 → 保存并全网扫描。
+接云端用顶部 **「☁ 连接云端」**：粘贴接入码，点一次连接；测试通过后自动保存并启用，持续显示等待扫描、上报成功或失败重试。
+手动填写地址、token、证书指纹，以及暂停上报，都在连接窗口的「高级设置」中。
+
+登录页和顶部都能切换 **跟随系统 / 按时间自动 / 日间 / 夜间**，浏览器会记住选择。
+按时间自动使用浏览设备的本地时间：07:00–19:00 为日间，其余为夜间，无需设置服务器。
 
 GitHub 访问慢可使用上面的 Gitee 一键命令，或设置镜像前缀 `GH_PROXY`；也可把源码 ZIP 拷过去，解压后在目录里
 `sudo bash install.sh`（无 `.git` 的源码包不保留 Git 更新来源；Python 依赖仍需能访问 PyPI 或国内镜像）。

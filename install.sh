@@ -3,11 +3,12 @@
 #
 # 一行安装(不用先 git clone，没装 git 也行)：
 #   curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
-# 安装时顺便接入云端(接入码在云端面板「🔌 场地接入」里复制；"-" = 在终端里粘贴，不留在命令历史里)：
-#   curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code - --site-name 内蒙一场
+# 首次交互安装会询问云端接入码，粘贴后自动连接；直接回车可跳过。
+# 已安装后只连接/更换云端，不更新程序：
+#   curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- connect
 #
-# 再跑一次：已安装时出管理菜单(更新 / 修复 / 卸载 / 重置账号)；没有终端时直接更新。
-# 也可直接指定：... | sudo bash -s -- install|update|repair|uninstall|reset-user|menu
+# 再跑一次：已安装时出管理菜单(更新 / 修复 / 卸载 / 重置账号 / 连接云端)；没有终端时直接更新。
+# 也可直接指定：... | sudo bash -s -- install|update|repair|uninstall|reset-user|connect|menu
 # 选项：--lang zh|en|ru|es|de|ar  --dir 安装目录  --branch 分支
 #       --connect-code 接入码  --site-name 场地名  --site-type air|hydro|mixed
 #       --source github|gitee（新装默认 GitHub；已安装未指定时保留 origin）
@@ -33,20 +34,25 @@ ACTION=""
 LANG_CODE=""
 CONNECT_CODE=""
 SITE_NAME=""
-SITE_TYPE="air"
+SITE_TYPE=""
+CLOUD_SETUP_CHANGED=0
 GENERATED_PW=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    install|update|repair|uninstall|reset-user|menu) ACTION="$1" ;;
+    install|update|repair|uninstall|reset-user|connect|configure-cloud|menu) ACTION="$1" ;;
     --lang) LANG_CODE="${2:-}"; shift ;;
     --dir) INSTALL_DIR="${2:-}"; shift ;;
     --branch) BRANCH="${2:-}"; ANTMONITOR_BRANCH="$BRANCH"; shift ;;
     --source)
       [[ $# -ge 2 && -n "${2:-}" ]] || { echo "--source 需要一个值：github 或 gitee" >&2; exit 2; }
       SOURCE="$2"; SOURCE_EXPLICIT=1; shift ;;
-    --connect-code) CONNECT_CODE="${2:-}"; shift ;;
+    --connect-code)
+      [[ $# -ge 2 && -n "${2:-}" ]] || { echo "--connect-code 需要接入码，或用 - 从终端粘贴" >&2; exit 2; }
+      CONNECT_CODE="$2"; shift ;;
     --site-name) SITE_NAME="${2:-}"; shift ;;
-    --site-type) SITE_TYPE="${2:-air}"; shift ;;
+    --site-type)
+      [[ $# -ge 2 && "${2:-}" =~ ^(air|hydro|mixed)$ ]] || { echo "--site-type 只能是 air、hydro 或 mixed" >&2; exit 2; }
+      SITE_TYPE="$2"; shift ;;
     -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]:-/dev/null}" 2>/dev/null || true; exit 0 ;;
     *) echo "未知参数 / unknown option: $1" >&2; exit 2 ;;
   esac
@@ -147,6 +153,13 @@ msg() { # key → 按 LANG_CODE 取文案
     es:m5) echo "Restablecer usuario y contraseña" ;;
     de:m5) echo "Benutzer & Passwort zurücksetzen" ;;
     ar:m5) echo "إعادة تعيين المستخدم وكلمة المرور" ;;
+
+    zh:m6) echo "连接 / 更换云端" ;;
+    en:m6) echo "Connect / change cloud" ;;
+    ru:m6) echo "Подключить / сменить облако" ;;
+    es:m6) echo "Conectar / cambiar nube" ;;
+    de:m6) echo "Cloud verbinden / wechseln" ;;
+    ar:m6) echo "اتصال / تغيير السحابة" ;;
 
     zh:m0) echo "退出" ;;
     en:m0) echo "Exit" ;;
@@ -477,47 +490,310 @@ PY
   ok "admin 密码已设置"
 }
 
-apply_connect_code() {   # 把云端接入码写进 settings.json(与网页「☁ 云端上报」保存的是同一处)
-  # 接入码含 token：写在命令行里本机其他用户用 ps 能看到、也会留在 shell 历史里。
-  # --connect-code - 表示从终端输入；也可用环境变量 ANTMONITOR_CONNECT_CODE 传
-  [[ -z "$CONNECT_CODE" && -n "${ANTMONITOR_CONNECT_CODE:-}" ]] && CONNECT_CODE="$ANTMONITOR_CONNECT_CODE"
-  if [[ "$CONNECT_CODE" == "-" ]]; then
-    CONNECT_CODE=""
-    ask CONNECT_CODE "粘贴云端接入码(AMC1-…，输入不显示): " silent || true
+apply_connect_code() {  # optional=仅处理显式接入码；prompt=主动询问；后两参为现有服务用户/组
+  CLOUD_SETUP_CHANGED=0
+  local mode="${1:-optional}" run_user="${2:-}" run_group="${3:-}" tty=0
+  local code="${CONNECT_CODE:-${ANTMONITOR_CONNECT_CODE:-}}"
+  has_tty && tty=1
+  if [[ "$code" == "-" && "$tty" == 0 ]]; then
+    warn "--connect-code - 需要终端，请在 SSH 终端运行后粘贴接入码；未修改云端配置"
+    return 1
   fi
-  [[ -n "$CONNECT_CODE" ]] || return 0
-  local py; py="$(py_bin)"
-  local name="${SITE_NAME:-$(hostname -s 2>/dev/null || echo site)}"
-  local out
-  if out="$(cd "$INSTALL_DIR" && CODE="$CONNECT_CODE" NAME="$name" TYPE="$SITE_TYPE" "$py" - <<'PY' 2>&1
-import base64, json, os, sys
-sys.path.insert(0, ".")
-import appconfig, cloud_report
-code = os.environ["CODE"].strip()
-if not code.startswith("AMC1-"):
-    print("接入码格式不对(应以 AMC1- 开头)"); sys.exit(1)
-b = code[5:]
-try:
-    d = json.loads(base64.urlsafe_b64decode(b + "=" * (-len(b) % 4)))
-except ValueError:
-    print("接入码解不开，请从云端面板完整复制"); sys.exit(1)
-fp = cloud_report.normalize_fingerprint(d.get("f"))
-if not d.get("u") or not d.get("t") or fp is None:
-    print("接入码内容不完整"); sys.exit(1)
-cl = {"enabled": True, "url": str(d["u"]).rstrip("/"), "token": d["t"], "tls_fingerprint": fp,
-      "site_name": os.environ["NAME"][:64],
-      "site_type": os.environ["TYPE"] if os.environ["TYPE"] in ("air", "hydro", "mixed") else "air"}
-if d.get("s"):
-    cl["site_id"] = str(d["s"])
-appconfig.update_settings({"cloud": cl})
-ok, msg = cloud_report.test(cl, cl.get("site_id") or cloud_report.site_id({"cloud": cl}))
-print(("✓ " if ok else "! ") + msg)
-PY
-  )"; then
-    ok "已接入云端：$(echo "$out" | tail -1)"
-  else
-    warn "接入码没用上：$out(装好后可在面板「⚙ 网段 → ☁ 云端上报」里粘贴)"
+  [[ -n "$code" || "$mode" == prompt ]] || return 0
+  if [[ -z "$code" && "$tty" == 0 ]]; then
+    # 自动化安装不增加交互；独立 connect 会在调用前提示需要接入码。
+    return 0
   fi
+  local py out rc=0; py="$(py_bin)"
+  # 逻辑随一键脚本分发：旧安装也能直接 connect，不需要先下载新模块或更新程序。
+  # 接入码通过环境传给子进程，不进入 Python 命令行；正常交互从 /dev/tty 隐藏读取。
+  out="$(cd "$INSTALL_DIR" && AM_CONNECT_CODE="$code" AM_SITE_NAME="$SITE_NAME" \
+    AM_SITE_TYPE="$SITE_TYPE" AM_HAS_TTY="$tty" AM_RUN_USER="$run_user" AM_RUN_GROUP="$run_group" \
+    "$py" - <<'PY_CLOUD_SETUP' 2>&1
+import base64
+import binascii
+import ipaddress
+import json
+import os
+import secrets
+import socket
+import sys
+from urllib.parse import urlsplit
+
+SITE_TYPES = ("air", "hydro", "mixed")
+
+
+class SetupError(ValueError):
+    pass
+
+
+def site_key(value):
+    """与云端 validate.site_key 一致，仅用于校验，不改写身份；允许中文及中间空格。"""
+    if value is None:
+        return ""
+    text = "".join(ch for ch in str(value) if ch >= " " and ch != "\x7f").strip()[:65]
+    return text if 0 < len(text) <= 64 else ""
+
+
+class Terminal:
+    """在降为服务账户前打开终端；sudo 管道安装也不会从脚本 stdin 取输入。"""
+    def __init__(self):
+        self.reader = open("/dev/tty", "r", encoding="utf-8")
+        try:
+            self.writer = open("/dev/tty", "w", encoding="utf-8")
+        except BaseException:
+            self.reader.close()
+            raise
+
+    def write(self, text):
+        self.writer.write(text + "\n")
+        self.writer.flush()
+
+    def ask(self, text, secret=False):
+        import termios
+        previous = None
+        if secret:
+            previous = termios.tcgetattr(self.reader.fileno())
+            hidden = list(previous)
+            hidden[3] &= ~termios.ECHO
+            termios.tcsetattr(self.reader.fileno(), termios.TCSANOW, hidden)
+        try:
+            self.writer.write(text)
+            self.writer.flush()
+            value = self.reader.readline()
+        finally:
+            if previous is not None:
+                termios.tcsetattr(self.reader.fileno(), termios.TCSADRAIN, previous)
+                self.write("")
+        if not value:
+            raise EOFError
+        return value.strip()
+
+    def close(self):
+        self.reader.close()
+        self.writer.close()
+
+
+def use_service_account(user, group):
+    """整个配置过程按现有服务身份运行，原子替换的 0600 文件也归该账户。"""
+    if not user:
+        return
+    import grp
+    import pwd
+    account = pwd.getpwuid(int(user)) if user.isdigit() else pwd.getpwnam(user)
+    gid = (int(group) if group.isdigit() else grp.getgrnam(group).gr_gid) if group else account.pw_gid
+    if os.geteuid() == account.pw_uid and os.getegid() == gid:
+        return
+    if os.geteuid() == 0:
+        os.initgroups(account.pw_name, gid)
+        os.setgid(gid)
+        os.setuid(account.pw_uid)
+    elif os.geteuid() != account.pw_uid or os.getegid() != gid:
+        raise SetupError("无法切换到现有服务账户，请使用 sudo 运行")
+
+
+def decode_code(code):
+    if not code.startswith("AMC1-"):
+        raise SetupError("接入码格式不对，应以 AMC1- 开头")
+    try:
+        encoded = code[5:]
+        data = json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4),
+                                          altchars=b"-_", validate=True))
+    except (ValueError, UnicodeError, binascii.Error):
+        raise SetupError("接入码解不开，请从云端完整复制") from None
+    if not isinstance(data, dict):
+        raise SetupError("接入码内容不完整")
+    if not isinstance(data.get("u"), str) or not isinstance(data.get("t"), str):
+        raise SetupError("接入码缺少云端地址或上报凭据")
+    url, token = data["u"].strip().rstrip("/"), data["t"].strip()
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        parsed.port  # 校验端口，避免保存无法使用的地址
+    except ValueError:
+        raise SetupError("接入码中的云端地址格式不对") from None
+    if (parsed.scheme not in ("http", "https") or not host or parsed.username
+            or parsed.password or parsed.query or parsed.fragment or not token):
+        raise SetupError("接入码中的云端地址或上报凭据不完整")
+    if parsed.scheme == "http":
+        try:
+            private = ipaddress.ip_address(host).is_private or ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            private = host == "localhost"
+        if not private:
+            raise SetupError("公网云端必须使用 HTTPS，请从云端重新复制接入码")
+    fp = cloud_report.normalize_fingerprint(data.get("f"))
+    if fp is None:
+        raise SetupError("接入码中的证书指纹格式不对")
+    if data.get("s") is not None and data["s"] != "":
+        sid = str(data["s"])
+        if not sid or site_key(sid) != sid:
+            raise SetupError("接入码中的场地 ID 格式不对")
+        data["s"] = sid
+    if data.get("n") is not None and not isinstance(data["n"], str):
+        raise SetupError("接入码中的场地名称格式不对")
+    if data.get("y") is not None and data["y"] not in SITE_TYPES:
+        raise SetupError("接入码中的场地类型须为 air、hydro 或 mixed")
+    data.update(u=url, t=token, f=fp)
+    return data
+
+
+def read_state():
+    # load_settings() 会容忍损坏文件并回退为空；绑定必须严格读，避免丢失原配置。
+    try:
+        with open(appconfig.SETTINGS_FILE, encoding="utf-8") as source:
+            saved = json.load(source)
+    except FileNotFoundError:
+        saved = {}
+    if not isinstance(saved, dict) or ("cloud" in saved and not isinstance(saved["cloud"], dict)):
+        raise SetupError("现有 settings.json 格式异常，已保留原文件")
+    cfg = appconfig.load_config()
+    appconfig.apply_settings(cfg, saved)
+    return dict(cfg.get("cloud") or {})
+
+
+def candidate(data, current, name="", site_type="", terminal=None):
+    # 显式参数 > 新码携带的名称/类型 > 现有有效配置 > 新安装默认值。
+    chosen_name = name.strip() or str(data.get("n") or "").strip()
+    default_name = str(current.get("site_name") or "").strip() or socket.gethostname().split(".")[0] or "site"
+    if not chosen_name:
+        chosen_name = (terminal.ask("场地名称 [" + default_name + "]，回车保留: ")
+                       if terminal else "") or default_name
+    chosen_type = site_type or data.get("y")
+    if not chosen_type:
+        default_type = current.get("site_type") if current.get("site_type") in SITE_TYPES else "air"
+        chosen_type = default_type
+        if terminal:
+            while True:
+                answer = terminal.ask("场地类型 1=风冷 2=水冷 3=混合 [" +
+                                      str(SITE_TYPES.index(default_type) + 1) + "]，回车保留: ")
+                chosen_type = {"1": "air", "2": "hydro", "3": "mixed"}.get(answer, answer) or default_type
+                if chosen_type in SITE_TYPES:
+                    break
+                terminal.write("请输入 1、2、3，或直接回车保留。")
+    if chosen_type not in SITE_TYPES:
+        raise SetupError("场地类型须为 air、hydro 或 mixed")
+    cloud = dict(current)
+    cloud.update(enabled=True, url=data["u"], token=data["t"], tls_fingerprint=data["f"],
+                 site_name=chosen_name[:64], site_type=chosen_type)
+    sid = data.get("s") or current.get("site_id")
+    if not sid:
+        try:
+            with open(cloud_report._ID_FILE, encoding="ascii") as source:
+                sid = source.read().strip()
+        except FileNotFoundError:
+            pass
+        except UnicodeError:
+            raise SetupError("现有场地 ID 文件内容异常，已保留原配置") from None
+    if sid:
+        sid = str(sid)
+        if site_key(sid) != sid:
+            raise SetupError("现有场地 ID 格式异常，请从云端复制本场地的专属接入码")
+    # 候选身份只在测试通过后随 settings 一起保存；失败不生成/改写 cloud_site_id.txt。
+    cloud["site_id"] = sid or "st-" + secrets.token_hex(6)
+    return cloud
+
+
+def configure(code, name="", site_type="", terminal=None):
+    code = code.strip()
+    if code == "-":
+        if terminal is None:
+            raise SetupError("--connect-code - 需要终端，请在 SSH 终端运行后粘贴接入码")
+        code = ""
+    while True:
+        if not code:
+            if terminal is None:
+                raise SetupError("请在 SSH 终端运行 connect 并粘贴接入码")
+            code = terminal.ask("粘贴云端接入码（AMC1-…，输入不显示，回车跳过）: ", secret=True)
+            if not code:
+                print("已跳过连接云端，原配置未修改。")
+                return 10
+        try:
+            data = decode_code(code)
+            current = read_state()
+            cloud = candidate(data, current, name, site_type, terminal)
+            if terminal:
+                terminal.write("正在验证云端连接…")
+            passed, message = cloud_report.test(cloud, cloud["site_id"])
+            if not passed:
+                raise SetupError("连接验证未通过：" + message)
+            # 测试期间若另一位管理员修改了配置，先重新读取，而不是覆盖新设置。
+            latest = read_state()
+            if latest != current:
+                raise SetupError("云端配置刚被其他操作修改，请重新粘贴接入码后重试")
+            appconfig.update_settings({"cloud": cloud})
+            print("连接验证通过，云端配置已保存（场地：" + cloud["site_name"] + "）。")
+            return 0
+        except (SetupError, OSError, ValueError, RuntimeError) as error:
+            message = str(error) + "；未修改原云端配置。"
+            if terminal is None:
+                print(message)
+                return 1
+            terminal.write(message + "\n请重新粘贴接入码，或直接回车跳过。")
+            code = ""
+
+
+def main():
+    terminal = None
+    try:
+        if os.environ.get("AM_HAS_TTY") == "1":
+            terminal = Terminal()
+        use_service_account(os.environ.get("AM_RUN_USER", ""), os.environ.get("AM_RUN_GROUP", ""))
+        sys.path.insert(0, ".")
+        global appconfig, cloud_report
+        import appconfig
+        import cloud_report
+        return configure(os.environ.get("AM_CONNECT_CODE", ""), os.environ.get("AM_SITE_NAME", ""),
+                         os.environ.get("AM_SITE_TYPE", ""), terminal)
+    except (EOFError, KeyboardInterrupt):
+        print("已取消连接云端，原配置未修改。")
+        return 10
+    except Exception as error:
+        print("无法配置云端：" + str(error) + "；未修改原云端配置。")
+        return 1
+    finally:
+        if terminal:
+            terminal.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY_CLOUD_SETUP
+  )" || rc=$?
+  case "$rc" in
+    0) CLOUD_SETUP_CHANGED=1; ok "$out" ;;
+    10) info "$out" ;;
+    *) warn "$out"; return 1 ;;
+  esac
+}
+
+do_connect() {
+  info "$(msg m6)"
+  [[ -f "$INSTALL_DIR/server.py" && -f "$INSTALL_DIR/config.yaml" ]] || die "未找到已安装的 AntMonitor：$INSTALL_DIR"
+  if ! has_tty && [[ -z "${CONNECT_CODE:-${ANTMONITOR_CONNECT_CODE:-}}" ]]; then
+    warn "连接云端需要粘贴接入码，请在 SSH 终端运行 connect；未修改云端配置"
+    return 1
+  fi
+  local state svc_user svc_group
+  state="$(systemctl show -p LoadState --value "${SERVICE_NAME}.service" 2>/dev/null)" || {
+    warn "无法读取现有服务，请确认 AntMonitor 已安装为 systemd 服务"; return 1;
+  }
+  [[ "$state" == loaded ]] || { warn "未找到已安装的 systemd 服务，请先完成安装"; return 1; }
+  svc_user="$(systemctl show -p User --value "${SERVICE_NAME}.service")" || return 1
+  svc_group="$(systemctl show -p Group --value "${SERVICE_NAME}.service")" || return 1
+  # systemd 的 User 为空表示 root；Group 为空时 Python 使用该账户的主组。
+  apply_connect_code prompt "${svc_user:-root}" "$svc_group" || return 1
+  [[ "$CLOUD_SETUP_CHANGED" == 1 ]] || return 0
+  if ! systemctl restart "${SERVICE_NAME}.service"; then
+    warn "云端配置已保存，但服务重启失败；请查看 journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    return 1
+  fi
+  sleep 1
+  if ! systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+    warn "云端配置已保存，但服务尚未运行；请查看 journalctl -u ${SERVICE_NAME} -n 50 --no-pager"
+    return 1
+  fi
+  ok "服务已启动；本地完成扫描后自动上报，可在云端查看场地状态。"
 }
 
 start_svc() {
@@ -539,19 +815,27 @@ start_svc() {
 do_install() {
   echo
   info "$(msg m1) → $INSTALL_DIR"
+  local cloud_mode=optional cloud_rc=0
+  [[ -f "$INSTALL_DIR/server.py" ]] || cloud_mode=prompt
   ensure_packages
   sync_code
   [[ -f "$INSTALL_DIR/server.py" ]] || die "代码下载不完整：$INSTALL_DIR"
   setup_venv
   ensure_config
   if admin_unusable; then set_admin_password; fi
-  apply_connect_code
+  apply_connect_code "$cloud_mode" || cloud_rc=$?
   write_systemd
   start_svc
   if [[ -n "$GENERATED_PW" ]]; then
     echo "  ${BLD}登录账号:${RST} admin  /  ${BLD}${GENERATED_PW}${RST}  (自动生成，请马上记下，登录后可在面板里改)"
   fi
-  ok "安装完成。打开面板 →「⚙ 网段」填矿机网段；接云端在同一页「☁ 云端上报」粘贴接入码。"
+  ok "安装完成。打开面板 →「⚙ 网段」填矿机网段。"
+  if [[ "$CLOUD_SETUP_CHANGED" == 1 ]]; then
+    info "云端配置已保存；本地完成扫描后自动上报，可在云端查看场地状态。"
+  else
+    info "稍后可再次运行本命令，选择「连接 / 更换云端」并粘贴接入码。"
+  fi
+  return "$cloud_rc"
 }
 
 do_update() {
@@ -562,10 +846,12 @@ do_update() {
   # (set -e 立即退出) 服务就一直停着，监控停摆没人知道
   sync_code
   setup_venv
-  apply_connect_code
+  local cloud_rc=0
+  apply_connect_code || cloud_rc=$?
   write_systemd
   start_svc
   ok "更新完成"
+  return "$cloud_rc"
 }
 
 do_repair() {
@@ -703,16 +989,18 @@ show_menu() {
   echo "  3) $(msg m3)"
   echo "  4) $(msg m4)"
   echo "  5) $(msg m5)"
+  echo "  6) $(msg m6)"
   echo "  0) $(msg m0)"
   echo
   local choice=""
-  ask choice "$(msg menu) [0-5] " || exit 0
+  ask choice "$(msg menu) [0-6] " || exit 0
   case "${choice:-}" in
     1) do_install ;;
     2) do_update ;;
     3) do_repair ;;
     4) do_uninstall ;;
     5) do_reset_user ;;
+    6) do_connect || true ;;
     0) exit 0 ;;
     *) warn "无效选项" ;;
   esac
@@ -720,12 +1008,16 @@ show_menu() {
 
 main() {
   need_root
+  if [[ "${CONNECT_CODE:-${ANTMONITOR_CONNECT_CODE:-}}" == "-" ]] && ! has_tty; then
+    die "--connect-code - 需要终端，请在 SSH 终端运行后粘贴接入码；未修改云端配置"
+  fi
   if [[ -n "$LANG_CODE" ]]; then :
   elif [[ -z "$ACTION" ]] && has_tty && [[ -f "$INSTALL_DIR/server.py" ]]; then pick_language
   else LANG_CODE="zh"; fi
   if [[ -z "$ACTION" ]]; then
     # 没装过：直接装(一行命令装好，不先进菜单)；装过了：有终端出菜单，没终端就更新
     if [[ ! -f "$INSTALL_DIR/server.py" ]]; then ACTION="install"
+    elif [[ -n "${CONNECT_CODE:-${ANTMONITOR_CONNECT_CODE:-}}" ]]; then ACTION="connect"
     elif has_tty; then ACTION="menu"
     else ACTION="update"; fi
   fi
@@ -735,6 +1027,7 @@ main() {
     repair) do_repair; return ;;
     uninstall) do_uninstall; return ;;
     reset-user) do_reset_user; return ;;
+    connect|configure-cloud) do_connect; return ;;
   esac
   while true; do
     show_menu

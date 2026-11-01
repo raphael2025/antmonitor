@@ -117,13 +117,18 @@ def _session(c):
 
 
 # 上报状态：给本地面板显示"最后一次成功/失败原因"，不用登机器翻日志
-_STATUS = {"last_ok": 0, "last_try": 0, "last_err": "", "fails": 0, "last_customers_ok": 0}
-_status_lock = threading.Lock()
+_STATUS = {"last_ok": 0, "last_try": 0, "last_err": "", "fails": 0,
+           "last_customers_ok": 0, "state": "disconnected", "generation": 0}
+_status_lock = threading.RLock()
 
 
-def _set_status(**kw):
+def _set_status(gen, **kw):
+    """Only the current reporting generation may change the visible status."""
     with _status_lock:
+        if gen != _GEN:
+            return False
         _STATUS.update(kw)
+        return True
 
 
 def status():
@@ -181,7 +186,7 @@ def test(cfg_cloud, sid):
                                  headers={"Authorization": f"Bearer {c.get('token', '')}"})
         if r.status_code == 404:
             return False, ("云端没有 ping 接口(云端版本过旧，或上报接口未开启)；"
-                           "可直接保存并启用，看下方上报状态是否成功")
+                           "请先更新云端并启用上报接口，然后重试连接")
         r.raise_for_status()
         d = r.json() if r.content else {}
         if d.get("registered"):
@@ -211,24 +216,33 @@ def start(cfg, get_summary, get_customers):
     get_summary: () -> /api/public/summary 同构 dict
     get_customers: (hours:int) -> customers 列表(worker/machines/uptime_pct/delivered_th_h/power_kwh)"""
     global _GEN, _thread
-    _GEN += 1        # 先递增：即使下面初始化失败，旧线程也必须停掉
-    try:
-        if not enabled(cfg):
-            _thread = None
-            return None
-        c = dict(cfg.get("cloud") or {})
-        sid = site_id(cfg)
-        if str(c.get("url") or "").strip().lower().startswith("http://"):
-            log.warning("云端上报地址使用了非加密的 http:// 协议，token 将明文传输，建议改用 https://")
-        t = threading.Thread(target=_loop, args=(_GEN, c, sid, get_summary, get_customers),
-                             daemon=True, name="cloud-report")
-        t.start()
-        _thread = t
-        return t
-    except Exception as e:  # noqa: BLE001  上报是附加功能，绝不能拖垮主服务启动
-        log.error("云端上报初始化失败，本功能已禁用，原因：%s", e, exc_info=True)
+    # Serialize restarts with status updates. An old in-flight request may finish
+    # after a new connection is saved, but it cannot mark that connection healthy.
+    with _status_lock:
+        _GEN += 1
+        gen = _GEN
         _thread = None
-        return None
+        _STATUS.clear()
+        _STATUS.update(last_ok=0, last_try=0, last_err="", fails=0,
+                       last_customers_ok=0, generation=gen, state="disconnected")
+        try:
+            if not enabled(cfg):
+                return None
+            _STATUS["state"] = "pending"
+            c = dict(cfg.get("cloud") or {})
+            sid = site_id(cfg)
+            if str(c.get("url") or "").strip().lower().startswith("http://"):
+                log.warning("云端上报地址使用了非加密的 http:// 协议，token 将明文传输，建议改用 https://")
+            t = threading.Thread(target=_loop, args=(gen, c, sid, get_summary, get_customers),
+                                 daemon=True, name="cloud-report")
+            _thread = t
+            t.start()
+            return t
+        except Exception as e:  # noqa: BLE001 - local monitoring must keep running
+            log.error("云端上报初始化失败，本功能已禁用，原因：%s", e, exc_info=True)
+            _thread = None
+            _STATUS.update(state="error", last_err=explain(e), fails=1)
+            return None
 
 
 def _post(c, path, payload, sess=None):
@@ -257,8 +271,14 @@ def _loop(gen, c, sid, get_summary, get_customers):
     cust_hours = int(c.get("customer_hours", 24))
     last_cust = 0.0
     fails = 0
-    sess = _session(c)
-    _set_status(last_err="", fails=0)
+    try:
+        sess = _session(c)
+    except Exception as e:  # noqa: BLE001
+        _set_status(gen, state="error", last_err=explain(e), fails=1)
+        return
+    if not _set_status(gen, state="pending", last_err="", fails=0):
+        sess.close()
+        return
     while gen == _GEN:   # 配置被网页改过(代数变了)就退出，由新线程接管
         t0 = time.time()
         pushed = False
@@ -269,7 +289,8 @@ def _loop(gen, c, sid, get_summary, get_customers):
                 scan_ts = s.get("scan_ts") or 0
                 if gen != _GEN:   # 取数期间配置被改：这一轮别再用旧token/旧名字推了
                     break
-                _set_status(last_try=now)
+                if not _set_status(gen, state="reporting", last_try=now):
+                    break
                 _post(c, "/api/ingest/summary", {
                     "site_id": sid, "site": c["site_name"],
                     "type": c.get("site_type", "air"), "ts": now,
@@ -283,17 +304,19 @@ def _loop(gen, c, sid, get_summary, get_customers):
                     "scan_age_s": (now - scan_ts) if scan_ts else None,
                     "alert_summary": s.get("alert_summary") or [],
                 }, sess)
+                if not _set_status(gen, state="connected", last_ok=int(time.time()), last_err="", fails=0):
+                    break
                 pushed = True
                 if fails:
                     log.info("上报恢复(此前连续失败 %d 次)", fails)
                 fails = 0
-                _set_status(last_ok=int(time.time()), last_err="", fails=0)
             else:
-                _set_status(last_err="本地还没完成首轮扫描，扫完后自动开始上报")
+                _set_status(gen, state="waiting_scan", fails=0,
+                            last_err="本地还没完成首轮扫描，扫完后自动开始上报")
         except Exception as e:  # noqa: BLE001
             fails += 1
-            if gen == _GEN:
-                _set_status(last_err=explain(e), fails=fails, last_try=int(time.time()))
+            _set_status(gen, state="error", last_err=explain(e), fails=fails,
+                        last_try=int(time.time()))
             if fails <= 3 or fails % 30 == 0:   # 断网时别刷屏
                 log.warning("上报失败×%d: %s", fails, e)
         if gen != _GEN:   # 每次发请求前都重新确认代数，缩短热重启时新旧线程重叠窗口
@@ -308,7 +331,8 @@ def _loop(gen, c, sid, get_summary, get_customers):
                       {"site_id": sid, "site": c["site_name"],
                        "hours": cust_hours, "customers": rows}, sess)
                 last_cust = t0
-                _set_status(last_customers_ok=int(time.time()))
+                _set_status(gen, last_customers_ok=int(time.time()))
             except Exception as e:  # noqa: BLE001
                 log.warning("客户报表上报失败(下轮重试): %s", e)
         _sleep(gen, max(5.0, interval - (time.time() - t0)))
+    sess.close()
