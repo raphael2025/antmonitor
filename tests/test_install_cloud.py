@@ -114,7 +114,8 @@ class CloudSetupTests(unittest.TestCase):
         self.assertEqual(self.saved()["unrelated_setting"], {"keep": True})
         self.assertEqual(self.saved()["scan_interval"], 330)
         self.assertFalse(self.id_file.exists())
-        self.assertEqual(self.settings.stat().st_mode & 0o777, 0o600)
+        if os.name == "posix":
+            self.assertEqual(self.settings.stat().st_mode & 0o777, 0o600)
 
     def test_explicit_options_override_code_metadata(self):
         status, _output, _ping = self.run_setup(connect_code(n="码名称", y="hydro"), Terminal(),
@@ -259,6 +260,7 @@ class CloudSetupTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(self.saved(), newer)
 
+    @unittest.skipUnless(os.name == "posix", "requires POSIX service UID/GID support")
     def test_service_identity_drops_groups_then_gid_then_uid_before_file_operations(self):
         import grp
         import pwd
