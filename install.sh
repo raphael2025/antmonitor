@@ -11,7 +11,7 @@
 # 也可直接指定：... | sudo bash -s -- install|update|repair|uninstall|reset-user|connect|menu
 # 选项：--lang zh|en|ru|es|de|ar  --dir 安装目录  --branch 分支
 #       --connect-code 接入码  --site-name 场地名  --site-type air|hydro|mixed
-#       --source github|gitee（新装默认 GitHub；已安装未指定时保留 origin）
+#       --source auto|github|gitee（默认 auto；已安装保持 origin）
 # 未指定源码平台时，从已下载/克隆的目录运行 sudo bash install.sh 会用本地源码(pip 依赖仍需联网或镜像)。
 # 环境变量：GH_PROXY=https://镜像前缀/  访问 GitHub 很慢时用(镜像能看到并篡改下载内容，只用信得过的)
 #           ANTMONITOR_SOURCE=github|gitee 与 --source 等效；ANTMONITOR_REPO 可指定自定义 Git 仓库。
@@ -23,7 +23,7 @@ INSTALL_DIR="${ANTMONITOR_HOME:-/opt/antmonitor}"
 SERVICE_NAME="antmonitor"
 GH_REPO="${ANTMONITOR_GH_REPO:-raphael2025/antmonitor}"
 GH_PROXY="${GH_PROXY:-}"
-SOURCE="${ANTMONITOR_SOURCE:-github}"
+SOURCE="${ANTMONITOR_SOURCE:-auto}"
 SOURCE_EXPLICIT=0
 [[ -n "${ANTMONITOR_SOURCE:-}" ]] && SOURCE_EXPLICIT=1
 # 生产默认跟踪 main(dev 是开发分支，未经验证)。已安装的现场更新时沿用当前分支，见 sync_code
@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     --dir) INSTALL_DIR="${2:-}"; shift ;;
     --branch) BRANCH="${2:-}"; ANTMONITOR_BRANCH="$BRANCH"; shift ;;
     --source)
-      [[ $# -ge 2 && -n "${2:-}" ]] || { echo "--source 需要一个值：github 或 gitee" >&2; exit 2; }
+      [[ $# -ge 2 && -n "${2:-}" ]] || { echo "--source 需要一个值：auto、github 或 gitee" >&2; exit 2; }
       SOURCE="$2"; SOURCE_EXPLICIT=1; shift ;;
     --connect-code)
       [[ $# -ge 2 && -n "${2:-}" ]] || { echo "--connect-code 需要接入码，或用 - 从终端粘贴" >&2; exit 2; }
@@ -58,17 +58,20 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+# Resolve relative destinations before any function changes its working directory.
+[[ -n "$INSTALL_DIR" ]] || { echo '--dir 不能为空' >&2; exit 2; }
+[[ "$INSTALL_DIR" == /* ]] || INSTALL_DIR="$PWD/$INSTALL_DIR"
 
 # 源码平台与下载方式必须一致：Gitee 公开归档链接可能返回下载网页，因此使用
 # Git 获取源码；不能把返回的 HTML 当源码或在失败后悄悄回到 GitHub。
 ARCHIVE_URL=""
 case "$SOURCE" in
-  github)
+  auto|github)
     SOURCE_REPO_URL="${GH_PROXY}https://github.com/${GH_REPO}.git"
     ARCHIVE_URL="${GH_PROXY}https://github.com/${GH_REPO}/archive/refs/heads/${BRANCH}.tar.gz"
     ;;
   gitee) SOURCE_REPO_URL="https://gitee.com/raphael01/antmonitor.git" ;;
-  *) echo "--source / ANTMONITOR_SOURCE 只能是 github 或 gitee" >&2; exit 2 ;;
+  *) echo "--source / ANTMONITOR_SOURCE 只能是 auto、github 或 gitee" >&2; exit 2 ;;
 esac
 if [[ "$SOURCE_EXPLICIT" == 1 && "$SOURCE" == github && "$GH_REPO" != raphael2025/antmonitor ]]; then
   echo "显式选择官方源码平台时不能同时指定自定义 ANTMONITOR_GH_REPO；请只保留一种配置" >&2
@@ -81,6 +84,12 @@ if [[ "$SOURCE_EXPLICIT" == 1 && "$REPO_URL" != "$SOURCE_REPO_URL" ]]; then
 fi
 # 自定义仓库继续用于 Git 克隆，但不能在失败后下载另一个官方仓库的源码。
 [[ "$REPO_URL" != "$SOURCE_REPO_URL" ]] && ARCHIVE_URL=""
+export GIT_TERMINAL_PROMPT=0 GCM_INTERACTIVE=never
+export GIT_HTTP_LOW_SPEED_LIMIT="${GIT_HTTP_LOW_SPEED_LIMIT:-1000}" GIT_HTTP_LOW_SPEED_TIME="${GIT_HTTP_LOW_SPEED_TIME:-30}"
+AUTO_SOURCE=0
+if [[ "$SOURCE" == auto && "$REPO_URL" == "$SOURCE_REPO_URL" && "$GH_REPO" == raphael2025/antmonitor ]]; then
+  AUTO_SOURCE=1
+fi
 
 # 未显式选择平台时，从已克隆/解压的仓库根目录运行仍优先用本地源码。
 # 显式 --source / ANTMONITOR_SOURCE 必须从所选平台获取代码，不能被本地副本覆盖。
@@ -292,7 +301,7 @@ official_origin() {
 sync_origin_source() {
   [[ -e "$INSTALL_DIR/.git" ]] || return 0
   command -v git >/dev/null || die "安装目录已有 Git 仓库，但找不到 git 命令；请先安装 git，现有源码保持不变"
-  [[ "$SOURCE_EXPLICIT" == 1 ]] || return 0
+  [[ "$SOURCE_EXPLICIT" == 1 && "$SOURCE" != auto ]] || return 0
   local origin
   local g=(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR")
   origin="$("${g[@]}" remote get-url origin)" || die "无法读取现有 origin，已停止自动换源"
@@ -306,6 +315,13 @@ sync_origin_source() {
 sync_code() {
   mkdir -p "$INSTALL_DIR"
   sync_origin_source
+  if [[ -n "$LOCAL_SRC" && "$(cd "$LOCAL_SRC" && pwd -P)" == "$(cd "$INSTALL_DIR" && pwd -P)" ]]; then
+    info "使用安装目录里现有的本地源码"
+    return
+  fi
+  if [[ -n "$LOCAL_SRC" && ! -d "$LOCAL_SRC/.git" && -e "$INSTALL_DIR/.git" ]]; then
+    die "目标已是 Git 仓库，不能用不含版本信息的本地源码覆盖；请在独立目录安装或使用 Git 快进更新"
+  fi
   if [[ -n "$LOCAL_SRC" && -d "$LOCAL_SRC/.git" && -e "$INSTALL_DIR/.git" \
         && "$(cd "$LOCAL_SRC" && pwd -P)" != "$(cd "$INSTALL_DIR" && pwd -P)" ]]; then
     # 两边都是 git 仓库：按提交快进，不用 rsync 覆盖工作区。rsync 覆盖后工作区与安装目录
@@ -364,7 +380,22 @@ sync_code() {
     if [[ -n "${ANTMONITOR_BRANCH:-}" || "$br" == "HEAD" ]]; then
       br="$BRANCH"
     fi
-    "${g[@]}" fetch --prune origin || die "从现有 origin 拉取失败：请检查网络与仓库访问权限，代码未更新"
+    if ! "${g[@]}" fetch --prune origin; then
+      local origin alternate current
+      origin="$("${g[@]}" remote get-url origin)"
+      [[ "$AUTO_SOURCE" == 1 ]] && official_origin "$origin" \
+        || die "从现有 origin 拉取失败：请检查网络与仓库访问权限，代码未更新"
+      "${g[@]}" diff --quiet && "${g[@]}" diff --cached --quiet \
+        || die "工作区有本地改动，自动备用源更新已停止"
+      current="$("${g[@]}" rev-parse --abbrev-ref HEAD)"
+      [[ "$current" == "$br" && "$current" != HEAD ]] || die "备用源更新不能自动切换分支，请检查原来源"
+      if [[ "$origin" == *gitee.com* ]]; then alternate="${GH_PROXY}https://github.com/raphael2025/antmonitor.git"
+      else alternate="https://gitee.com/raphael01/antmonitor.git"; fi
+      info "原来源不可达，尝试备用来源（保留 origin）：$alternate"
+      "${g[@]}" fetch "$alternate" "$br" || die "GitHub/Gitee 均无法拉取，现有代码和配置保留"
+      "${g[@]}" merge --ff-only FETCH_HEAD || die "备用来源无法快进，现有版本保留，不会回退或覆盖改动"
+      return
+    fi
     # 旧版本脚本默认装在 dev，dev 已不再更新：dev 上没有 main 里没有的实际改动时改跟 main
     # (与网页更新器的规则一致，见 updater._can_leave_legacy)
     if [[ -z "${ANTMONITOR_BRANCH:-}" && "$br" == "dev" ]] \
@@ -395,6 +426,16 @@ sync_code() {
         return
       fi
       rm -rf "$tmpc"
+      if [[ "$AUTO_SOURCE" == 1 ]]; then
+        tmpc="$(mktemp -d)"
+        info "GitHub 不可达，尝试 Gitee"
+        if git clone -q --branch "$BRANCH" https://gitee.com/raphael01/antmonitor.git "$tmpc/src"; then
+          cp -a "$tmpc/src"/. "$INSTALL_DIR"/
+          rm -rf "$tmpc"
+          return
+        fi
+        rm -rf "$tmpc"
+      fi
       [[ -n "$ARCHIVE_URL" ]] || die "Git 克隆失败，当前源码来源没有可用的源码包兜底；请检查网络与仓库访问权限后重试"
       warn "git clone 失败，改用 GitHub 源码包下载"
     fi
@@ -412,6 +453,7 @@ fetch_tarball() {
     rm -rf "$tmp"
     die "下载失败：检查本机能否访问 GitHub；国内网络可设 GH_PROXY 镜像前缀后重试，或下载 ZIP 解压后在目录里运行 sudo bash install.sh"
   fi
+  [[ -f "$tmp/server.py" && -f "$tmp/requirements.txt" ]] || { rm -rf "$tmp"; die "下载的源码包不完整，现有文件未修改"; }
   mkdir -p "$INSTALL_DIR"
   # config.yaml / 数据库 / settings.json 等本机文件不在源码包里，不会被覆盖
   cp -a "$tmp"/. "$INSTALL_DIR"/
@@ -423,8 +465,15 @@ setup_venv() {
   if [[ ! -d "$INSTALL_DIR/.venv" ]]; then
     python3 -m venv "$INSTALL_DIR/.venv"
   fi
-  "$INSTALL_DIR/.venv/bin/pip" install -q --upgrade pip
-  "$INSTALL_DIR/.venv/bin/pip" install -q -r "$INSTALL_DIR/requirements.txt"
+  local wheels="${ANTMONITOR_WHEELHOUSE:-}" opts=()
+  [[ -n "$wheels" || ! -d "$INSTALL_DIR/offline/wheels" ]] || wheels="$INSTALL_DIR/offline/wheels"
+  if [[ -n "$wheels" ]]; then
+    [[ -d "$wheels" ]] || die "依赖缓存目录不存在：$wheels"
+    opts=(--no-index --find-links "$wheels")
+  else
+    "$INSTALL_DIR/.venv/bin/pip" install -q --upgrade pip
+  fi
+  "$INSTALL_DIR/.venv/bin/pip" install -q "${opts[@]}" -r "$INSTALL_DIR/requirements.txt"
   ok "Python 依赖 OK"
 }
 
@@ -515,6 +564,7 @@ import binascii
 import ipaddress
 import json
 import os
+import re
 import secrets
 import socket
 import sys
@@ -593,7 +643,8 @@ def use_service_account(user, group):
 
 
 def decode_code(code):
-    if not code.startswith("AMC1-"):
+    code = code.strip()
+    if len(code) > 16384 or not re.fullmatch(r"AMC1-[A-Za-z0-9_-]+", code):
         raise SetupError("接入码格式不对，应以 AMC1- 开头")
     try:
         encoded = code[5:]
@@ -606,6 +657,10 @@ def decode_code(code):
     if not isinstance(data.get("u"), str) or not isinstance(data.get("t"), str):
         raise SetupError("接入码缺少云端地址或上报凭据")
     url, token = data["u"].strip().rstrip("/"), data["t"].strip()
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in url):
+        raise SetupError("接入码中的云端地址格式不对")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in token):
+        raise SetupError("接入码中的上报凭据格式不对")
     try:
         parsed = urlsplit(url)
         host = parsed.hostname
@@ -622,15 +677,18 @@ def decode_code(code):
             private = host == "localhost"
         if not private:
             raise SetupError("公网云端必须使用 HTTPS，请从云端重新复制接入码")
+    if any(data.get(key) is not None and not isinstance(data[key], str) for key in ("f", "s", "n", "y")):
+        raise SetupError("接入码中的场地信息格式不对")
     fp = cloud_report.normalize_fingerprint(data.get("f"))
     if fp is None:
         raise SetupError("接入码中的证书指纹格式不对")
     if data.get("s") is not None and data["s"] != "":
-        sid = str(data["s"])
+        sid = data["s"]
         if not sid or site_key(sid) != sid:
             raise SetupError("接入码中的场地 ID 格式不对")
         data["s"] = sid
-    if data.get("n") is not None and not isinstance(data["n"], str):
+    name = data.get("n") or ""
+    if len(name.strip()) > 64 or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
         raise SetupError("接入码中的场地名称格式不对")
     if data.get("y") is not None and data["y"] not in SITE_TYPES:
         raise SetupError("接入码中的场地类型须为 air、hydro 或 mixed")
@@ -647,8 +705,11 @@ def read_state():
         saved = {}
     if not isinstance(saved, dict) or ("cloud" in saved and not isinstance(saved["cloud"], dict)):
         raise SetupError("现有 settings.json 格式异常，已保留原文件")
-    cfg = appconfig.load_config()
-    appconfig.apply_settings(cfg, saved)
+    try:
+        cfg = appconfig.load_config()
+        appconfig.apply_settings(cfg, saved)
+    except (appconfig.yaml.YAMLError, TypeError, AttributeError):
+        raise SetupError("现有配置文件格式异常，已保留原文件") from None
     return dict(cfg.get("cloud") or {})
 
 
@@ -708,6 +769,7 @@ def configure(code, name="", site_type="", terminal=None):
             if not code:
                 print("已跳过连接云端，原配置未修改。")
                 return 10
+        data = {}
         try:
             data = decode_code(code)
             current = read_state()
@@ -726,6 +788,9 @@ def configure(code, name="", site_type="", terminal=None):
             return 0
         except (SetupError, OSError, ValueError, RuntimeError) as error:
             message = str(error) + "；未修改原云端配置。"
+            for secret in (code, data.get("t")):
+                if secret:
+                    message = message.replace(secret, "[已隐藏]")
             if terminal is None:
                 print(message)
                 return 1

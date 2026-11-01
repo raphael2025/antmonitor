@@ -216,6 +216,9 @@ body.viewer #btnFull, body.viewer #btnQuick, body.viewer #btnScanContainers { di
 .cloud-field input, .cloud-field select { width: 100%; min-width: 0; background: #0d1117; border: 1px solid #30363d; color: inherit; padding: 10px 11px; border-radius: 6px; font: inherit; }
 .cloud-field input:focus, .cloud-field select:focus { outline: 2px solid #58a6ff; outline-offset: 1px; }
 .cloud-site-row { display: grid; grid-template-columns: minmax(0, 1fr) 140px; gap: 14px; }
+.cloud-paste { width: 100%; padding: 12px; margin-top: 2px; }
+.cloud-site-details { margin: 12px 0; }
+.cloud-site-details summary { cursor: pointer; font-size: 13px; }
 .cloud-token-row { display: flex; gap: 8px; }
 .cloud-token-row button { flex-shrink: 0; }
 .cloud-hint { font-size: 12px; min-height: 1.5em; }

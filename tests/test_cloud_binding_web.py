@@ -36,7 +36,8 @@ def test_new_utf8_and_legacy_codes_keep_site_identity():
     assert.equal(shared.s, ''); assert.equal(shared.n, '');
     for (const invalid of [{...base, s: '矿'.repeat(65)}, {...base, s: '\n'},
         {...base, s: 'Site\n A'}, {...base, s: ' Site A '}, {...base, s:'Site\x7f A'},
-        {...base, n: 1}, {...base, y: 'wrong'}, {...base, t: ''}, {...base, s: {}}]) {
+        {...base, n: 1}, {...base, y: 'wrong'}, {...base, t: ''}, {...base, s: {}},
+        {...base, u: 'https://cloud .example.test'}, {...base, u: 'https://cloud.example.test/a b'}]) {
       assert.equal(cloud.parseCode(code(invalid)), null);
     }
     assert.equal(cloud.parseCode('AMC1-not-a-code'), null);
@@ -99,3 +100,11 @@ def test_all_languages_include_new_connection_messages():
         assert all(dictionary.get(key) for key in keys), lang
         for key in ("cloud.test_failed", "cloud.save_failed", "cloud.retrying"):
             assert "{error}" in dictionary[key], (lang, key)
+
+
+def test_actual_dialog_pastes_and_connects_with_lan_fallback():
+    if not NODE:
+        pytest.skip("Node.js is needed to execute browser connection logic")
+    result = subprocess.run([NODE, "tests/cloud_binding_behavior.cjs"], cwd=ROOT,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr

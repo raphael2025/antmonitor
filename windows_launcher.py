@@ -71,6 +71,16 @@ def prepare_environment(base):
                 run_checked([python, "-m", "ensurepip", "--upgrade"], base)
             install = [python, "-m", "pip", "install", "--disable-pip-version-check",
                        "--only-binary=:all:", "-r", requirements]
+            wheelhouse = os.environ.get("MINER_WHEELHOUSE")
+            if not wheelhouse and (base / "offline" / "wheels").is_dir():
+                wheelhouse = str(base / "offline" / "wheels")
+            if wheelhouse:
+                wheels = Path(wheelhouse)
+                if not wheels.is_absolute():
+                    wheels = base / wheels
+                if not wheels.is_dir():
+                    raise FileNotFoundError("Local dependency directory does not exist: {}".format(wheels))
+                install += ["--no-index", "--find-links", wheels]
             if installed == fingerprint and probe.returncode:
                 # Metadata can survive missing/damaged package files; a plain pip
                 # install would report "already satisfied" and leave them broken.

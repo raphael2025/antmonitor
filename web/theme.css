@@ -5,7 +5,6 @@ header { gap: 12px; flex-wrap: wrap; }
 .actions { flex-wrap: wrap; }
 .theme-select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 4px 8px; font-size: 13px; cursor: pointer; max-width: 100%; }
 .theme-row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 16px; font-size: 13px; color: #8b949e; }
-#cloudOpen { color: #58a6ff; }
 :is(button, input, select, textarea, summary):focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
 
 /* Surfaces and text. Explicit selectors preserve status colours and rack semantics. */
@@ -18,7 +17,7 @@ header { gap: 12px; flex-wrap: wrap; }
 [data-theme="light"] :is(.muted, th, .card .lbl, tr.off, .a .atime, .rack-head .stat, .site .stats .k, .site .foot) { color: #596677; }
 [data-theme="light"] :is(.badge, .pump, .chbadge.off, .fbadge.info, .pill.st-pending) { background: #e7edf4; color: #4d5e73; }
 [data-theme="light"] :is(.seg-host, .wstat, #mInfo, .formrow label, .reboot-bar, .a .aworker b, .conn-advanced summary, .conn-raw-token summary) { color: #4d5e73; }
-[data-theme="light"] :is(.a .ip, .ip-link, .wname, .cbox-ip, #cloudSiteId, #cloudOpen) { color: #175fbd; }
+[data-theme="light"] :is(.a .ip, .ip-link, .wname, .cbox-ip, #cloudSiteId) { color: #175fbd; }
 [data-theme="light"] :is(th, td) { border-bottom-color: #dce4ed; }
 [data-theme="light"] th:hover { color: #202c3c; }
 [data-theme="light"] :is(.seg-divider, .deleted-site, .conn-advanced, .conn-raw-token, .cloud-advanced, .cloud-status-card) { border-color: #cfd8e3; }

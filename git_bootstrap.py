@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -31,6 +32,8 @@ BRANCH = "main"
 MINGIT_VERSION = "2.56.0"
 _MINGIT_URL = ("https://github.com/git-for-windows/git/releases/download/"
                "v{v}.windows.1/MinGit-{v}-{arch}.zip")
+_MINGIT_MIRROR_URL = ("https://sourceforge.net/projects/git-for-windows.mirror/files/"
+                      "v{v}.windows.1/MinGit-{v}-{arch}.zip/download")
 # SHA-256 of the official MinGit archives; a download with any other content is rejected.
 MINGIT_SHA256 = {
     "64-bit": "064b440ff870ed5198527e8f3a92cdf5bd2fd0fedf5e718af95e3fdaddeff718",
@@ -173,6 +176,40 @@ def find_git():
     return _find_mingit()
 
 
+def _download_mingit(archive, arch):
+    """Every source, including a local/offline package, must match the same pin."""
+    local = os.environ.get("MINER_MINGIT_ZIP")
+    if not local:
+        bundled = Path(__file__).resolve().parent / "offline" / (
+            "MinGit-{}-{}.zip".format(MINGIT_VERSION, arch))
+        if bundled.is_file():
+            local = str(bundled)
+    if local:
+        shutil.copyfile(local, archive)
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != MINGIT_SHA256[arch]:
+            raise RuntimeError("local portable Git package failed verification (sha256 mismatch)")
+        return
+    sources = [_MINGIT_URL, _MINGIT_MIRROR_URL]
+    if os.environ.get("MINER_DOWNLOAD_SOURCE", "").lower() == "gitee":
+        sources.reverse()
+    failures = []
+    for template in sources:
+        url = template.format(v=MINGIT_VERSION, arch=arch)
+        try:
+            _say("Downloading verified portable Git {} from {}...".format(
+                MINGIT_VERSION, urllib.parse.urlsplit(url).netloc))
+            with urllib.request.urlopen(url, timeout=120) as r, open(archive, "wb") as f:
+                shutil.copyfileobj(r, f)
+            if hashlib.sha256(archive.read_bytes()).hexdigest() != MINGIT_SHA256[arch]:
+                raise RuntimeError("sha256 mismatch")
+            return
+        except (OSError, RuntimeError) as e:
+            failures.append(str(e))
+            _say("Portable Git source unavailable or failed verification; trying the next source.")
+    raise RuntimeError("portable Git download failed verification or could not be reached: {}. "
+                       "Use MINER_MINGIT_ZIP for a verified local MinGit ZIP.".format("; ".join(failures)))
+
+
 def install_mingit():
     """Reuse or install verified MinGit in an owned per-user cache; returns git.exe.
 
@@ -193,13 +230,7 @@ def install_mingit():
     complete = False
     try:
         archive = tmp / "mingit.zip"
-        url = _MINGIT_URL.format(v=MINGIT_VERSION, arch=arch)
-        _say("Git not found. Downloading portable Git {} for web updates...".format(MINGIT_VERSION))
-        with urllib.request.urlopen(url, timeout=120) as r, open(archive, "wb") as f:
-            shutil.copyfileobj(r, f)
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        if digest != MINGIT_SHA256[arch]:
-            raise RuntimeError("portable Git download failed verification (sha256 mismatch)")
+        _download_mingit(archive, arch)
         _retry_access_denied(lambda: legacy.parent.mkdir(parents=True, exist_ok=True))
         dest = Path(_retry_access_denied(lambda: tempfile.mkdtemp(
             prefix=legacy.name + "-" + arch + "-", dir=str(legacy.parent))))

@@ -52,6 +52,7 @@ apply_result.txt
 __pycache__/
 *.py[cod]
 .venv/
+offline/
 .venv.incompatible-*/
 venv/
 *.egg-info/

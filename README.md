@@ -58,7 +58,8 @@
 
 ## 三分钟上手
 
-Ubuntu 不用先 `git clone`，也不用预装 Git / Python；按网络情况选择 GitHub 或 Gitee，执行一条安装命令即可。
+GitHub / Gitee 是下载代码的网站，无需注册账号或安装它们的客户端。Ubuntu 和 Windows 都会自动准备 Git / Python；
+按网络情况选择下面的一条命令即可。Ubuntu 命令需要 `curl`；系统没有时先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`。
 
 ### Ubuntu（推荐）
 
@@ -73,6 +74,17 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 ```bash
 curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- --source gitee
 ```
+
+<details><summary>不确定哪个网站能访问？自动选择 GitHub / Gitee</summary>
+
+下面是一条命令：先尝试 GitHub，下载失败再尝试 Gitee；完整下载成功后才执行安装脚本一次。
+安装器也会自动选择可用的源码来源，不会在安装已开始后重复运行另一份安装程序。
+
+```bash
+( f=$(mktemp) && trap 'rm -f "$f"' EXIT && { curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh -o "$f" || curl -fsSL --connect-timeout 10 --max-time 60 https://gitee.com/raphael01/antmonitor/raw/main/install.sh -o "$f"; } && sudo bash "$f" --source auto )
+```
+
+</details>
 
 Gitee 命令会自动安装 Git，并从 Gitee 拉取源码；后续网页更新使用同一仓库来源。
 
@@ -90,8 +102,9 @@ Gitee 命令会自动安装 Git，并从 Gitee 拉取源码；后续网页更新
 2. 在 Windows / Mac / 其他电脑的浏览器打开 `http://<Ubuntu监控机IP>:8800`，
    例如 `http://192.168.1.50:8800`，替换成你自己的 Ubuntu IP。
 3. 用 **admin** 登录 → 顶部 **「☁ 连接云端」**（未连接时会突出显示）。
-4. 从**云端面板「🔌 场地接入」**复制接入码 → 粘贴 → 点 **「连接云端」**。
-   新码会自动填好场地名与类型；旧码缺名称时补填一次。程序自动测试、保存并启用上报，失败时保留原配置和输入。
+4. 云端「🔌 场地接入」点 **「生成并复制接入信息」** → 本地端点 **「粘贴接入信息并连接」**。
+   局域网 HTTP 页面若提示不能自动读剪贴板，直接按 **Ctrl+V** 即可继续连接。地址、token、场地名与类型自动带入；旧码缺名称时补填一次。
+   程序自动测试、保存并启用上报，验证失败时保留原配置和输入。
    下方状态会持续更新；显示「等待首轮扫描」时，在「⚙ 网段」设置矿机网段并开始全网扫描，完成后自动上报。
 
 **只有 SSH 能访问 Ubuntu？** 在有浏览器的电脑上运行（把用户名和 IP 换成实际 SSH 登录信息）：
@@ -125,26 +138,41 @@ curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bas
 接入后核对具体连接测试结果及云端是否出现本场地；详细排查见
 [中文指南 · Ubuntu 无桌面访问与云端配置](docs/guide/zh.md#ubuntu-无桌面访问与云端配置)。
 
+已经更新到当前版本，也可在安装目录直接运行 `sudo bash install.sh connect --dir .`，无需再次下载脚本。
+**Windows 的同一份接入信息**可在本地网页使用，也可双击安装目录内的 `connect-cloud.bat` 后粘贴。
+命令界面输入不显示；测试通过后才保存。如果原 Windows 监控仍在运行，按提示关闭原窗口并重新运行 `run.bat`；
+端口空闲时会自动打开监控。程序保存配置和首次真实上报是两个步骤，以面板的上报成功时间为准。
+
 ### Windows 10 / 11
 
 在 PowerShell 里执行，不需要管理员。按下载源选一条：
 
-**GitHub（无需提前安装 Git）：**
+**GitHub：**
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1'))) -Source github
 ```
 
-**Gitee（系统已安装 Git for Windows，且 `git --version` 可用）：**
+**Gitee（GitHub 无法访问时使用）：**
 
 ```powershell
 & ([scriptblock]::Create((irm 'https://gitee.com/raphael01/antmonitor/raw/main/install.ps1'))) -Source gitee
 ```
 
-若还没安装 Git，先安装 Git for Windows 并重新打开 PowerShell，再执行 Gitee 命令。
-下载到 `%LOCALAPPDATA%\AntMonitor\antmonitor`，桌面生成「AntMonitor」快捷方式并启动；没有 Python 会自动从
-python.org 下载并验证签名后安装（当前用户，不需要管理员），之后可在网页上一键更新。
+两种方式均无需预装 Git / Python。缺少 Git 时先自动准备便携 Git；Gitee 优先使用经过固定 SHA256 校验的 SourceForge 镜像，
+不需要先成功访问 GitHub。下载到 `%LOCALAPPDATA%\AntMonitor\antmonitor`，桌面生成「AntMonitor」快捷方式并启动；
+缺少 Python 时从 python.org 下载并验证签名后安装（当前用户，不需要管理员），之后可在网页上一键更新。
 Windows 已有安装再次运行脚本只会启动程序，保留原来的更新源；换源说明见[中文指南](docs/guide/zh.md#windows一键安装)。
+
+<details><summary>Windows 自动选择 GitHub / Gitee</summary>
+
+复制这一整段到 PowerShell 执行。先完整下载脚本，再执行一次；不会在安装失败后重新执行另一份脚本。
+
+```powershell
+$s=$null; foreach($u in @('https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1','https://gitee.com/raphael01/antmonitor/raw/main/install.ps1')) { try { $s=Invoke-RestMethod -Uri $u -TimeoutSec 60 -ErrorAction Stop; break } catch { Write-Host ('Download unavailable: '+([uri]$u).Host) } }; if([string]::IsNullOrWhiteSpace($s)) { throw 'GitHub/Gitee unavailable; use downloaded source.' }; & ([scriptblock]::Create($s)) -Source auto
+```
+
+</details>
 
 <a id="windows-web-update-recovery"></a>
 
@@ -164,7 +192,8 @@ Windows 已有安装再次运行脚本只会启动程序，保留原来的更新
 脚本会寻找当前目录或默认安装目录；找不到时提示粘贴含有 `run.bat` 的原文件夹路径。
 恢复成功会自动启动新窗口，随后登录网页点击「更新」，安装最新版本。
 脚本保留原源码、配置和数据库；旧 ZIP 会匹配它原来的发布版本，已有 Git 仓库保留原 `origin`。
-Gitee 选择的是恢复脚本来源，以及无 `.git` 时的仓库来源；缺少 Git 时，便携 MinGit 仍从官方 GitHub 下载并校验。
+Gitee 选择恢复脚本和无 `.git` 时的仓库来源；缺少 Git 时优先使用 SourceForge 上与官方文件 SHA256 一致的 MinGit，
+镜像失败才尝试官方 GitHub。也可通过 `MINER_MINGIT_ZIP` 指定本地固定版本安装包。
 自定义目录、网络失败或本地改动的处理见[中文指南 · Windows 网页更新恢复](docs/guide/zh.md#windows-web-update-recovery)。
 
 ### 后续更新与换源
@@ -179,7 +208,8 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- update --source gitee
 ```
 
-Ubuntu 显式传入 `--source` 可在两个官方仓库之间切换更新源；不传时沿用已有 `origin`。
+Ubuntu 显式传入 `--source github` / `--source gitee` 可在两个官方仓库之间切换更新源；不传或 `--source auto` 时保留已有 `origin`。
+默认自动模式下，官方来源网络失败时可尝试另一平台的同分支，只接受快进更新，不回退到旧镜像版本。
 自定义仓库不会被自动覆盖。自定义安装目录仍需追加 `--dir '/实际安装目录'`。
 Windows 日常从网页更新；GitHub / Gitee 仓库是否已有新版本，取决于发布者的同步情况。
 详细步骤见[中文指南 · Ubuntu 更新与选择下载源](docs/guide/zh.md#ubuntu-更新与选择下载源)。
@@ -187,14 +217,25 @@ Windows 日常从网页更新；GitHub / Gitee 仓库是否已有新版本，取
 ### 装好以后
 
 admin 登录 →「⚙ 网段」填矿机网段 → 保存并全网扫描。
-接云端用顶部 **「☁ 连接云端」**：粘贴接入码，点一次连接；测试通过后自动保存并启用，持续显示等待扫描、上报成功或失败重试。
+接云端用顶部 **「☁ 连接云端」**：先在云端复制完整接入信息，再点本地 **「粘贴接入信息并连接」**。
+浏览器不允许自动读取时，按提示 **Ctrl+V** 即可继续。测试通过后自动保存并启用，持续显示等待扫描、上报成功或失败重试。
 手动填写地址、token、证书指纹，以及暂停上报，都在连接窗口的「高级设置」中。
 
 登录页和顶部都能切换 **跟随系统 / 按时间自动 / 日间 / 夜间**，浏览器会记住选择。
 按时间自动使用浏览设备的本地时间：07:00–19:00 为日间，其余为夜间，无需设置服务器。
 
-GitHub 访问慢可使用上面的 Gitee 一键命令，或设置镜像前缀 `GH_PROXY`；也可把源码 ZIP 拷过去，解压后在目录里
-`sudo bash install.sh`（无 `.git` 的源码包不保留 Git 更新来源；Python 依赖仍需能访问 PyPI 或国内镜像）。
+### GitHub 和 Gitee 都打不开
+
+在能联网的电脑下载完整源码 ZIP，拷到监控机解压，然后使用本地安装入口：
+
+| 系统 | 在解压后的源码目录执行 |
+|---|---|
+| Ubuntu | `sudo bash install.sh --dir /opt/antmonitor` |
+| Windows PowerShell | `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1` |
+
+这条路径不需要访问 GitHub / Gitee 下载源码。**源码包不等于完整离线安装包**：系统包、Python、Python 依赖仍需可用下载源，
+或事先拷入对应系统和版本的安装包 / wheels。Windows 支持本地签名 Python 安装器和校验过的 MinGit ZIP，
+两系统支持 `offline/wheels` 依赖目录，具体变量和操作见[中文指南 · 无法访问代码托管平台](docs/guide/zh.md#无法访问代码托管平台)。
 
 **大场地防误报**：发现掉线或零算力先等 20 秒用更长超时重探一遍（二次确认），仍不行当轮就报；整段掉线不重探、直接报整段掉线；单台判活最多等 3 秒；高温连续 2 轮才报；全场同时大面积掉线
 只报一条「全场掉线」；矿机网页卡住但还在挖矿时改从 4028 端口取数，不再误报掉线。参数见

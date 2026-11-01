@@ -1000,6 +1000,7 @@ let cloudSiteIdOverride = "", _cloudAppliedCode = "";
 let _cloudSaved = null, _cloudSnapshot = null, _cloudStatusUnavailable = false;
 let _cloudBusy = false, _cloudTimer = null, _cloudPollEpoch = 0, _cloudOpenEpoch = 0;
 let _cloudFeedback = null, _cloudCodeHintKey = "cloud.code_hint";
+let _cloudReadingClipboard = false, _cloudAwaitingPaste = false;
 
 function cloudFeedback(key, vars = {}, kind = "muted") {
   _cloudFeedback = key ? { key, vars, kind } : null;
@@ -1013,6 +1014,9 @@ function renderCloudLabels() {
   $("cloudToken").placeholder = _cloudSaved && _cloudSaved.token_set
     ? t("seg.token_saved_ph", { hint: _cloudSaved.token_hint || "****" }) : "ingest token";
   $("cloudConnect").textContent = t(_cloudBusy ? "cloud.working" : "header.cloud");
+  $("cloudPaste").textContent = t(_cloudReadingClipboard ? "cloud.reading_clipboard" : "cloud.paste_connect");
+  $("cloudPaste").disabled = _cloudBusy || _cloudReadingClipboard;
+  $("cloudSiteSummary").textContent = $("cloudName").value.trim();
   $("cloudClose").setAttribute("aria-label", t("cloud.close"));
   if (_cloudFeedback) cloudFeedback(_cloudFeedback.key, _cloudFeedback.vars, _cloudFeedback.kind);
 }
@@ -1026,6 +1030,8 @@ function fillCloudSettings(c) {
   $("cloudToken").value = "";
   $("cloudToken").type = "password";
   $("cloudCode").value = "";
+  $("cloudSiteDetails").open = false;
+  _cloudAwaitingPaste = false;
   $("cloudPause").classList.toggle("hidden", !c.enabled);
   cloudSiteIdOverride = "";
   _cloudAppliedCode = "";
@@ -1062,6 +1068,7 @@ async function openCloud() {
 }
 function closeCloud() {
   _cloudOpenEpoch++;
+  _cloudAwaitingPaste = false;
   $("cloudModal").classList.add("hidden");
   $("cloudToken").type = "password";
   renderCloudLabels();
@@ -1094,6 +1101,7 @@ function applyCloudCode(showError = false) {
     _cloudAppliedCode = raw;
   }
   _cloudCodeHintKey = d.n ? "cloud.code_ready" : "cloud.code_needs_name";
+  $("cloudSiteDetails").open = !d.n;
   renderCloudLabels();
   return true;
 }
@@ -1125,7 +1133,8 @@ async function connectCloud(event) {
   const c = cloudForm(), missing = AntMonitorCloud.validate(c, cloudHasSavedToken(c));
   if (missing) {
     cloudFeedback("cloud.required_" + missing, {}, "res-fail");
-    if (missing !== "site_name") $("cloudAdvanced").open = true;
+    if (missing === "site_name") $("cloudSiteDetails").open = true;
+    else $("cloudAdvanced").open = true;
     $({ site_name: "cloudName", url: "cloudUrl", token: "cloudToken" }[missing]).focus();
     return;
   }
@@ -1146,6 +1155,37 @@ async function connectCloud(event) {
     cloudFeedback(keys[e.step] || "cloud.save_unknown", { error: e.message || "" }, "res-fail");
     startCloudPolling(); // 输入保持不动；同时显示原来已保存连接的真实状态
   } finally { setCloudBusy(false); }
+}
+async function pasteCloudAndConnect() {
+  if (_cloudBusy || _cloudReadingClipboard || myRole !== "admin") return;
+  const epoch = _cloudOpenEpoch;
+  _cloudAwaitingPaste = false;
+  _cloudReadingClipboard = true;
+  renderCloudLabels();
+  let text;
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.readText !== "function") throw new Error("clipboard");
+    text = await navigator.clipboard.readText();
+  } catch (e) {
+    if (epoch === _cloudOpenEpoch && !$("cloudModal").classList.contains("hidden")) {
+      _cloudAwaitingPaste = true;
+      cloudFeedback("cloud.paste_manual");
+      $("cloudCode").focus();
+      $("cloudCode").select();
+    }
+    return;
+  } finally {
+    _cloudReadingClipboard = false;
+    renderCloudLabels();
+  }
+  if (epoch !== _cloudOpenEpoch || $("cloudModal").classList.contains("hidden")) return;
+  $("cloudCode").value = String(text || "").trim();
+  if (!$("cloudCode").value) {
+    cloudFeedback("cloud.clipboard_empty", {}, "res-fail");
+    $("cloudCode").focus();
+    return;
+  }
+  await connectCloud({ preventDefault() {} });
 }
 async function pauseCloud() {
   if (_cloudBusy || !_cloudSaved) return;
@@ -1172,7 +1212,6 @@ function renderCloudStatus() {
   const el = $("cloudStatus"), badge = $("cloudHeaderState"), st = _cloudSnapshot;
   el.className = "muted";
   $("btnCloud").classList.toggle("needs-connection", !!(st && !st.enabled));
-  $("cloudOpen").classList.add("hidden");
   if (_cloudStatusUnavailable || !st) {
     el.textContent = t(_cloudStatusUnavailable ? "cloud.status_unavailable" : "cloud.loading");
     badge.textContent = _cloudStatusUnavailable ? t("cloud.badge_unknown") : "…";
@@ -1182,10 +1221,6 @@ function renderCloudStatus() {
     el.textContent = t("cloud.disconnected");
     badge.textContent = t("cloud.badge_off");
     return;
-  }
-  if (/^https?:\/\//i.test(st.url || "")) {
-    $("cloudOpen").href = st.url;
-    $("cloudOpen").classList.remove("hidden");
   }
   if (st.state === "error" || st.fails || st.running === false) {
     el.className = "res-fail";
@@ -1232,8 +1267,21 @@ function startCloudPolling() {
 $("btnCloud").onclick = openCloud;
 $("cloudClose").onclick = $("cloudCancel").onclick = closeCloud;
 $("cloudBindingForm").onsubmit = connectCloud;
+$("cloudPaste").onclick = pasteCloudAndConnect;
 $("cloudPause").onclick = pauseCloud;
+$("cloudName").addEventListener("input", renderCloudLabels);
 $("cloudCode").addEventListener("input", () => { cloudFeedback(""); applyCloudCode(); });
+$("cloudCode").addEventListener("paste", event => {
+  // On a LAN HTTP page browsers may forbid clipboard reads. After the operator
+  // requests paste-and-connect, their explicit Ctrl+V gesture completes it.
+  if (!_cloudAwaitingPaste || _cloudBusy || !event.clipboardData) return;
+  const text = event.clipboardData.getData("text");
+  if (!text) return;
+  event.preventDefault();
+  _cloudAwaitingPaste = false;
+  $("cloudCode").value = text.trim();
+  return connectCloud({ preventDefault() {} });
+});
 $("cloudTokenEye").onclick = () => {
   $("cloudToken").type = $("cloudToken").type === "password" ? "text" : "password";
   renderCloudLabels();

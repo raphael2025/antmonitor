@@ -135,6 +135,8 @@ def main():
         import windows_repair_updates
         windows_repair_updates.main(portable_git=git,
                                     portable_cache=os.environ["LOCALAPPDATA"])
+        import windows_install_sources
+        windows_install_sources.main(native_archive)
 
 
 if __name__ == "__main__":
