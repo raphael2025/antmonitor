@@ -19,6 +19,8 @@ def app(monkeypatch, tmp_path):
     monkeypatch.setattr(server.appconfig, "save_settings", lambda *a, **k: None)
     monkeypatch.setattr(server.appconfig, "update_settings", lambda *a, **k: {})
     monkeypatch.setattr(server.appconfig, "load_segments", lambda cfg: (["10.0.0"], 1, 254))
+    # API validation tests must not start a worker that contacts a real cloud URL.
+    monkeypatch.setattr(server, "_start_cloud_report", lambda: None)
     auth._fails.clear()
     auth._ufails.clear()
     c = TestClient(server.app)
@@ -115,6 +117,74 @@ def test_cloud_fingerprint_is_validated_and_normalized(app, monkeypatch):
     server.CFG["cloud"]["tls_fingerprint"] = fp
     assert c.post("/api/settings", json={"cloud": dict(cloud, token="", tls_fingerprint=fp)}
                   ).status_code == 200
+
+
+@pytest.mark.parametrize("site_id", ["云海 二期", "Site A"])
+def test_cloud_legacy_site_ids_and_saved_identity_are_preserved(app, monkeypatch, site_id):
+    server, c = app
+    monkeypatch.setitem(server.CFG, "cloud", dict(server.appconfig.DEFAULTS["cloud"]))
+    saved = []
+    monkeypatch.setattr(server.appconfig, "update_settings", lambda body: saved.append(body))
+    cloud = {"enabled": True, "url": "https://cloud.example.test", "token": "test-token",
+             "site_name": "Renamed site", "site_type": "hydro", "site_id": site_id}
+    response = c.post("/api/settings", json={"cloud": cloud})
+    assert response.status_code == 200 and response.json()["site_id"] == site_id
+    assert saved[-1]["cloud"]["site_id"] == site_id == server.CFG["cloud"]["site_id"]
+    # Manual editing or an old shared code may omit s/site_id. Keep the saved ID.
+    cloud.pop("site_id")
+    cloud["token"] = ""
+    assert c.post("/api/settings", json={"cloud": cloud}).status_code == 200
+    assert saved[-1]["cloud"]["site_id"] == site_id
+    assert c.get("/api/settings").json()["site_id"] == site_id
+
+
+@pytest.mark.parametrize("bad", [" Site A ", "Site\nA", "Site\x7fA", "场" * 65])
+def test_cloud_site_id_is_not_silently_rewritten(app, monkeypatch, bad):
+    server, c = app
+    monkeypatch.setitem(server.CFG, "cloud", {})
+    saved = []
+    monkeypatch.setattr(server.appconfig, "update_settings", lambda body: saved.append(body))
+    cloud = {"enabled": False, "url": "https://cloud.example.test", "token": "test-token",
+             "site_name": "Site", "site_id": bad}
+    assert c.post("/api/settings", json={"cloud": cloud}).status_code == 400
+    assert not saved and not server.CFG["cloud"]
+
+
+def test_cloud_test_failure_does_not_save_or_replace_current_connection(app, monkeypatch):
+    server, c = app
+    current = {"enabled": True, "url": "https://old.example.test", "token": "old-token",
+               "site_name": "Old site", "site_id": "old-site"}
+    monkeypatch.setitem(server.CFG, "cloud", current.copy())
+    saved = []
+    monkeypatch.setattr(server.appconfig, "update_settings", lambda body: saved.append(body))
+    monkeypatch.setattr(server.cloud_report, "test", lambda *args: (False, "test denied"))
+    proposed = dict(current, url="https://new.example.test", token="new-token", site_id="new-site")
+    response = c.post("/api/cloud/test", json={"cloud": proposed})
+    assert response.status_code == 200 and response.json()["ok"] is False
+    assert not saved and server.CFG["cloud"] == current
+
+
+def test_cloud_only_save_preserves_scan_settings_and_requires_admin_and_same_origin(app, monkeypatch):
+    server, c = app
+    tuning = {"interval": 120, "timeout": 17, "customer_interval": 900, "customer_hours": 48}
+    monkeypatch.setitem(server.CFG, "cloud", {**server.appconfig.DEFAULTS["cloud"], **tuning})
+    saved, segments = [], []
+    monkeypatch.setattr(server.appconfig, "update_settings", lambda body: saved.append(body))
+    monkeypatch.setattr(server.appconfig, "save_segments", lambda *args: segments.append(args))
+    schedule, scan = dict(server.CFG["schedule"]), dict(server.CFG["scan"])
+    body = {"cloud": {"enabled": True, "url": "https://cloud.example.test", "token": "test-token",
+                       "site_name": "Site", "site_id": "site-a"}}
+    assert c.post("/api/settings", json=body).status_code == 200
+    assert list(saved[-1]) == ["cloud"] and not segments
+    assert {key: saved[-1]["cloud"][key] for key in tuning} == tuning
+    assert server.CFG["schedule"] == schedule and server.CFG["scan"] == scan
+    assert c.post("/api/cloud/test", json=body, headers={"Origin": "https://evil.example"}).status_code == 403
+    assert c.post("/api/settings", json=body, headers={"Origin": "https://evil.example"}).status_code == 403
+    assert c.post("/api/login", json={"username": "viewer", "password": "test-viewer-password"}).status_code == 200
+    assert "cloud" not in c.get("/api/settings").json()
+    assert c.get("/api/cloud/status").status_code == 403
+    assert c.post("/api/cloud/test", json=body).status_code == 403
+    assert c.post("/api/settings", json=body).status_code == 403
 
 
 def test_csv_formula_injection_is_neutralized(app, monkeypatch):

@@ -1,0 +1,70 @@
+/* Shared theme controls. Night keeps the existing monitoring palette. */
+:root { color-scheme: dark; --theme-danger: #ff9b9b; --theme-warning: #fab219; --theme-success: #3fb950; }
+:root[data-theme="light"] { color-scheme: light; --theme-danger: #b42330; --theme-warning: #925607; --theme-success: #19713a; }
+header { gap: 12px; flex-wrap: wrap; }
+.actions { flex-wrap: wrap; }
+.theme-select { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 4px 8px; font-size: 13px; cursor: pointer; max-width: 100%; }
+.theme-row { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 16px; font-size: 13px; color: #8b949e; }
+#cloudOpen { color: #58a6ff; }
+:is(button, input, select, textarea, summary):focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+
+/* Surfaces and text. Explicit selectors preserve status colours and rack semantics. */
+[data-theme="light"] body { background: #f2f5f9; color: #202c3c; }
+[data-theme="light"] .login-overlay { background: #edf2f7; }
+[data-theme="light"] :is(header, .card, .panel, .site, .modal-box, .login-box, .toast, .reboot-bar) { background: #fff; border-color: #cfd8e3; }
+[data-theme="light"] :is(.rack, .worker, .cbox, .chartbox) { background: #f8fafc; border-color: #d8e0ea; }
+[data-theme="light"] :is(h2, h3, .legend, .site .hr .unit, .wmodels, .cbox-meta, .poolrow b, .lang-row, .theme-row) { color: #596677; }
+[data-theme="light"] :is(.login-box h2, .rack-head .name, .wmodel b, .a .aworker, #cmdBody) { color: #202c3c; }
+[data-theme="light"] :is(.muted, th, .card .lbl, tr.off, .a .atime, .rack-head .stat, .site .stats .k, .site .foot) { color: #596677; }
+[data-theme="light"] :is(.badge, .pump, .chbadge.off, .fbadge.info, .pill.st-pending) { background: #e7edf4; color: #4d5e73; }
+[data-theme="light"] :is(.seg-host, .wstat, #mInfo, .formrow label, .reboot-bar, .a .aworker b, .conn-advanced summary, .conn-raw-token summary) { color: #4d5e73; }
+[data-theme="light"] :is(.a .ip, .ip-link, .wname, .cbox-ip, #cloudSiteId, #cloudOpen) { color: #175fbd; }
+[data-theme="light"] :is(th, td) { border-bottom-color: #dce4ed; }
+[data-theme="light"] th:hover { color: #202c3c; }
+[data-theme="light"] :is(.seg-divider, .deleted-site, .conn-advanced, .conn-raw-token, .cloud-advanced, .cloud-status-card) { border-color: #cfd8e3; }
+[data-theme="light"] .cmdbar .sep { background: #cfd8e3; }
+[data-theme="light"] .progress .bar { background: #dce4ed; }
+[data-theme="light"] tr.sel { background: #e3efff; }
+[data-theme="light"] .alertlist .a { background: #f0f4f8; }
+[data-theme="light"] .modal { background: rgba(25, 39, 59, .35); }
+
+/* Forms, including login, connection settings and dynamically rendered commands. */
+[data-theme="light"] :is(button, .lang-select, .theme-select) { background: #edf2f7; color: #29394e; border-color: #b9c7d7; }
+[data-theme="light"] button:hover { background: #dde7f2; }
+[data-theme="light"] :is(button.primary, .tab.active) { background: #1765cf; color: #fff; border-color: #1765cf; }
+[data-theme="light"] :is(button.primary:hover, .tab.active:hover) { background: #0e53b1; }
+[data-theme="light"] :is(.filters input, .filters select, .seg-host input, .seg-host select,
+  .login-box input, .site-manage input, .reboot-bar input[type=number], .formrow input,
+  #cmdBody input, #segBody textarea, .cloud-field input, .cloud-field select,
+  #connectModal input, #connectModal select, select, textarea, .conn-install-command code) {
+  background: #fff; color: #202c3c; border-color: #b9c7d7;
+}
+[data-theme="light"] :is(input, textarea)::placeholder { color: #64748b; opacity: 1; }
+[data-theme="light"] .conn-install-command code { background: #f6f8fb; }
+[data-theme="light"] :is(button, input, select, textarea, summary):focus-visible { outline-color: #1765cf; }
+
+/* Error/success/warning states remain distinct in daylight. */
+[data-theme="light"] :is(.login-err, .res-fail, .upd-body .upd-err, td.hot, button.danger, .mini-btn.danger, .site .err) { color: #b42330; }
+[data-theme="light"] :is(.res-ok, .acked, .upd-body .upd-ok, #btnUpdate.has-update) { color: #19713a; }
+[data-theme="light"] :is(td.low, .card.alert .num, .card.alert .num.hot, .rack-head .stat b.bad, .cbox-temps .out, .site-warning, .conn-warn) { color: #925607; }
+[data-theme="light"] .cbox-temps .in { color: #087584; }
+[data-theme="light"] :is(.rmbtn, .sec-banner, .seccheck.high, #cmdBody .warn-box) { background: #ffebed; color: #a81f2e; border-color: #e6a3ac; }
+[data-theme="light"] :is(.rmbtn:hover, .mini-btn.danger:hover) { background: #ffdce1; }
+[data-theme="light"] :is(.pill.online, .pill.st-ok, .pump.on, .chbadge.ok, .seccheck.ok) { background: #e1f4e7; color: #19713a; }
+[data-theme="light"] :is(.pill.offline, .pill.st-unreachable, .fbadge.crit, .chbadge.fail) { background: #ffe5e9; color: #b42330; }
+[data-theme="light"] :is(.pill.repair, .pill.st-alert, .fbadge.warn, .alertrow, .seccheck.warn, .upd-body .upd-note, .conn-result) { background: #fff2d8; color: #80510a; }
+[data-theme="light"] .alertrow b { color: #744606; }
+[data-theme="light"] .pill.st-stalled { background: #ffeadc; color: #a74716; }
+[data-theme="light"] :is(.pill.stock, .pill.mixed) { background: #eee6ff; color: #6941a5; }
+[data-theme="light"] :is(.pill.uniplus, .pill.air) { background: #dff4f6; color: #0c6c79; }
+[data-theme="light"] :is(.pill.unknown, .pill.hydro, .seccheck.info) { background: #e2eeff; color: #175fbd; }
+[data-theme="light"] .slot.empty { background: #e1e7ee; color: #69778a; }
+[data-theme="light"] .slot:hover { outline-color: #1765cf; }
+[data-theme="light"] .site.s-unreachable { border-color: #d98d98; }
+[data-theme="light"] .site:hover { border-color: #1765cf; }
+[data-theme="light"] .dot.offline { background: #8b97a7; }
+
+@media (max-width: 640px) {
+  header { padding: 12px; }
+  .actions { gap: 7px; }
+}

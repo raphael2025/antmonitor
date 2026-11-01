@@ -757,10 +757,12 @@ async function openContainer(ip) {
 }
 
 function refreshAll() {
-  refreshSummary(); refreshAlerts(); refreshTrend(); refreshContainers();
-  if (view === "rack") refreshRacks();
-  else if (view === "worker") refreshWorkers();
-  else refreshMiners();
+  const requests = [refreshSummary(), refreshAlerts(), refreshTrend(), refreshContainers()];
+  if (view === "rack") requests.push(refreshRacks());
+  else if (view === "worker") requests.push(refreshWorkers());
+  else requests.push(refreshMiners());
+  // 会话失效时 jget 会弹登录，已发出的并行请求仍需接住各自的 rejection。
+  return Promise.allSettled(requests);
 }
 
 /* ---------------- 选择 + 远程命令 ---------------- */
@@ -943,7 +945,7 @@ function toast(text, kind) {
   setTimeout(() => t.remove(), 6000);
 }
 
-/* ---------------- 设置(网段/扫描/云端上报) ---------------- */
+/* ---------------- 网段与扫描设置 ---------------- */
 async function openSeg() {
   const d = await jget("/api/segments");
   $("segText").value = (d.segments || []).join("\n");
@@ -952,89 +954,8 @@ async function openSeg() {
   $("setInterval").value = s.scan_interval;
   if ($("setFullInterval")) $("setFullInterval").value = s.full_interval;
   $("setPps").value = s.max_pps;
-  if (s.cloud) {   // 云端上报配置(仅 admin 下发；token 不回传明文，留空保存=沿用)
-    $("cloudEnabled").checked = !!s.cloud.enabled;
-    $("cloudName").value = s.cloud.site_name || "";
-    $("cloudType").value = s.cloud.site_type || "air";
-    $("cloudUrl").value = s.cloud.url || "";
-    $("cloudToken").value = "";
-    $("cloudToken").placeholder = s.cloud.token_set
-      ? t("seg.token_saved_ph", { hint: s.cloud.token_hint || "****" }) : "ingest token";
-    $("cloudFp").value = s.cloud.tls_fingerprint || "";
-    $("cloudSiteId").textContent = s.site_id || "-";
-    cloudSiteIdOverride = "";
-  }
-  $("cloudCode").value = "";
-  $("cloudToken").type = "password";   // 每次打开都回到遮蔽态
-  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = t("seg.token_eye");
   $("segModal").classList.remove("hidden");
-  if (s.cloud) refreshCloudStatus();
 }
-
-// 云端「场地接入」生成的接入码：AMC1-<base64url(JSON {u:地址, t:token, f:证书指纹, s:场地ID})>
-let cloudSiteIdOverride = "";
-function parseConnectCode(code) {
-  const m = String(code || "").trim().match(/^AMC1-([A-Za-z0-9_-]+)$/);
-  if (!m) return null;
-  try {
-    const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
-    const d = JSON.parse(atob(b64 + "===".slice((b64.length + 3) % 4)));
-    return d && typeof d.u === "string" && typeof d.t === "string" ? d : null;
-  } catch (e) { return null; }
-}
-$("cloudCodeApply").onclick = () => {
-  const d = parseConnectCode($("cloudCode").value);
-  if (!d) { toast(t("toast.connect_bad"), "fail"); return; }
-  $("cloudUrl").value = d.u;
-  $("cloudToken").value = d.t;
-  $("cloudFp").value = d.f || "";
-  if (d.s) { cloudSiteIdOverride = d.s; $("cloudSiteId").textContent = d.s; }
-  $("cloudCode").value = "";
-  $("cloudEnabled").checked = true;
-  toast(t("toast.connect_applied"), "ok");
-};
-function cloudForm() {
-  const c = {
-    enabled: $("cloudEnabled").checked,
-    site_name: $("cloudName").value.trim(),
-    site_type: $("cloudType").value,
-    url: $("cloudUrl").value.trim(),
-    token: $("cloudToken").value.trim(),
-    tls_fingerprint: $("cloudFp").value.trim(),
-  };
-  if (cloudSiteIdOverride) c.site_id = cloudSiteIdOverride;
-  return c;
-}
-function agoText(ts) {
-  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
-  return s < 90 ? t("cloud.ago_s", { n: s }) : t("cloud.ago_m", { n: Math.round(s / 60) });
-}
-async function refreshCloudStatus() {
-  const el = $("cloudStatus");
-  try {
-    const st = await jget("/api/cloud/status");
-    el.className = "muted";
-    if (!st.enabled) { el.textContent = t("cloud.st_disabled"); return; }
-    if (st.fails && st.last_err) {
-      el.className = "res-fail";
-      el.textContent = t("cloud.st_fail", { n: st.fails, err: st.last_err });
-    } else if (st.last_ok) {
-      el.className = "res-ok";
-      el.textContent = t("cloud.st_ok", { ago: agoText(st.last_ok) });
-    } else {
-      el.textContent = st.last_err || t("cloud.st_wait");
-    }
-  } catch (e) { el.textContent = ""; }
-}
-$("cloudTest").onclick = async () => {
-  const el = $("cloudStatus");
-  el.className = "muted"; el.textContent = t("cloud.testing");
-  try {
-    const d = await jpost("/api/cloud/test", { cloud: cloudForm() });
-    el.className = d.ok ? "res-ok" : "res-fail";
-    el.textContent = d.message || d.error || "";
-  } catch (e) { el.textContent = ""; }
-};
 async function saveSeg(scan) {
   const segs = $("segText").value.split(/[\n,\s]+/).map(s => s.trim()).filter(Boolean);
   try {
@@ -1049,32 +970,276 @@ async function saveSeg(scan) {
     const body = {
       scan_interval: num("setInterval"),
       max_pps: num("setPps"),
-      cloud: cloudForm(),
     };
     if ($("setFullInterval")) body.full_interval = num("setFullInterval");
     Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
     const d2 = await jpost("/api/settings", body);
     if (!d2.ok) { toast(t("toast.save_fail", { msg: d2.error || "" })); return; }
     $("segModal").classList.add("hidden");
-    toast(t("toast.saved_settings") + ($("cloudEnabled").checked ? t("toast.cloud_on") : ""), "ok");
+    toast(t("toast.saved_settings"), "ok");
     if (scan) { await jpost("/api/scan?kind=full", {}); toast(t("toast.full_triggered"), "ok"); setTimeout(pollProgress, 500); }
   } catch (e) {}
 }
 $("btnSeg").onclick = openSeg;
-// 上报token 默认按密码框遮住（机房里投屏/旁人围观是常态），需要核对时点👁临时显示
-if ($("cloudTokenEye")) $("cloudTokenEye").onclick = () => {
-  const el = $("cloudToken"), show = el.type === "password";
-  el.type = show ? "text" : "password";
-  $("cloudTokenEye").textContent = show ? t("seg.token_hide") : t("seg.token_eye");
-};
 $("segClose").onclick = $("segCancel").onclick = () => {
   $("segModal").classList.add("hidden");
-  const el = $("cloudToken");   // 关窗即复位成遮蔽态，别下次打开还明晃晃亮着
-  if (el) el.type = "password";
-  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = t("seg.token_eye");
 };
 $("segSave").onclick = () => saveSeg(false);
 $("segSaveScan").onclick = () => saveSeg(true);
+
+/* ---------------- 独立云端连接：测试成功才保存，仅提交 cloud ---------------- */
+let cloudSiteIdOverride = "", _cloudAppliedCode = "";
+let _cloudSaved = null, _cloudSnapshot = null, _cloudStatusUnavailable = false;
+let _cloudBusy = false, _cloudTimer = null, _cloudPollEpoch = 0, _cloudOpenEpoch = 0;
+let _cloudFeedback = null, _cloudCodeHintKey = "cloud.code_hint";
+
+function cloudFeedback(key, vars = {}, kind = "muted") {
+  _cloudFeedback = key ? { key, vars, kind } : null;
+  const el = $("cloudFeedback");
+  el.className = "cloud-feedback " + (key ? kind : "hidden");
+  el.textContent = key ? t(key, vars) : "";
+}
+function renderCloudLabels() {
+  $("cloudCodeHint").textContent = t(_cloudCodeHintKey);
+  $("cloudTokenEye").textContent = t($("cloudToken").type === "password" ? "seg.token_eye" : "seg.token_hide");
+  $("cloudToken").placeholder = _cloudSaved && _cloudSaved.token_set
+    ? t("seg.token_saved_ph", { hint: _cloudSaved.token_hint || "****" }) : "ingest token";
+  $("cloudConnect").textContent = t(_cloudBusy ? "cloud.working" : "header.cloud");
+  $("cloudClose").setAttribute("aria-label", t("cloud.close"));
+  if (_cloudFeedback) cloudFeedback(_cloudFeedback.key, _cloudFeedback.vars, _cloudFeedback.kind);
+}
+function fillCloudSettings(c) {
+  _cloudSaved = { ...c };
+  $("cloudName").value = c.site_name || "";
+  $("cloudType").value = c.site_type || "air";
+  $("cloudUrl").value = c.url || "";
+  $("cloudFp").value = c.tls_fingerprint || "";
+  $("cloudSiteId").textContent = c.site_id || "-";
+  $("cloudToken").value = "";
+  $("cloudToken").type = "password";
+  $("cloudCode").value = "";
+  $("cloudPause").classList.toggle("hidden", !c.enabled);
+  cloudSiteIdOverride = "";
+  _cloudAppliedCode = "";
+  _cloudCodeHintKey = "cloud.code_hint";
+  renderCloudLabels();
+}
+async function openCloud() {
+  if (myRole !== "admin") return;
+  const epoch = ++_cloudOpenEpoch;
+  $("cloudModal").classList.remove("hidden");
+  $("cloudClose").focus();
+  if (!_cloudBusy) {
+    cloudFeedback("cloud.loading");
+    $("cloudFields").disabled = true;
+    $("cloudConnect").disabled = true;
+    try {
+      const s = await jget("/api/settings");
+      if (epoch !== _cloudOpenEpoch) return;
+      if (!s.cloud) throw new Error("settings");
+      fillCloudSettings({ ...s.cloud, site_id: s.site_id });
+      $("cloudAdvanced").open = false;
+      cloudFeedback("");
+    } catch (e) {
+      if (epoch === _cloudOpenEpoch) cloudFeedback("cloud.load_failed", {}, "res-fail");
+    } finally {
+      if (epoch === _cloudOpenEpoch) {
+        $("cloudFields").disabled = false;
+        $("cloudConnect").disabled = false;
+        $("cloudCode").focus();
+      }
+    }
+  }
+  startCloudPolling();
+}
+function closeCloud() {
+  _cloudOpenEpoch++;
+  $("cloudModal").classList.add("hidden");
+  $("cloudToken").type = "password";
+  renderCloudLabels();
+  startCloudPolling();
+  $("btnCloud").focus();
+}
+function applyCloudCode(showError = false) {
+  const raw = $("cloudCode").value.trim();
+  if (!raw) {
+    _cloudAppliedCode = "";
+    _cloudCodeHintKey = "cloud.code_hint";
+    renderCloudLabels();
+    return true; // 手动配置和已保存的连接不需要接入码
+  }
+  const d = AntMonitorCloud.parseCode(raw);
+  if (!d) {
+    _cloudCodeHintKey = "cloud.code_hint";
+    if (showError) cloudFeedback("toast.connect_bad", {}, "res-fail");
+    renderCloudLabels();
+    return false;
+  }
+  if (raw !== _cloudAppliedCode) {
+    $("cloudUrl").value = d.u;
+    $("cloudToken").value = d.t;
+    $("cloudFp").value = d.f;
+    $("cloudName").value = d.n || (_cloudSaved && _cloudSaved.site_name) || "";
+    $("cloudType").value = d.y || (_cloudSaved && _cloudSaved.site_type) || "air";
+    cloudSiteIdOverride = d.s;
+    $("cloudSiteId").textContent = d.s || (_cloudSaved && _cloudSaved.site_id) || "-";
+    _cloudAppliedCode = raw;
+  }
+  _cloudCodeHintKey = d.n ? "cloud.code_ready" : "cloud.code_needs_name";
+  renderCloudLabels();
+  return true;
+}
+function cloudForm() {
+  const c = { enabled: true, site_name: $("cloudName").value.trim(),
+    site_type: $("cloudType").value, url: $("cloudUrl").value.trim(),
+    token: $("cloudToken").value.trim(), tls_fingerprint: $("cloudFp").value.trim() };
+  if (cloudSiteIdOverride) c.site_id = cloudSiteIdOverride;
+  return c;
+}
+function cloudHasSavedToken(c) {
+  const fp = v => String(v || "").trim().toLowerCase().replace(/^sha256:/, "").replace(/[:\s]/g, "");
+  return !!(_cloudSaved && _cloudSaved.token_set
+    && c.url.replace(/\/+$/, "") === (_cloudSaved.url || "").replace(/\/+$/, "")
+    && fp(c.tls_fingerprint) === fp(_cloudSaved.tls_fingerprint));
+}
+function setCloudBusy(busy) {
+  _cloudBusy = busy;
+  $("cloudFields").disabled = busy;
+  $("cloudConnect").disabled = busy;
+  $("cloudBindingForm").setAttribute("aria-busy", String(busy));
+  renderCloudLabels();
+}
+async function connectCloud(event) {
+  event.preventDefault();
+  if (_cloudBusy || myRole !== "admin") return;
+  cloudFeedback("");
+  if (!applyCloudCode(true)) { $("cloudCode").focus(); return; }
+  const c = cloudForm(), missing = AntMonitorCloud.validate(c, cloudHasSavedToken(c));
+  if (missing) {
+    cloudFeedback("cloud.required_" + missing, {}, "res-fail");
+    if (missing !== "site_name") $("cloudAdvanced").open = true;
+    $({ site_name: "cloudName", url: "cloudUrl", token: "cloudToken" }[missing]).focus();
+    return;
+  }
+  setCloudBusy(true);
+  try {
+    const saved = await AntMonitorCloud.connect(c, jpost, phase => cloudFeedback("cloud." + phase));
+    fillCloudSettings({ ...saved.cloud, site_id: saved.site_id || (saved.cloud || {}).site_id
+      || cloudSiteIdOverride || (_cloudSaved && _cloudSaved.site_id) });
+    // 丢弃保存前已经发出的状态查询，避免旧连接的成功短暂覆盖新连接。
+    _cloudSnapshot = null;
+    _cloudStatusUnavailable = false;
+    renderCloudStatus();
+    cloudFeedback("cloud.saved", {}, "res-ok");
+    startCloudPolling();
+  } catch (e) {
+    const keys = { test: "cloud.test_failed", test_network: "cloud.test_network",
+      save: "cloud.save_failed", save_network: "cloud.save_unknown" };
+    cloudFeedback(keys[e.step] || "cloud.save_unknown", { error: e.message || "" }, "res-fail");
+    startCloudPolling(); // 输入保持不动；同时显示原来已保存连接的真实状态
+  } finally { setCloudBusy(false); }
+}
+async function pauseCloud() {
+  if (_cloudBusy || !_cloudSaved) return;
+  setCloudBusy(true);
+  cloudFeedback("cloud.saving");
+  try {
+    const c = { enabled: false, url: _cloudSaved.url, token: "",
+      site_name: _cloudSaved.site_name, site_type: _cloudSaved.site_type,
+      tls_fingerprint: _cloudSaved.tls_fingerprint, site_id: _cloudSaved.site_id };
+    const d = await jpost("/api/settings", { cloud: c });
+    if (!d.ok) { cloudFeedback("cloud.save_failed", { error: d.error || "" }, "res-fail"); return; }
+    _cloudSaved.enabled = false;
+    $("cloudPause").classList.add("hidden");
+    cloudFeedback("cloud.paused", {}, "res-ok");
+    _cloudSnapshot = null;
+  } catch (e) { cloudFeedback("cloud.save_unknown", {}, "res-fail"); }
+  finally { setCloudBusy(false); startCloudPolling(); }
+}
+function agoText(ts) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  return s < 90 ? t("cloud.ago_s", { n: s }) : t("cloud.ago_m", { n: Math.round(s / 60) });
+}
+function renderCloudStatus() {
+  const el = $("cloudStatus"), badge = $("cloudHeaderState"), st = _cloudSnapshot;
+  el.className = "muted";
+  $("btnCloud").classList.toggle("needs-connection", !!(st && !st.enabled));
+  $("cloudOpen").classList.add("hidden");
+  if (_cloudStatusUnavailable || !st) {
+    el.textContent = t(_cloudStatusUnavailable ? "cloud.status_unavailable" : "cloud.loading");
+    badge.textContent = _cloudStatusUnavailable ? t("cloud.badge_unknown") : "…";
+    return;
+  }
+  if (!st.enabled) {
+    el.textContent = t("cloud.disconnected");
+    badge.textContent = t("cloud.badge_off");
+    return;
+  }
+  if (/^https?:\/\//i.test(st.url || "")) {
+    $("cloudOpen").href = st.url;
+    $("cloudOpen").classList.remove("hidden");
+  }
+  if (st.state === "error" || st.fails || st.running === false) {
+    el.className = "res-fail";
+    el.textContent = t("cloud.retrying", { error: st.last_err || t("cloud.worker_stopped") });
+    badge.textContent = t("cloud.badge_retry");
+  } else if (st.state === "waiting_scan") {
+    el.textContent = t("cloud.waiting_scan");
+    badge.textContent = t("cloud.badge_wait");
+  } else if (st.last_ok) {
+    el.className = "res-ok";
+    el.textContent = t("cloud.st_ok", { ago: agoText(st.last_ok) });
+    badge.textContent = t("cloud.badge_ok");
+  } else {
+    el.textContent = t("cloud.waiting_report");
+    badge.textContent = t("cloud.badge_wait");
+  }
+}
+function stopCloudPolling() {
+  _cloudPollEpoch++;
+  if (_cloudTimer) { clearTimeout(_cloudTimer); _cloudTimer = null; }
+}
+function startCloudPolling() {
+  stopCloudPolling();
+  if (myRole !== "admin" || _wsStop) return;
+  const epoch = _cloudPollEpoch;
+  async function poll() {
+    try {
+      const st = await jget("/api/cloud/status");
+      if (epoch !== _cloudPollEpoch) return;
+      if (!st.ok) throw new Error("status");
+      _cloudSnapshot = st;
+      _cloudStatusUnavailable = false;
+    } catch (e) {
+      if (epoch !== _cloudPollEpoch) return;
+      _cloudStatusUnavailable = true;
+    }
+    renderCloudStatus();
+    if (epoch === _cloudPollEpoch) {
+      _cloudTimer = setTimeout(poll, $("cloudModal").classList.contains("hidden") ? 30000 : 3000);
+    }
+  }
+  poll();
+}
+$("btnCloud").onclick = openCloud;
+$("cloudClose").onclick = $("cloudCancel").onclick = closeCloud;
+$("cloudBindingForm").onsubmit = connectCloud;
+$("cloudPause").onclick = pauseCloud;
+$("cloudCode").addEventListener("input", () => { cloudFeedback(""); applyCloudCode(); });
+$("cloudTokenEye").onclick = () => {
+  $("cloudToken").type = $("cloudToken").type === "password" ? "text" : "password";
+  renderCloudLabels();
+};
+$("cloudModal").addEventListener("keydown", e => {
+  if (e.key === "Escape") { e.preventDefault(); closeCloud(); }
+  if (e.key === "Tab") {
+    const items = [...$("cloudBindingForm").querySelectorAll("button, input, select, summary, a[href]")]
+      .filter(el => !el.matches(":disabled") && el.getClientRects().length);
+    const first = items[0], last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+});
 
 /* ---------------- 顶部：零算力自动重启设置 ---------------- */
 async function loadRebootSettings() {
@@ -1207,6 +1372,7 @@ $("pwdNew2").addEventListener("keydown", e => { if (e.key === "Enter") savePwd()
 function applyRole() {
   const canCtl = myRole === "ops" || myRole === "admin";
   document.body.classList.toggle("viewer", !canCtl);
+  $("btnCloud").classList.toggle("hidden", myRole !== "admin");
   $("btnSeg").style.display = myRole === "admin" ? "" : "none";  // 网段设置仅 admin
   $("btnUpdate").style.display = myRole === "admin" ? "" : "none";  // 版本更新仅 admin
   $("btnPwd").style.display = myUser && myUser !== "anonymous" ? "" : "none";
@@ -1374,6 +1540,9 @@ function connectWS() {
 }
 function stopDashboard() {   // 会话失效/登出：停轮询与 WS 重连，避免登录页后台空转
   _wsStop = true;
+  stopCloudPolling();
+  _cloudOpenEpoch++;
+  $("cloudModal").classList.add("hidden");
   if (_timer) { clearInterval(_timer); _timer = null; }
   if (_wsRetryTimer) { clearTimeout(_wsRetryTimer); _wsRetryTimer = null; }
   if (_ws) { const w = _ws; _ws = null; try { w.close(); } catch (e) {} }
@@ -1391,6 +1560,7 @@ function startDashboard() {
   if (!_staleTimer) _staleTimer = setInterval(checkStale, 10000);  // 失联自检，每10秒
   if (myRole === "ops" || myRole === "admin") pollCmdProgress(true);   // 刷新页面后接上在跑的分批重启
   if (myRole === "admin") {   // 新版本提示：进来查一次，之后每 30 分钟(后端有 10 分钟缓存)
+    startCloudPolling();
     checkUpdate(false);
     if (!_updTimer) _updTimer = setInterval(() => checkUpdate(false), 1800000);
   }
@@ -1463,12 +1633,18 @@ init();
     wireSelect("langSelect");
     wireSelect("langSelectLogin");
     syncSelects();
+    renderCloudLabels();
+    renderCloudStatus();
     document.addEventListener("i18n:change", () => {
       syncSelects();
+      renderCloudLabels();
+      renderCloudStatus();
       try { setVoice(voiceOn, false); } catch (e) {}
       try { updateSelCount(); } catch (e) {}
-      // 动态渲染的列表/卡片/趋势不走 data-i18n，必须整页刷新文案
-      try { if (typeof refreshAll === "function") refreshAll(); } catch (e) {}
+      // 登录页只更新控件语言，不发需要登录的请求。已登录时刷新动态内容。
+      if (!_wsStop && myUser && $("loginOverlay").classList.contains("hidden")) {
+        refreshAll().catch(() => {});
+      }
     });
   }
 })();

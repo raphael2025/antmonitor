@@ -927,9 +927,6 @@ def api_settings_get(sess: dict = Depends(require_viewer)):
     return out
 
 
-_SITE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-
 def _cloud_form(c, keep_token=True):
     """校验网页提交的云端上报配置，返回 (配置, 错误)。token 留空 = 沿用已保存的。"""
     cur = CFG.get("cloud") or {}
@@ -953,11 +950,19 @@ def _cloud_form(c, keep_token=True):
           "site_type": c.get("site_type") if c.get("site_type") in ("air", "hydro", "mixed")
           else "air",
           "tls_fingerprint": fp}
+    # settings.json replaces the cloud object as a whole. Preserve reporting
+    # intervals/timeouts that are configured outside this connection form.
+    for key in ("interval", "timeout", "customer_interval", "customer_hours"):
+        if key in cur:
+            cl[key] = cur[key]
     # 场地 ID 一旦定下就别丢：表单没带时沿用当前值(否则重启后回落到 cloud_site_id.txt，云端变成新场地)
-    sid = str(c.get("site_id") or cur.get("site_id") or "").strip()
-    if sid:
-        if not _SITE_ID_RE.match(sid):
-            return None, "场地 ID 只能是 1~64 位字母/数字/._-"
+    raw_sid = str(c.get("site_id") or cur.get("site_id") or "")
+    if raw_sid:
+        # 与云端绑定 token 的目标校验一致：旧码可用中文或带空格的名称作 ID。
+        # 清洗后必须原样，禁止静默改写身份，否则可能指向另一个场地。
+        sid = "".join(ch for ch in raw_sid if ch >= " " and ch != "\x7f").strip()
+        if sid != raw_sid or not 1 <= len(sid) <= 64:
+            return None, "场地 ID 须为 1~64 个字符，不能含控制符或首尾空白"
         cl["site_id"] = sid
     if "enabled" in c and not isinstance(c["enabled"], bool):
         return None, "cloud.enabled 须为布尔值"
