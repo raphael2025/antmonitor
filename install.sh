@@ -10,8 +10,11 @@
 # 也可直接指定：... | sudo bash -s -- install|update|repair|uninstall|reset-user|menu
 # 选项：--lang zh|en|ru|es|de|ar  --dir 安装目录  --branch 分支
 #       --connect-code 接入码  --site-name 场地名  --site-type air|hydro|mixed
-# 从已下载/克隆的源码目录运行 sudo bash install.sh 时，直接用这份源码(不用访问 GitHub；pip 依赖仍需联网或镜像)。
+#       --source github|gitee（新装默认 GitHub；已安装未指定时保留 origin）
+# 未指定源码平台时，从已下载/克隆的目录运行 sudo bash install.sh 会用本地源码(pip 依赖仍需联网或镜像)。
 # 环境变量：GH_PROXY=https://镜像前缀/  访问 GitHub 很慢时用(镜像能看到并篡改下载内容，只用信得过的)
+#           ANTMONITOR_SOURCE=github|gitee 与 --source 等效；ANTMONITOR_REPO 可指定自定义 Git 仓库。
+# Gitee 安装会自动安装 Git；Git 不可用或克隆失败时停止，不改从其它平台下载。
 set -euo pipefail
 
 APP_NAME="AntMonitor"
@@ -19,7 +22,9 @@ INSTALL_DIR="${ANTMONITOR_HOME:-/opt/antmonitor}"
 SERVICE_NAME="antmonitor"
 GH_REPO="${ANTMONITOR_GH_REPO:-raphael2025/antmonitor}"
 GH_PROXY="${GH_PROXY:-}"
-REPO_URL="${ANTMONITOR_REPO:-${GH_PROXY}https://github.com/${GH_REPO}.git}"
+SOURCE="${ANTMONITOR_SOURCE:-github}"
+SOURCE_EXPLICIT=0
+[[ -n "${ANTMONITOR_SOURCE:-}" ]] && SOURCE_EXPLICIT=1
 # 生产默认跟踪 main(dev 是开发分支，未经验证)。已安装的现场更新时沿用当前分支，见 sync_code
 BRANCH="${ANTMONITOR_BRANCH:-main}"
 PY_MIN="3.8"
@@ -36,6 +41,9 @@ while [[ $# -gt 0 ]]; do
     --lang) LANG_CODE="${2:-}"; shift ;;
     --dir) INSTALL_DIR="${2:-}"; shift ;;
     --branch) BRANCH="${2:-}"; ANTMONITOR_BRANCH="$BRANCH"; shift ;;
+    --source)
+      [[ $# -ge 2 && -n "${2:-}" ]] || { echo "--source 需要一个值：github 或 gitee" >&2; exit 2; }
+      SOURCE="$2"; SOURCE_EXPLICIT=1; shift ;;
     --connect-code) CONNECT_CODE="${2:-}"; shift ;;
     --site-name) SITE_NAME="${2:-}"; shift ;;
     --site-type) SITE_TYPE="${2:-air}"; shift ;;
@@ -45,10 +53,34 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-# 若从已克隆/解压的仓库根目录运行，优先用本地源码安装/更新。
+# 源码平台与下载方式必须一致：Gitee 公开归档链接可能返回下载网页，因此使用
+# Git 获取源码；不能把返回的 HTML 当源码或在失败后悄悄回到 GitHub。
+ARCHIVE_URL=""
+case "$SOURCE" in
+  github)
+    SOURCE_REPO_URL="${GH_PROXY}https://github.com/${GH_REPO}.git"
+    ARCHIVE_URL="${GH_PROXY}https://github.com/${GH_REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+    ;;
+  gitee) SOURCE_REPO_URL="https://gitee.com/raphael01/antmonitor.git" ;;
+  *) echo "--source / ANTMONITOR_SOURCE 只能是 github 或 gitee" >&2; exit 2 ;;
+esac
+if [[ "$SOURCE_EXPLICIT" == 1 && "$SOURCE" == github && "$GH_REPO" != raphael2025/antmonitor ]]; then
+  echo "显式选择官方源码平台时不能同时指定自定义 ANTMONITOR_GH_REPO；请只保留一种配置" >&2
+  exit 2
+fi
+REPO_URL="${ANTMONITOR_REPO:-$SOURCE_REPO_URL}"
+if [[ "$SOURCE_EXPLICIT" == 1 && "$REPO_URL" != "$SOURCE_REPO_URL" ]]; then
+  echo "显式选择源码平台时不能同时指定不同的 ANTMONITOR_REPO；自定义仓库请不要设置 --source / ANTMONITOR_SOURCE" >&2
+  exit 2
+fi
+# 自定义仓库继续用于 Git 克隆，但不能在失败后下载另一个官方仓库的源码。
+[[ "$REPO_URL" != "$SOURCE_REPO_URL" ]] && ARCHIVE_URL=""
+
+# 未显式选择平台时，从已克隆/解压的仓库根目录运行仍优先用本地源码。
+# 显式 --source / ANTMONITOR_SOURCE 必须从所选平台获取代码，不能被本地副本覆盖。
 # curl | bash 时没有脚本文件(BASH_SOURCE 为空)，绝不能把当前目录误当源码
 LOCAL_SRC=""
-if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+if [[ "$SOURCE_EXPLICIT" == 0 && -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [[ -f "$SCRIPT_DIR/server.py" && -f "$SCRIPT_DIR/requirements.txt" ]]; then
     LOCAL_SRC="$SCRIPT_DIR"
@@ -173,8 +205,16 @@ ensure_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq || warn "apt-get update 失败，继续尝试"
   apt-get install -y -qq python3 python3-venv python3-pip curl ca-certificates tar >/dev/null
-  # git 只用于网页一键更新；装不上(内网源缺包等)就改用源码包，安装照样完成
-  apt-get install -y -qq git >/dev/null 2>&1 || warn "git 装不上，改用源码包下载(网页更新不可用，可再跑本命令更新)"
+  # Gitee / 自定义仓库必须用 Git；已有 Git 部署也不能因 Git 缺失而被源码包覆盖。
+  if ! apt-get install -y -qq git >/dev/null 2>&1; then
+    if command -v git >/dev/null; then
+      warn "Git 软件包安装/更新失败，继续使用已安装的 Git"
+    elif [[ -e "$INSTALL_DIR/.git" || -z "$ARCHIVE_URL" ]]; then
+      die "当前源码来源需要 Git，自动安装失败；请检查 apt 软件源、安装 git 后重试"
+    else
+      warn "git 装不上，改用 GitHub 源码包(网页更新不可用，可再跑本命令更新)"
+    fi
+  fi
   apt-get install -y -qq rsync >/dev/null 2>&1 || true
   # 依赖(fastapi 等)最低要 Python 3.8：Ubuntu 18.04 自带 3.6，不拦住的话会在 pip 安装时
   # 报一堆看不懂的版本错误
@@ -224,9 +264,36 @@ EOF
   ok "systemd: ${SERVICE_NAME}.service (User=${user})"
 }
 
+official_origin() {
+  local url="${1%/}"
+  url="${url%.git}"
+  case "$url" in
+    https://github.com/raphael2025/antmonitor|http://github.com/raphael2025/antmonitor|\
+    git@github.com:raphael2025/antmonitor|ssh://git@github.com/raphael2025/antmonitor|\
+    https://gitee.com/raphael01/antmonitor|http://gitee.com/raphael01/antmonitor|\
+    git@gitee.com:raphael01/antmonitor|ssh://git@gitee.com/raphael01/antmonitor) return 0 ;;
+  esac
+  [[ -n "$GH_PROXY" && "$url" == "${GH_PROXY}https://github.com/raphael2025/antmonitor" ]]
+}
+
+sync_origin_source() {
+  [[ -e "$INSTALL_DIR/.git" ]] || return 0
+  command -v git >/dev/null || die "安装目录已有 Git 仓库，但找不到 git 命令；请先安装 git，现有源码保持不变"
+  [[ "$SOURCE_EXPLICIT" == 1 ]] || return 0
+  local origin
+  local g=(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR")
+  origin="$("${g[@]}" remote get-url origin)" || die "无法读取现有 origin，已停止自动换源"
+  official_origin "$origin" || die "现有 origin 是自定义仓库，已保留；请移除 --source / ANTMONITOR_SOURCE，或人工确认后修改 origin"
+  if [[ "$origin" != "$REPO_URL" ]]; then
+    "${g[@]}" remote set-url origin "$REPO_URL"
+    info "更新源已切换为 $SOURCE"
+  fi
+}
+
 sync_code() {
   mkdir -p "$INSTALL_DIR"
-  if [[ -n "$LOCAL_SRC" && -d "$LOCAL_SRC/.git" && -d "$INSTALL_DIR/.git" \
+  sync_origin_source
+  if [[ -n "$LOCAL_SRC" && -d "$LOCAL_SRC/.git" && -e "$INSTALL_DIR/.git" \
         && "$(cd "$LOCAL_SRC" && pwd -P)" != "$(cd "$INSTALL_DIR" && pwd -P)" ]]; then
     # 两边都是 git 仓库：按提交快进，不用 rsync 覆盖工作区。rsync 覆盖后工作区与安装目录
     # 自己的 HEAD 对不上，git status 永远是脏的，网页更新会一直以"工作区有改动"拒绝；
@@ -275,7 +342,8 @@ sync_code() {
     if [[ -d "$LOCAL_SRC/.git" && ! -d "$INSTALL_DIR/.git" ]]; then
       rsync -a "$LOCAL_SRC/.git"/ "$INSTALL_DIR/.git"/
     fi
-  elif [[ -d "$INSTALL_DIR/.git" ]]; then
+    sync_origin_source
+  elif [[ -e "$INSTALL_DIR/.git" ]]; then
     # 沿用现场当前分支(网页更新也是跟它)；只有显式设了 ANTMONITOR_BRANCH 才切换分支
     local br
     local g=(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR")
@@ -283,7 +351,7 @@ sync_code() {
     if [[ -n "${ANTMONITOR_BRANCH:-}" || "$br" == "HEAD" ]]; then
       br="$BRANCH"
     fi
-    "${g[@]}" fetch --all --prune || warn "fetch 失败（私有仓需部署密钥/Token / 网络不通）"
+    "${g[@]}" fetch --prune origin || die "从现有 origin 拉取失败：请检查网络与仓库访问权限，代码未更新"
     # 旧版本脚本默认装在 dev，dev 已不再更新：dev 上没有 main 里没有的实际改动时改跟 main
     # (与网页更新器的规则一致，见 updater._can_leave_legacy)
     if [[ -z "${ANTMONITOR_BRANCH:-}" && "$br" == "dev" ]] \
@@ -295,9 +363,10 @@ sync_code() {
     info "git pull ($br)"
     "${g[@]}" checkout "$br"
     "${g[@]}" pull --ff-only origin "$br" || \
-      warn "pull 失败（私有仓需部署密钥/Token）。可在有代码的机器上再跑本脚本。"
-  elif [[ -f "$INSTALL_DIR/server.py" ]]; then
-    # 以前用源码包装的(没有 .git)：继续用源码包覆盖更新
+      die "从现有 origin 更新失败：请检查网络、权限或本地分支，服务尚未重启"
+  elif [[ -f "$INSTALL_DIR/server.py" && -n "$ARCHIVE_URL" ]]; then
+    # GitHub 源码包安装继续用源码包；显式 Gitee / 自定义 Git 源走下方克隆路径，
+    # 让旧的无 .git 安装也能切换来源并获得后续 Git 更新能力。
     fetch_tarball
   else
     if command -v git >/dev/null; then
@@ -313,16 +382,18 @@ sync_code() {
         return
       fi
       rm -rf "$tmpc"
-      warn "git clone 失败，改用源码包下载"
+      [[ -n "$ARCHIVE_URL" ]] || die "Git 克隆失败，当前源码来源没有可用的源码包兜底；请检查网络与仓库访问权限后重试"
+      warn "git clone 失败，改用 GitHub 源码包下载"
     fi
     fetch_tarball
   fi
 }
 
 fetch_tarball() {
+  [[ -n "$ARCHIVE_URL" ]] || die "当前源码来源需要 Git；请安装 git 并确认仓库可访问后重试"
   local tmp url
   tmp="$(mktemp -d)"
-  url="${GH_PROXY}https://github.com/${GH_REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+  url="$ARCHIVE_URL"
   info "下载源码包 $url"
   if ! curl -fsSL --retry 3 --connect-timeout 15 "$url" | tar xz -C "$tmp" --strip-components=1; then
     rm -rf "$tmp"
