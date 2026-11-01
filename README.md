@@ -60,22 +60,65 @@
 
 不用先 `git clone`，没装 git / Python 也行，一行命令装好：
 
-**Ubuntu（推荐）**
+### Ubuntu（推荐）
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
 ```
 
 自动装依赖、下载代码、建服务并启动，安装时设置 admin 密码（直接回车会生成强密码并显示）。
-面板 `http://<监控机IP>:8800`。再跑一次同样的命令 = 管理菜单（更新 / 修复 / 卸载 / 重置账号）。
+默认安装目录 `/opt/antmonitor`，服务名 `antmonitor`，面板端口 `8800`。
+再次执行不带参数的安装命令，会进入管理菜单（更新 / 修复 / 卸载 / 重置账号）。
 
-装的时候顺便接入云端（接入码在云端面板「🔌 场地接入」里复制，运行后按提示粘贴，不会留在命令历史里）：
+#### Ubuntu 没有桌面，怎样打开面板？
+
+**Ubuntu Server 不需要安装桌面或浏览器。** AntMonitor 会启动 Web 服务；Linux 上不会自动弹出浏览器，
+请用同一局域网内另一台电脑的浏览器配置：
+
+1. 在 Ubuntu 终端执行 `hostname -I`，找到另一台电脑能访问的局域网 IP（可能显示多个地址）。
+2. 在 Windows / Mac / 其他电脑的浏览器打开 `http://<Ubuntu监控机IP>:8800`，
+   例如 `http://192.168.1.50:8800`，替换成你自己的 Ubuntu IP。
+3. 用 **admin** 登录 → 右上「⚙ 网段」→「☁ 云端上报」。
+4. 从**云端面板「🔌 场地接入」**复制接入码 → 回到本地面板粘贴并点「填入」→ 填场地名、选择类型、勾选启用
+   →「🔌 测试连接」→ **保存**。测试连接不会保存配置；保存后查看下方最近上报成功时间或失败原因。
+
+**只有 SSH 能访问 Ubuntu？** 在有浏览器的电脑上运行（把用户名和 IP 换成实际 SSH 登录信息）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code - --site-name 内蒙一场
+ssh -N -L 18800:127.0.0.1:8800 用户名@Ubuntu监控机IP
 ```
 
-**Windows 10 / 11**（PowerShell 里执行，不需要管理员）
+保持 SSH 窗口打开，在这台电脑的浏览器访问 `http://127.0.0.1:18800`。
+以上地址使用默认 HTTP / 8800 配置；如果改过面板端口或启用了 HTTPS，按实际配置调整。
+
+#### 通过终端接入云端
+
+接入码从**云端面板「🔌 场地接入」**复制。`--connect-code -` 表示运行后在交互终端中隐藏输入，
+不要把包含 token 的接入码直接写进命令。
+
+**首次安装时接入云端：**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh |
+  sudo bash -s -- --connect-code - --site-name '你的场地名' --site-type hydro
+```
+
+**已经安装后接入或更换云端：**当前脚本通过 `update` 处理接入码，
+**会同时更新代码和依赖、保存云端配置并重启服务**。只想修改配置时，使用上面的 Web 面板。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh |
+  sudo bash -s -- update --connect-code - --site-name '你的场地名' --site-type hydro
+```
+
+把场地名换成实际名称；`hydro` 为水冷，风冷用 `air`，混合用 `mixed`。
+如果原来使用自定义安装目录，还需补 `--dir '/实际安装目录'`。
+接入后核对具体连接测试结果及云端是否出现本场地；详细排查见
+[中文指南 · Ubuntu 无桌面访问与云端配置](docs/guide/zh.md#ubuntu-无桌面访问与云端配置)。
+
+### Windows 10 / 11
+
+PowerShell 里执行，不需要管理员：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
@@ -85,8 +128,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubus
 python.org 下载并验证签名后安装（当前用户，不需要管理员），之后可在网页上一键更新。
 也可以照旧下载 ZIP 解压后双击 `run.bat`。
 
-**装好以后**：admin 登录 →「⚙ 网段」填矿机网段 → 保存并全网扫描；要接云端就在同一页「☁ 云端上报」粘贴接入码，
-点「🔌 测试连接」，下面会一直显示上报状态（最近一次成功 / 失败原因），不用登机器看日志。
+### 装好以后
+
+admin 登录 →「⚙ 网段」填矿机网段 → 保存并全网扫描。接云端就在同一页「☁ 云端上报」粘贴接入码并点「填入」，
+填场地名、选择类型、勾选启用 →「🔌 测试连接」→ **保存**。保存后查看下方上报状态（最近一次成功 / 失败原因）。
 
 GitHub 访问慢可设镜像前缀 `GH_PROXY`；连不上 GitHub 时可把源码 ZIP 拷过去，解压后在目录里 `sudo bash install.sh`（Python 依赖仍要能访问 PyPI 或国内镜像）。
 
