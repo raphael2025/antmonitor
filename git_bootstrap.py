@@ -104,13 +104,19 @@ def _usable_mingit(git):
         return False
     try:
         # `--version` can work in an old partial installation even when HTTPS fetch
-        # cannot. Ask Git for its own runtime path (also supports 32-bit and ARM64).
+        # cannot. Let Git locate and start its helper: official MinGit moves these
+        # executables from --exec-path into the architecture's bin directory.
+        # Without arguments remote-curl exits with its usage message BEFORE HTTP
+        # initialization. This verifies the runtime without making a network request.
+        env = dict(os.environ, **_GIT_ENV)
+        env.update(LC_ALL="C", PATH="")
+        env.pop("GIT_EXEC_PATH", None)  # do not borrow another installation's helper
         result = _retry_access_denied(lambda: subprocess.run(
-            [str(git), "--exec-path"], capture_output=True, text=True,
+            [str(git), "-c", "help.autocorrect=0", "-c", "protocol.allow=never", "remote-https"],
+            capture_output=True, text=True,
             stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
-            timeout=10, env=dict(os.environ, **_GIT_ENV)))
-        return (result.returncode == 0 and bool(result.stdout.strip())
-                and (Path(result.stdout.strip()) / "git-remote-https.exe").is_file())
+            timeout=10, env=env))
+        return result.returncode == 1 and "remote-curl: usage:" in result.stderr
     except (OSError, subprocess.SubprocessError):
         return False
 

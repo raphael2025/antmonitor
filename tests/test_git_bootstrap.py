@@ -138,8 +138,8 @@ def portable_archive(monkeypatch, tmp_path):
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as z:
         z.writestr("cmd/git.exe", b"test Git binary")
-        z.writestr("mingw64/bin/runtime.dll", b"test Git runtime")
-        z.writestr("mingw64/libexec/git-core/git-remote-https.exe", b"test HTTPS runtime")
+        z.writestr("ucrt64/bin/runtime.dll", b"test Git runtime")
+        z.writestr("ucrt64/bin/git-remote-https.exe", b"test HTTPS runtime")
     data = archive.getvalue()
     monkeypatch.setitem(git_bootstrap.MINGIT_SHA256, "64-bit", hashlib.sha256(data).hexdigest())
     downloads = []
@@ -151,8 +151,8 @@ def portable_archive(monkeypatch, tmp_path):
     def usable(git):
         git = Path(git)
         return (git.is_file() and git.read_bytes() == b"test Git binary"
-                and (git.parent.parent / "mingw64/bin/runtime.dll").is_file()
-                and (git.parent.parent / "mingw64/libexec/git-core/git-remote-https.exe").is_file())
+                and (git.parent.parent / "ucrt64/bin/runtime.dll").is_file()
+                and (git.parent.parent / "ucrt64/bin/git-remote-https.exe").is_file())
 
     monkeypatch.setattr(git_bootstrap.urllib.request, "urlopen", download)
     monkeypatch.setattr(git_bootstrap, "_usable_mingit", usable)
@@ -213,7 +213,7 @@ def test_discovery_ignores_incomplete_corrupt_and_wrong_arch_caches(portable_arc
     (wrong_hash / git_bootstrap._MINGIT_COMPLETE).write_text("unverified")
     broken_runtime = legacy.parent / (prefix + "d-no-runtime")
     _fake_install(broken_runtime, data, complete=True)
-    (broken_runtime / "mingw64/bin/runtime.dll").unlink()
+    (broken_runtime / "ucrt64/bin/runtime.dll").unlink()
     wrong_arch = legacy.parent / (legacy.name + "-arm64-e-other-architecture")
     _fake_install(wrong_arch, data, complete=True)
     assert git_bootstrap.find_git() is None
@@ -339,18 +339,32 @@ def test_git_version_retries_a_short_windows_sharing_lock(monkeypatch):
     assert len(attempts) == 3 and delays == [0.2, 0.4]
 
 
-def test_portable_git_also_requires_https_runtime(monkeypatch, tmp_path):
+@pytest.mark.parametrize("result, usable", [
+    (subprocess.CompletedProcess([], 1, "", "error: remote-curl: usage: git remote-curl <remote> [<url>]\n"), True),
+    (subprocess.CompletedProcess([], 1, "", "git: 'remote-https' is not a git command\n"), False),
+    (subprocess.CompletedProcess([], 0, "", "remote-curl: usage:"), False),
+    (subprocess.CompletedProcess([], 3221225781, "", ""), False),  # Windows: a DLL is missing
+    (FileNotFoundError("helper missing"), False),
+    (subprocess.TimeoutExpired("git remote-https", 10), False),
+])
+def test_portable_git_starts_its_own_https_runtime_without_network(monkeypatch, result, usable):
     monkeypatch.setattr(git_bootstrap, "_usable_git", lambda git: True)
+    monkeypatch.setenv("GIT_EXEC_PATH", "another-installation")
+    monkeypatch.setenv("LC_ALL", "zh_CN.UTF-8")
 
     def run(args, **kw):
-        assert args == ["git.exe", "--exec-path"]
+        assert args == ["git.exe", "-c", "help.autocorrect=0", "-c", "protocol.allow=never", "remote-https"]
         assert kw["timeout"] == 10
-        return subprocess.CompletedProcess([], 0, str(tmp_path), "")
+        assert kw["stdin"] == subprocess.DEVNULL
+        assert kw["env"]["PATH"] == ""
+        assert kw["env"]["LC_ALL"] == "C"
+        assert "GIT_EXEC_PATH" not in kw["env"]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
     monkeypatch.setattr(git_bootstrap.subprocess, "run", run)
-    assert not git_bootstrap._usable_mingit("git.exe")
-    (tmp_path / "git-remote-https.exe").write_bytes(b"HTTPS helper")
-    assert git_bootstrap._usable_mingit("git.exe")
+    assert git_bootstrap._usable_mingit("git.exe") is usable
 
 
 def test_bootstrap_installs_git_for_an_existing_clone(monkeypatch, tmp_path):

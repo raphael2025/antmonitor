@@ -57,13 +57,16 @@ def main():
         assert native_archive is not None, "native Windows architecture not supported"
         legacy = git_bootstrap._mingit_dir()
         with zipfile.ZipFile(io.BytesIO(native_archive)) as z:
+            # Use the verified archive's actual layout, which differs by architecture.
+            # In 2.56 these helpers live in prefix/bin, not --exec-path's libexec/git-core.
+            https_helpers = [name for name in z.namelist() if name.endswith("/git-remote-https.exe")]
+            assert len(https_helpers) == 1, https_helpers
             z.extractall(legacy)
         old_git = legacy / "cmd/git.exe"
         # A partial old installation can still run `git --version`. The missing
         # HTTPS helper must make us install a complete copy, without destroying it.
-        exec_path = subprocess.run([str(old_git), "--exec-path"], check=True,
-                                   capture_output=True, text=True).stdout.strip()
-        (Path(exec_path) / "git-remote-https.exe").unlink()
+        assert git_bootstrap._usable_mingit(old_git), "complete official archive must pass the runtime probe"
+        (legacy / https_helpers[0]).unlink()
         assert git_bootstrap._usable_git(old_git)
         assert not git_bootstrap._usable_mingit(old_git)
         sentinel = legacy / "keep.txt"
