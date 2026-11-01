@@ -111,7 +111,7 @@ sys.exit(1 if os.environ.get("TEST_APT_GIT_FAIL") and sys.argv[-1:] == ["git"] e
         rows = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return [row for row in rows if tool is None or row[0] == tool]
 
-    def run_installer(self, *args, missing_git=False, local_source=False, operation="sync_code", **extra):
+    def run_installer(self, *args, missing_git=False, local_source=False, local_archive=False, operation="sync_code", **extra):
         text = SCRIPT.read_text(encoding="utf-8")
         self.assertEqual(text.count('\nmain "$@"'), 1)
         # Run the real argument parsing and selected installer function, never main's
@@ -121,6 +121,8 @@ sys.exit(1 if os.environ.get("TEST_APT_GIT_FAIL") and sys.argv[-1:] == ["git"] e
             source_dir = self.root / "source"
             shutil.copytree(self.template, source_dir)
             self.git("-C", str(source_dir), "remote", "add", "origin", GITHUB)
+            if local_archive:
+                shutil.rmtree(source_dir / ".git")
             runner = source_dir / "install.sh"
         runner.write_text(text.rsplit('\nmain "$@"', 1)[0] + "\n" + operation + "\n", encoding="utf-8")
         env = {key: value for key, value in os.environ.items()
@@ -158,6 +160,32 @@ sys.exit(1 if os.environ.get("TEST_APT_GIT_FAIL") and sys.argv[-1:] == ["git"] e
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.install / "server.py").read_text(), "# fixture\n")
         self.assertFalse(any("clone" in row for row in self.calls("git")))
+        self.assertFalse(self.calls("curl"))
+
+    @unittest.skipUnless(shutil.which("rsync"), "requires real rsync to check destination preservation")
+    def test_local_archive_updates_source_without_deleting_custom_database_or_other_files(self):
+        self.install.mkdir()
+        (self.install / "server.py").write_text("# old archive installation\n")
+        original = {
+            "config.yaml": b"db:\n  path: other.db\n",
+            "settings.json": b'{"max_pps": 200}\n',
+            "other.db": b"SQLite format 3\x00\xffcustomer database",
+            "other.db-wal": b"customer write-ahead log\x00\xff",
+            "business/notes.txt": b"customer file not shipped with AntMonitor\n",
+        }
+        for name, contents in original.items():
+            target = self.install / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(contents)
+        # A downloaded package can also contain example/local configuration. It
+        # must not overwrite this installation's existing configuration.
+        (self.template / "config.yaml").write_text("db:\n  path: replacement.db\n")
+        result = self.run_installer(local_source=True, local_archive=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.install / "server.py").read_text(), "# fixture\n")
+        for name, contents in original.items():
+            self.assertEqual((self.install / name).read_bytes(), contents, name)
+        self.assertFalse((self.install / ".git").exists())
         self.assertFalse(self.calls("curl"))
 
     def test_gitee_uses_existing_git_when_apt_git_install_fails(self):

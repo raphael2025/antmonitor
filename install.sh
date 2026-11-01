@@ -359,7 +359,9 @@ sync_code() {
         --exclude=./.update_state.json -cf - . | tar -C "$INSTALL_DIR" -xf -
       return
     fi
-    rsync -a --delete \
+    # 与 tar 路径一致：只同步源码，不删除目标里的未知文件。数据库路径可自定义，
+    # 无法靠固定排除列表判断哪些额外文件属于用户数据。
+    rsync -a \
       --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
       --exclude 'miner_monitor.db*' --exclude 'logs/' \
       --exclude 'settings.json' --exclude 'segments.json' \
