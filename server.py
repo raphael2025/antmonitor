@@ -489,6 +489,12 @@ def _build_public_summary():
                     "online_count": 0, "offline_count": 0, "total_count": 0,
                     "total_hashrate_ths": 0.0, "active_alerts": 0, "miners": []}
         s = _summary_stats(ls, recs)
+        # 在线矿机有时能读到算力但读不到矿池名；只补已知身份，不能把客户误清成 0。
+        # 正常快照不查名册，保持每轮云端客户实时摘要轻量。
+        customer_identity = None
+        if any(not r.get("worker") and r.get("status") in ("online", "unknown") for r in recs):
+            customer_identity = {ip: a["worker"] for ip, a in db.known_identity(SVC.conn).items()
+                                 if a.get("worker")}
         return {
             **base, "scanned": True,
             "scan_id": s["scan_id"], "scan_ts": s["scan_ts"], "scan_kind": s["scan_kind"],
@@ -502,6 +508,7 @@ def _build_public_summary():
             "active_alerts": s["active_alerts"],
             "containers": s["containers"], "containers_faulty": s["containers_faulty"],
             "containers_offline": s["containers_offline"],
+            "customer_hashrates": db.customer_hashrates(ls, recs, identities=customer_identity),
             "miners": [{"ip": r["ip"], "model": r.get("model") or "",
                         "firmware": r.get("firmware") or "",
                         "status": r.get("status") or "unknown",
@@ -666,7 +673,7 @@ def _report_window(hours):
 
 @app.get("/api/public/customers")
 def api_public_customers(request: Request, hours: int = 24):
-    """按客户(矿工名)报表：机器数 / 可用率% / 交付算力 TH·h / 耗电 kWh。"""
+    """客户实时/时段平均算力、有效观测覆盖，以及兼容的计费报表字段。"""
     _check_public_token(request)
     hours = max(1, min(8760, hours))   # 顺手封顶，避免任意 hours 撑爆缓存键空间
     eff, truncated = _report_window(hours)
@@ -674,7 +681,7 @@ def api_public_customers(request: Request, hours: int = 24):
     def build():   # 最重的查询, 缓存 45 秒(报表变化慢)
         return {"ok": True, "ts": int(time.time()), "hours": hours,
                 "covered_hours": eff, "truncated": truncated,
-                "customers": db.customer_report(SVC.conn, eff)}
+                "customers": db.customer_report(SVC.conn, eff, hashrate_hours=hours)}
     # 缓存槽位必须按**原始入参 hours** 区分：响应里带了 hours/truncated 两个随原始入参
     # 变化的字段，若按收敛后的 eff 做键，hours=20 与 hours=21(都收敛到 eff=20)会互相
     # 拿到对方的元数据。另外键名与 /api/reports/customers 的 ("customers", eff) 区分开
@@ -740,9 +747,10 @@ def api_workers(_: dict = Depends(require_viewer)):
 
 @app.get("/api/reports/customers")
 def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(require_viewer)):
+    hours = max(1, min(8760, hours))
     eff, truncated = _report_window(hours)
-    rows = _cached(("customers", eff), 45,
-                   lambda: db.customer_report(SVC.conn, eff))
+    rows = _cached(("customers", hours, eff), 45,
+                   lambda: db.customer_report(SVC.conn, eff, hashrate_hours=hours))
     if format == "csv":   # 对客户出账：UTF-8 BOM 的 CSV(Excel 直接打开不乱码)
         import csv as _csv
         import io
@@ -751,14 +759,18 @@ def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(re
         w = _csv.writer(buf)
         days = round(eff / 24, 1)
         w.writerow([f"客户报表  数据覆盖近 {days} 天" + ("（已按可用数据截断）" if truncated else "")])
-        w.writerow(["客户(矿工名)", "机器数", "可用率%", "交付算力(TH·h)", "耗电(kWh)"])
+        w.writerow(["客户(矿工名)", "周期内峰值机器数", "可用率%", "交付算力(TH·h)", "耗电(kWh)",
+                    "当前机器数", "实时算力(TH/s)", f"近{hours}小时观测平均算力(TH/s)",
+                    "有效观测(小时)", "观测覆盖率%", "实时采样时间(Unix秒)"])
         def cell(v):   # 矿工名来自矿机(可被篡改)：= + - @ 开头会被 Excel 当公式执行
             s = str(v or "")
             return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
 
         for r in rows:
             w.writerow([cell(r["worker"]), r["machines"], r["uptime_pct"],
-                        r["delivered_th_h"], r["power_kwh"]])
+                        r["delivered_th_h"], r["power_kwh"], r.get("current_machines"),
+                        r.get("hashrate_ths"), r.get("avg_hashrate_ths"),
+                        r.get("observed_hours"), r.get("coverage_pct"), r.get("hashrate_ts")])
         return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition":
                                  f'attachment; filename="customers_{eff}h.csv"'})

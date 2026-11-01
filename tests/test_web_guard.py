@@ -189,7 +189,7 @@ def test_cloud_only_save_preserves_scan_settings_and_requires_admin_and_same_ori
 
 def test_csv_formula_injection_is_neutralized(app, monkeypatch):
     server, c = app
-    monkeypatch.setattr(server.db, "customer_report", lambda conn, h: [
+    monkeypatch.setattr(server.db, "customer_report", lambda conn, h, **kwargs: [
         {"worker": '=HYPERLINK("http://x","y")', "machines": 1, "uptime_pct": 100,
          "delivered_th_h": 1, "power_kwh": 1}])
     server._CACHE.clear() if hasattr(server, "_CACHE") else None

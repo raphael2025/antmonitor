@@ -557,7 +557,7 @@ async function refreshWorkers() {
         .map(([m, c]) => `<div class="wmodel">${esc(t("worker.models", { m, c }).replace(String(c), "") )}<b>${c}</b></div>`).join("");
       return `<div class="worker"><div class="worker-head">`
         + `<span class="wname">${esc(w.worker)}</span>`
-        + `<span class="wstat">${t("worker.stat", { n: w.total, hr: fmtHash(w.hashrate) })}</span></div>`
+        + `<span class="wstat">${t("worker.stat", { n: w.total, hr: fmtHash(w.hashrate, "/s") })}</span></div>`
         + `<div class="wmodels">${models}</div></div>`;
     }).join("") || `<div class="muted">${esc(t("worker.none"))}</div>`;
   } else {
@@ -571,14 +571,22 @@ async function refreshWorkers() {
       const upCls = up >= 99 ? "res-ok" : up >= 95 ? "" : "res-fail";
       return `<div class="worker"><div class="worker-head">`
         + `<span class="wname">${esc(c.worker)}</span>`
-        + `<span class="wstat">${t("worker.machines", { n: c.machines })}</span></div>`
+        + `<span class="wstat">${AntCustomerRates.machines(c, t)} ${esc(t("rate.machines_unit"))}</span></div>`
         + `<div class="wmodels">`
+        + `<div class="worker-rates"><div><span>${esc(t("rate.current"))}</span>${AntCustomerRates.cell(c, "current", t, fmtHash, rateAgo)}</div>`
+        + `<div><span>${esc(AntCustomerRates.header([c], t))}</span>${AntCustomerRates.cell(c, "average", t, fmtHash, rateAgo)}</div></div>`
         + `${esc(t("worker.uptime"))} <b class="${upCls}">${up}%</b><br>`
-        + `${esc(t("worker.delivered"))} <b>${fmtHashH(c.delivered_th_h)}</b><br>`
         + `${esc(t("worker.kwh"))} <b>${c.power_kwh.toLocaleString()}</b> kWh`
+        + `<details class="worker-billing"><summary>${esc(t("rate.billing"))}</summary>${esc(t("worker.delivered"))} <b>${fmtHashH(c.delivered_th_h)}</b></details>`
         + `</div></div>`;
     }).join("") || `<div class="muted">${esc(t("worker.none_period"))}</div>`);
   }
+}
+
+function rateAgo(seconds) {
+  if (seconds < 60) return t("time.sec_ago", { n: Math.floor(seconds) });
+  if (seconds < 3600) return t("time.min_ago", { n: Math.floor(seconds / 60) });
+  return t("time.hour_ago", { n: Math.floor(seconds / 3600) });
 }
 
 let view = "list";   // list | rack | worker
