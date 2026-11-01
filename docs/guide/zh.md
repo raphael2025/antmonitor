@@ -39,12 +39,81 @@ curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install
 curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code - --site-name 内蒙一场
 ```
 
-**再跑一次同样的命令**：出管理菜单（更新 / 修复 / 卸载 / 重置用户名和密码）；没有终端（自动化）时直接更新。
+**再次执行不带参数的安装命令**：出管理菜单（更新 / 修复 / 卸载 / 重置用户名和密码）；没有终端（自动化）时直接更新。
 也可直接指定：`… | sudo bash -s -- update`（或 `repair` / `uninstall` / `reset-user`）。
 
 GitHub 访问慢：`curl -fsSL <镜像前缀>/https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo GH_PROXY=<镜像前缀>/ bash`
 （镜像能看到并篡改下载内容，只用信得过的）。连不上 GitHub：把源码 ZIP 拷到监控机，解压后在目录里
 `sudo bash install.sh`，直接用这份源码安装（Python 依赖仍需能访问 PyPI 或国内镜像）。
+
+### Ubuntu 无桌面访问与云端配置
+
+Ubuntu Server 没有桌面也能使用完整面板。AntMonitor 默认监听 `0.0.0.0:8800`；
+Linux 上只打印访问地址，不会自动打开浏览器。默认安装后按以下方式操作。
+
+#### 从另一台电脑打开面板
+
+在 Ubuntu 终端查看 IP：
+
+```bash
+hostname -I
+```
+
+输出可能包含多个地址，选择另一台电脑能访问的局域网 IP。在那台电脑的浏览器打开
+`http://<Ubuntu监控机IP>:8800`（例如 `http://192.168.1.50:8800`，请替换 IP）。
+用 **admin** 登录，按下方[装好以后](#装好以后)的步骤进入「⚙ 网段 → ☁ 云端上报」。
+
+如果另一台电脑已经可以通过 SSH 登录 Ubuntu，也可以在**有浏览器的那台电脑**的终端
+（Windows 可用 PowerShell）运行：
+
+```bash
+ssh -N -L 18800:127.0.0.1:8800 用户名@Ubuntu监控机IP
+```
+
+替换为实际 SSH 登录信息，保持窗口打开，再用同一台电脑的浏览器访问 `http://127.0.0.1:18800`。
+`18800` 是浏览器所在电脑的转发端口，`8800` 是 Ubuntu 上的面板端口。
+以上示例按默认 HTTP / 8800 配置编写；如果改过面板端口或启用了 HTTPS，按实际配置调整。
+
+#### 已经安装后，用终端设置云端接入
+
+先在云端面板「🔌 场地接入」复制接入码。以下命令适用于**已经安装**的 Ubuntu：
+**它会更新代码和依赖、保存云端配置并重启服务**。如果只需更改上报设置，使用 Web 面板即可。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh |
+  sudo bash -s -- update \
+    --connect-code - \
+    --site-name '你的场地名' \
+    --site-type hydro
+```
+
+- `--connect-code -`：运行后在交互终端里粘贴接入码，输入不显示；不要把真实接入码写进命令。
+- `--site-name`：本场地在云端显示的名称，请替换示例。
+- `--site-type`：`air` 风冷、`hydro` 水冷、`mixed` 混合，按实际类型选择。
+- 默认目录为 `/opt/antmonitor`；自定义安装目录需补 `--dir '/实际安装目录'`。
+
+当前管理菜单没有独立的「配置云端」选项；`update` 会处理接入码，`repair` 不会。
+接入码会保存到安装目录的 `settings.json`，其中 `cloud` 的对应字段会覆盖 `config.yaml`。
+因此只修改 `config.yaml` 可能不生效；不要用新的 JSON 整份覆盖已有 `settings.json`。
+
+终端会输出连接测试结果。若显示 `!` 或连接失败原因，配置可能已保存，但连接尚未成功；
+不要仅凭「已接入云端」的提示前缀判断成功。修正地址、接入码或网络后重试，
+并在本地面板确认最近上报成功时间、在云端确认本场地出现。
+
+#### 面板打不开或上报失败
+
+在 Ubuntu 终端查看服务、监听端口和近期日志：
+
+```bash
+sudo systemctl status antmonitor --no-pager
+sudo ss -lntp 'sport = :8800'
+sudo journalctl -u antmonitor -n 50 --no-pager
+```
+
+服务未启动时先根据日志定位；本机有监听、另一台电脑仍打不开时，检查 IP、端口和网络是否可达，
+或使用上面的 SSH 转发。若使用自定义端口，请把检查命令中的 `8800` 换成实际端口。
+网页里的「🔌 测试连接」检查云端地址、证书与 token，**不会保存配置**；修改后需要点击「保存」，
+再查看下方上报状态。上报由本地主动发往云端，无需为此给场地端配置公网端口映射。
 
 ### Windows：一行命令装好
 
@@ -65,10 +134,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubus
 ### 装好以后
 
 1. 浏览器打开面板，用 admin 登录 → 右上「⚙ 网段」填矿机网段 → 保存并全网扫描。
-2. 接入云端：同一页「☁ 云端上报」→ 把云端给的**接入码**粘贴进去点「填入」→ 填场地名 → 勾选启用 → 保存。
-   点「🔌 测试连接」立刻知道地址 / 证书 / token 对不对；下方一直显示上报状态（最近一次成功时间或失败原因），
-   不用登机器看日志。云端没有域名（`https://IP:端口`）时必须带**证书指纹**，接入码里已经包含。
-3. 上报 token 保存后不再明文显示（只显示末 4 位），输入框留空保存 = 沿用原 token。
+2. 接入云端：从云端面板「🔌 场地接入」复制**接入码**，回到本地同一页「☁ 云端上报」粘贴并点「填入」
+   → 填场地名、选择风冷 / 水冷 / 混合、勾选启用 →「🔌 测试连接」→ **保存**。
+   测试连接只检查地址 / 证书 / token，**不会保存配置**；保存后下方显示上报状态（最近一次成功时间或失败原因）。
+   云端使用自签名证书（例如 `https://IP:端口`）时需要填写**证书指纹**，可随接入码一并填入。
+3. 上报 token 保存后不再明文显示（只提示已填写，较长 token 显示末 4 位）；云端地址和证书指纹未改变时，
+   输入框留空保存会沿用原 token。更换地址或指纹后，需要重新填写 token 或粘贴新的接入码。
 
 <details><summary>手动安装（开发/调试）</summary>
 
