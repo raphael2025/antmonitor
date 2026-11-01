@@ -233,11 +233,13 @@ def check(branch=None):
     try:
         _git("rev-parse", "--git-dir", timeout=15)
     except FileNotFoundError:
-        return {"git": False, "error": "找不到 git 命令：请安装 Git 并确认它在系统 PATH 里"
-                                      "(以服务方式运行时要装成所有用户可用)"}
+        return {"git": False, "reason": "git_missing", "windows_repair": os.name == "nt",
+                "error": "当前运行账号找不到 git 命令，网页更新暂不可用；监控可继续运行。"}
     except Exception as e:  # noqa: BLE001
         # 不一定是"不是仓库"：服务账号与 clone 账号不同会报 dubious ownership 等
-        return {"git": False, "error": f"git 无法读取本目录: {str(e)[:200]}"}
+        return {"git": False, "reason": "repository_unavailable",
+                "windows_repair": os.name == "nt",
+                "error": f"git 无法读取本目录: {str(e)[:200]}"}
     try:
         cur = _git("rev-parse", "--abbrev-ref", "HEAD")
         if branch and cur != "HEAD" and cur != branch:
