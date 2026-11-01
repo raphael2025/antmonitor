@@ -33,6 +33,15 @@ WRAPPER = r"""
 $ErrorActionPreference = 'Stop'
 $initialPath = $env:PATH
 $initialUtf8 = $env:PYTHONUTF8
+Write-Host ('PowerShell provider location: ' + (Get-Location).Path)
+Write-Host ('Native process directory: ' + [Environment]::CurrentDirectory)
+$global:antmonitorRepairTestPrompted = $false
+function Read-Host {
+    param([string]$Prompt)
+    $global:antmonitorRepairTestPrompted = $true
+    if ($env:REPAIR_EXPECT_EMPTY_INPUT -eq '1') { return $null }
+    throw 'Automatic directory detection unexpectedly requested input.'
+}
 function Invoke-WebRequest {
     param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile, [int]$TimeoutSec)
     if (-not $Uri.StartsWith($env:REPAIR_EXPECTED_RAW)) { throw "Unexpected download: $Uri" }
@@ -46,7 +55,18 @@ function Invoke-WebRequest {
 $arguments = @{ Source = $env:REPAIR_SOURCE_NAME }
 if ($env:REPAIR_EXPLICIT_DIRECTORY -eq '1') { $arguments.Directory = $env:REPAIR_SITE }
 if ($env:REPAIR_NO_START -eq '1') { $arguments.NoStart = $true }
-& (Join-Path $env:REPAIR_SOURCE 'repair-web-updates.ps1') @arguments
+try {
+    & (Join-Path $env:REPAIR_SOURCE 'repair-web-updates.ps1') @arguments
+} catch {
+    if ($env:REPAIR_EXPECT_EMPTY_INPUT -eq '1' -and $global:antmonitorRepairTestPrompted -and
+        $_.Exception.Message -like '*-Directory*' -and
+        $_.Exception.Message -notlike '*null-valued*') {
+        Write-Host 'Empty directory input produced the explicit retry instruction.'
+        return
+    }
+    throw
+}
+if ($env:REPAIR_EXPECT_EMPTY_INPUT -eq '1') { throw 'Empty input must fail before any repair.' }
 if ($env:PATH -ne $initialPath -or $env:PYTHONUTF8 -ne $initialUtf8) {
     throw 'Recovery changed the calling process environment'
 }
@@ -107,7 +127,7 @@ def main(portable_git=None, portable_cache=None):
                    MINER_REPO_URL=str(remote), MINER_REPAIR_TEST_LAUNCH_TRACE=str(launch_trace),
                    REPAIR_SOURCE=str(BASE), REPAIR_SITE=str(site), REPAIR_SOURCE_NAME="github",
                    REPAIR_EXPECTED_RAW="https://raw.githubusercontent.com/raphael2025/antmonitor/main/",
-                   REPAIR_EXPLICIT_DIRECTORY="0", REPAIR_NO_START="0")
+                   REPAIR_EXPLICIT_DIRECTORY="0", REPAIR_NO_START="0", REPAIR_EXPECT_EMPTY_INPUT="0")
         for name in ("ANTMONITOR_HOME", "ANTMONITOR_BRANCH", "ANTMONITOR_GH_REPO",
                      "ANTMONITOR_GITEE_REPO", "GH_PROXY"):
             env.pop(name, None)
@@ -147,6 +167,12 @@ def main(portable_git=None, portable_cache=None):
         assert Path(git(site, "remote", "get-url", "origin")) == remote
         assert {name: (site / name).read_bytes() for name in original} == original
         print("Gitee helper source preserved existing origin; -NoStart did not launch a process.")
+
+        # No selected installation and EOF/cancel at the prompt must fail clearly,
+        # without a null-method error or launching/downloading anything.
+        empty_env = dict(env, REPAIR_EXPLICIT_DIRECTORY="0", REPAIR_EXPECT_EMPTY_INPUT="1")
+        subprocess.run(command, cwd=str(temporary), env=empty_env, check=True, timeout=30)
+        assert not launch_trace.exists()
 
         (site / "server.py").write_bytes(b"local source edits\n")
         env["REPAIR_NO_START"] = "0"

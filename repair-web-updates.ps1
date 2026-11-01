@@ -15,6 +15,7 @@ function U([string]$s) { [regex]::Unescape($s) }
 function Say([string]$s, [string]$color = 'Cyan') { Write-Host $s -ForegroundColor $color }
 
 function Test-MonitorFolder([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
     return $Path -and (Test-Path -LiteralPath (Join-Path $Path 'server.py') -PathType Leaf) -and
         (Test-Path -LiteralPath (Join-Path $Path 'run.bat') -PathType Leaf)
 }
@@ -49,17 +50,27 @@ function Find-RepairPython([string]$Base) {
 $temporary = $null
 $oldPath = $env:PATH
 $oldUtf8 = $env:PYTHONUTF8
+# Windows PowerShell 5.1 can start its provider in PSHOME when the native
+# working directory contains '['. Capture the real process directory before
+# running Python: a native invocation can synchronize it to the provider path.
+$nativeStartDirectory = [Environment]::CurrentDirectory
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     if (-not $Directory) {
+        $providerDirectory = (Get-Location).Path
         if ($env:ANTMONITOR_HOME) {
             $Directory = $env:ANTMONITOR_HOME
-        } elseif (Test-MonitorFolder (Get-Location).Path) {
-            $Directory = (Get-Location).Path
+        } elseif (Test-MonitorFolder $providerDirectory) {
+            $Directory = $providerDirectory
+        } elseif (Test-MonitorFolder $nativeStartDirectory) {
+            $Directory = $nativeStartDirectory
         } elseif ($env:LOCALAPPDATA -and (Test-MonitorFolder (Join-Path $env:LOCALAPPDATA 'AntMonitor\antmonitor'))) {
             $Directory = Join-Path $env:LOCALAPPDATA 'AntMonitor\antmonitor'
         } else {
             $Directory = Read-Host (U '\u8bf7\u7c98\u8d34\u73b0\u6709 AntMonitor \u6587\u4ef6\u5939\u8def\u5f84\uff08\u91cc\u9762\u5e94\u6709 run.bat\uff09')
+            if ([string]::IsNullOrWhiteSpace($Directory)) {
+                throw (U '\u672a\u8f93\u5165\u539f\u5b89\u88c5\u76ee\u5f55\uff0c\u4fee\u590d\u5df2\u505c\u6b62\u3002\u8bf7\u7528 -Directory ''D:\\AntMonitor'' \u6307\u5b9a\u539f\u6587\u4ef6\u5939\u540e\u91cd\u8bd5\u3002')
+            }
             $Directory = $Directory.Trim().Trim('"')
         }
     }
@@ -110,7 +121,15 @@ try {
     $env:PATH = (Split-Path -Parent $result.git) + [IO.Path]::PathSeparator + $oldPath
     Say ((U '\u5df2\u6062\u590d Git \u548c\u4ed3\u5e93\u4fe1\u606f\uff1a') + $result.branch + ' @ ' + $result.head.Substring(0, 10)) 'Green'
     if (-not $NoStart) {
-        Start-Process -FilePath (Join-Path $dest 'run.bat') -WorkingDirectory $dest
+        # Start-Process in Windows PowerShell 5.1 can expand brackets in paths.
+        # ShellExecute takes these paths literally, opens the usual new console,
+        # and inherits the process PATH that we temporarily prepared above.
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = Join-Path $dest 'run.bat'
+        $startInfo.WorkingDirectory = $dest
+        $startInfo.UseShellExecute = $true
+        $startInfo.WindowStyle = [Diagnostics.ProcessWindowStyle]::Normal
+        [void][Diagnostics.Process]::Start($startInfo)
         Say (U '\u5df2\u7528\u4fee\u590d\u540e\u7684 Git \u542f\u52a8\u65b0\u7a97\u53e3\u3002\u767b\u5f55\u7f51\u9875\u540e\u70b9\u53f3\u4e0a\u89d2\u300c\u66f4\u65b0\u300d\uff0c\u5b89\u88c5\u6700\u65b0\u7248\u672c\u3002') 'Green'
     } else {
         Say (U '\u5df2\u6309 -NoStart \u8df3\u8fc7\u542f\u52a8\u3002\u65e7\u7248\u542f\u52a8\u5668\u53ef\u80fd\u8fd8\u4e0d\u8ba4\u8bc6\u65b0\u7f13\u5b58\uff0c\u8bf7\u91cd\u65b0\u8fd0\u884c\u672c\u4fee\u590d\u547d\u4ee4\uff08\u4e0d\u52a0 -NoStart\uff09\u542f\u52a8\u540e\u5b8c\u6210\u7f51\u9875\u66f4\u65b0\u3002') 'Yellow'
