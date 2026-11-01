@@ -165,6 +165,11 @@ function Get-InstallGit {
 }
 
 try {
+    # A PowerShell 7 parent can leave its module paths in the environment.
+    # Load THIS host's built-in hashing and ZIP modules by absolute path before
+    # any download, rather than autoloading incompatible modules from that path.
+    Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -ErrorAction Stop
+    Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Archive\Microsoft.PowerShell.Archive.psd1') -ErrorAction Stop
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     $dest = Full-InstallPath $(if ($env:ANTMONITOR_HOME) { $env:ANTMONITOR_HOME } else { Join-Path $env:LOCALAPPDATA 'AntMonitor\antmonitor' })
     if (-not $SourcePath -and -not $PSBoundParameters.ContainsKey('Source') -and -not $env:ANTMONITOR_SOURCE -and $PSScriptRoot -and (Test-SourceFolder $PSScriptRoot)) {

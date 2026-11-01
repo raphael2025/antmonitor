@@ -20,6 +20,7 @@ WRAPPER = r'''
 $ErrorActionPreference = 'Stop'
 $initialPath = $env:PATH
 $initialSource = $env:MINER_DOWNLOAD_SOURCE
+$initialModulePath = $env:PSModulePath
 function Invoke-WebRequest {
     param([switch]$UseBasicParsing, [string]$Uri, [string]$OutFile, [int]$TimeoutSec)
     Add-Content -LiteralPath $env:INSTALL_HTTP_LOG -Value $Uri
@@ -33,7 +34,8 @@ $parameters = @{ NoStart = ($env:INSTALL_START -ne '1') }
 if ($env:INSTALL_SOURCE_NAME) { $parameters.Source = $env:INSTALL_SOURCE_NAME }
 if ($env:INSTALL_SOURCE_PATH) { $parameters.SourcePath = $env:INSTALL_SOURCE_PATH }
 & (Join-Path $env:INSTALL_SCRIPT_ROOT 'install.ps1') @parameters
-if ($env:PATH -ne $initialPath -or $env:MINER_DOWNLOAD_SOURCE -ne $initialSource) {
+if ($env:PATH -ne $initialPath -or $env:MINER_DOWNLOAD_SOURCE -ne $initialSource -or
+    $env:PSModulePath -ne $initialModulePath) {
     throw 'Installer changed the calling process environment.'
 }
 '''
@@ -83,6 +85,8 @@ def main(native_archive):
         ))
         entry = temporary / "\u573a\u5730 [\u4e00] user's entry"
         entry.mkdir()
+        # Keep the actual PS7 parent's PSModulePath: PS5.1 must select its own
+        # hashing/archive modules in production, not rely on a sanitized fixture.
         env = {k: v for k, v in os.environ.items()
                if not k.startswith(("ANTMONITOR_", "MINER_", "GIT_CONFIG_")) and k not in ("GH_PROXY", "GIT_EXEC_PATH")}
         cache = temporary / "new LocalAppData"
