@@ -23,14 +23,16 @@ def test_save_scan_keep_ips_drops_dead_addresses(conn):
 
 
 def test_customer_report_worker_attribution_is_deterministic(conn):
-    """机器中途换客户时，归属必须取"区间内最后一次非空矿工名"并且稳定。
-    旧实现依赖 SELECT 的返回顺序，同样的数据可能算给不同客户——这是出账数据。"""
+    """旧计费归属保持确定性；新增算力均值按每轮真实客户保留历史。"""
     h = now_hour(-2)
     insert_scan(conn, h + 60, "quick", [rec("10.2.0.1", worker="老客户")])
     insert_scan(conn, h + 120, "quick", [rec("10.2.0.1", worker="新客户")])
     for _ in range(3):
         rows = {r["worker"]: r for r in db.customer_report(conn, hours=6)}
-        assert set(rows) == {"新客户"}
+        assert set(rows) == {"老客户", "新客户"}
+        assert rows["老客户"]["delivered_th_h"] == 0
+        assert rows["新客户"]["delivered_th_h"] > 0
+        assert rows["老客户"]["avg_hashrate_ths"] > 0
 
 
 def test_customer_report_counts_offline_time_against_uptime(conn):

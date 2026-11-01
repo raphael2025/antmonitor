@@ -214,7 +214,7 @@ def is_alive():
 def start(cfg, get_summary, get_customers):
     """启动/热重启上报线程(旧线程自动失效)。未启用时仅停掉旧线程。
     get_summary: () -> /api/public/summary 同构 dict
-    get_customers: (hours:int) -> customers 列表(worker/machines/uptime_pct/delivered_th_h/power_kwh)"""
+    get_customers: (hours:int) -> customers 列表(含时段平均算力与观测覆盖，保留计费字段)"""
     global _GEN, _thread
     # Serialize restarts with status updates. An old in-flight request may finish
     # after a new connection is saved, but it cannot mark that connection healthy.
@@ -294,6 +294,7 @@ def _loop(gen, c, sid, get_summary, get_customers):
                 _post(c, "/api/ingest/summary", {
                     "site_id": sid, "site": c["site_name"],
                     "type": c.get("site_type", "air"), "ts": now,
+                    "scan_ts": scan_ts,
                     "online": s.get("online") or 0, "total": s.get("total") or 0,
                     "hashrate_ths": s.get("total_hashrate_ths") or 0.0,
                     "power_kw": s.get("total_power_kw") or 0.0,
@@ -303,6 +304,8 @@ def _loop(gen, c, sid, get_summary, get_customers):
                     "containers_offline": s.get("containers_offline") or 0,
                     "scan_age_s": (now - scan_ts) if scan_ts else None,
                     "alert_summary": s.get("alert_summary") or [],
+                    **({"customer_hashrates": s["customer_hashrates"]}
+                       if "customer_hashrates" in s else {}),
                 }, sess)
                 if not _set_status(gen, state="connected", last_ok=int(time.time()), last_err="", fails=0):
                     break

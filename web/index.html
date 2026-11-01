@@ -210,14 +210,14 @@
       <div class="wbar"><span data-i18n="worker.period">周期</span>
         <select id="workerPeriod">
           <option value="0" data-i18n="worker.p0">当前快照</option>
-          <option value="24" data-i18n="worker.p24">近 24 小时</option>
+          <option value="24" selected data-i18n="worker.p24">近 24 小时</option>
           <option value="72" data-i18n="worker.p72">近 3 天</option>
           <option value="168" data-i18n="worker.p168">近 7 天</option>
           <option value="720" data-i18n="worker.p720">近 30 天</option>
           <option value="2160" data-i18n="worker.p2160">近 90 天</option>
         </select>
         <button id="btnExportCsv" class="hidden" data-i18n="worker.export">⬇ 导出CSV</button>
-        <span class="muted" data-i18n="worker.hint">报表含可用率 / 交付算力 / 耗电</span>
+        <span class="muted" data-i18n="worker.hint">实时算力 / 周期平均算力 / 可用率 / 耗电；累计交付可展开或导出</span>
       </div>
       <div id="workerList"></div>
     </div>
@@ -264,7 +264,7 @@
         <thead><tr>
           <th class="cbcol"><input type="checkbox" id="cbAll" data-i18n-title="cmd.select_page" title="全选本页"></th>
           <th data-k="ip">IP</th><th data-k="status" data-i18n="th.status">状态</th><th data-k="firmware" data-i18n="th.fw">固件</th>
-          <th data-k="model" data-i18n="th.model">机型</th><th data-k="hr_rt" data-i18n="th.hr_rt">实时算力</th><th data-k="hr_avg" data-i18n="th.hr_avg">平均算力</th>
+          <th data-k="model" data-i18n="th.model">机型</th><th data-k="hr_rt" data-i18n="th.hr_rt">实时算力</th><th data-k="hr_avg" data-i18n="th.hr_avg" data-i18n-title="rate.firmware_help" title="矿机固件返回的平均值，统计周期由固件决定，不等同于本系统近 24 小时平均。">固件平均</th>
           <th data-k="power" data-i18n="th.power">功耗</th><th data-k="eff" data-i18n="th.eff">能效</th><th data-i18n="th.reject">拒绝率</th><th data-k="temp" data-i18n="th.temp">芯片温</th>
           <th data-k="uptime" data-i18n="th.uptime">运行时长</th><th data-k="worker" data-i18n="th.worker">矿工名</th><th data-k="sn">SN</th><th data-i18n="th.note">备注</th>
         </tr></thead>
@@ -296,6 +296,7 @@
 
   <footer class="muted" data-i18n="footer">实时推送 + 每 30 秒兜底刷新 · 数据来自最近一次扫描</footer>
   <script src="/web/cloud-connect.js"></script>
+  <script src="/web/customer-rates.js"></script>
   <script src="/web/app.js"></script>
 </body>
 </html>

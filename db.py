@@ -11,6 +11,7 @@
   暴涨到几百 MB 的主因（每 commit 一条 WAL 帧 + fsync）。
 """
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -192,6 +193,20 @@ CREATE TABLE IF NOT EXISTS worker_hourly (
     PRIMARY KEY (hour, worker)
 );
 CREATE INDEX IF NOT EXISTS idx_wh_hour ON worker_hourly(hour);
+-- 算力速率单独归档：不能把旧计费 TH·h 直接当作已完整观测的 24h 均值。
+-- observed_s 是场地已观测的墙钟时间；unknown_s 是该客户无法完整读数的时段。
+CREATE TABLE IF NOT EXISTS hashrate_hourly (
+    hour INTEGER PRIMARY KEY,
+    observed_s REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS worker_hashrate_hourly (
+    hour INTEGER NOT NULL,
+    worker TEXT NOT NULL,
+    th_h REAL NOT NULL,
+    unknown_s REAL NOT NULL,
+    machines INTEGER NOT NULL,
+    PRIMARY KEY (hour, worker)
+);
 -- 重启限流按 action+ok+ip+ts 批量查 24h 成功次数；缺索引时勾选上千台会扫全表
 CREATE INDEX IF NOT EXISTS idx_cmd_reboot ON command_log(action, ok, ip, ts);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -777,6 +792,196 @@ def clear_zero_reboot_states(conn, ips):
 MAX_SAMPLE_GAP = 900   # 单次扫描最多代表 15 分钟；监控停摆期间不把停机时间算成交付
 
 
+def _customer_rate_sample(records, identities=None):
+    """一轮扫描的客户实际总算力。任何一台读数未知，整个客户总数就是未知。
+
+    identities 只沿时间正向传递身份，绝不把换客户后的名字倒套到旧读数上。
+    空 IP 的离线记录没有客户身份，不能算成客户的矿机。
+    """
+    identities = identities if identities is not None else {}
+    out = {}
+    for r in records:
+        ip = r["ip"]
+        worker = r.get("worker") or identities.get(ip)
+        if r.get("worker"):
+            identities[ip] = r["worker"]
+        if not worker:
+            if r.get("status") != "online":
+                continue
+            worker = "(未知)"
+        a = out.setdefault(worker, {"machines": 0, "hashrate_ths": 0.0})
+        a["machines"] += 1
+        if r.get("status") == "offline":
+            continue
+        rate = r.get("hr_rt")
+        if (r.get("status") != "online" or isinstance(rate, bool)
+                or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate < 0):
+            a["hashrate_ths"] = None
+        elif a["hashrate_ths"] is not None:
+            a["hashrate_ths"] += rate
+    return out
+
+
+def customer_hashrates(scan, records, now=None, identities=None):
+    """轻量实时客户摘要，供网页与每轮云端摘要共用；不查询历史报表。"""
+    if not scan:
+        return []
+    now = int(time.time() if now is None else now)
+    ts = int(scan.get("ts") or 0)
+    fresh = bool(ts and -60 <= now - ts <= MAX_SAMPLE_GAP)
+    return [{"worker": worker, "machines": a["machines"],
+             "hashrate_ths": round(a["hashrate_ths"], 2)
+             if fresh and a["hashrate_ths"] is not None else None,
+             "hashrate_ts": ts}
+            for worker, a in sorted(_customer_rate_sample(records, identities).items())]
+
+
+def _past_customer_identities(conn, scans):
+    """仅为窗口初次出现时无客户名的 IP 补过去身份，不能借用未来/当前名册。
+
+    矿池名读取失败可能跨越多个整点；每小时只带入一轮旧读数不足以保留归属。
+    查询走现有 snapshots(ip) 索引，正常都有矿工名时不产生额外查询。
+    """
+    if not scans:
+        return {}
+    seen, missing = set(), set()
+    for _sid, _ts, records in scans:
+        for r in records:
+            if r["ip"] not in seen:
+                seen.add(r["ip"])
+                if not r.get("worker"):
+                    missing.add(r["ip"])
+    if not missing:
+        return {}
+    first_id, first_ts, _records = scans[0]
+    rc = _r(conn)
+    out = {}
+    for ip in missing:
+        row = rc.execute(
+            "SELECT p.worker FROM snapshots p JOIN scans s ON s.scan_id=p.scan_id "
+            "WHERE p.ip=? AND p.worker<>'' AND s.kind IN ('full','quick','manual') "
+            "AND (s.ts<? OR (s.ts=? AND s.scan_id<?)) "
+            "ORDER BY s.ts DESC, s.scan_id DESC LIMIT 1",
+            (ip, first_ts, first_ts, first_id)).fetchone()
+        if row:
+            out[ip] = row["worker"]
+    return out
+
+
+def _customer_hashrate_window(conn, start, end):
+    """按真实扫描时刻积分 [start, end)，不回填首个样本之前的时间。
+
+    带入窗口前最多 15 分钟内的最后一轮读数，以正确裁剪跨整点的样本。
+    一轮最多代表 15 分钟；确认离线为 0，unknown/无算力读数不充当停机。
+    单条 JOIN 查询保证维护线程清理明细时不会读到只有扫描头、没有明细的半份数据。
+    """
+    rows = _r(conn).execute(
+        "SELECT s.scan_id, s.ts, p.ip, p.worker, p.status, p.hr_rt "
+        "FROM scans s LEFT JOIN snapshots p ON p.scan_id=s.scan_id "
+        "WHERE s.kind IN ('full','quick','manual') AND s.ts<? AND (s.ts>=? OR s.scan_id=("
+        " SELECT scan_id FROM scans WHERE kind IN ('full','quick','manual') AND ts<? AND ts>=?"
+        " ORDER BY ts DESC, scan_id DESC LIMIT 1)) ORDER BY s.ts, s.scan_id, p.ip",
+        (end, start, start, start - MAX_SAMPLE_GAP)).fetchall()
+    scans = []
+    for row in rows:
+        if not scans or scans[-1][0] != row["scan_id"]:
+            scans.append((row["scan_id"], row["ts"], []))
+        if row["ip"] is not None:
+            scans[-1][2].append(dict(row))
+    observed_s = 0.0
+    workers = {}
+    identities = _past_customer_identities(conn, scans)
+    for i, (_sid, ts, records) in enumerate(scans):
+        sample = _customer_rate_sample(records, identities)
+        stop = min(end, ts + MAX_SAMPLE_GAP,
+                   scans[i + 1][1] if i + 1 < len(scans) else end)
+        dt = max(0, stop - max(start, ts))
+        if not dt:
+            continue
+        observed_s += dt
+        for worker, a in sample.items():
+            dst = workers.setdefault(worker, {"th_h": 0.0, "unknown_s": 0.0, "machines": 0})
+            dst["machines"] = max(dst["machines"], a["machines"])
+            if a["hashrate_ths"] is None:
+                dst["unknown_s"] += dt
+            else:
+                dst["th_h"] += a["hashrate_ths"] * dt / HOUR
+    return observed_s, workers
+
+
+def _save_hashrate_hour(conn, hour, observed_s, workers):
+    with _wlock, conn:
+        conn.execute("INSERT OR REPLACE INTO hashrate_hourly(hour,observed_s) VALUES(?,?)",
+                     (hour, observed_s))
+        conn.execute("DELETE FROM worker_hashrate_hourly WHERE hour=?", (hour,))
+        conn.executemany(
+            "INSERT INTO worker_hashrate_hourly(hour,worker,th_h,unknown_s,machines) "
+            "VALUES(?,?,?,?,?)",
+            [(hour, worker, a["th_h"], a["unknown_s"], a["machines"])
+             for worker, a in workers.items()])
+
+
+def _rollup_customer_hashrates(conn, now, max_hours):
+    """独立进度允许升级后补算尚保留的旧快照，不改写历史计费数字。"""
+    cur_hour = now - now % HOUR
+    hour = int(meta_get(conn, "hashrate_rollup_hour", 0) or 0)
+    if not hour:
+        row = _r(conn).execute("SELECT MIN(ts) t FROM scans WHERE kind IN ('full','quick','manual')").fetchone()
+        if not row or row["t"] is None:
+            return
+        hour = row["t"] - row["t"] % HOUR
+    n = 0
+    while hour < cur_hour and n < max_hours:
+        if _r(conn).execute("SELECT 1 FROM hashrate_hourly WHERE hour=?", (hour,)).fetchone() is None:
+            observed_s, workers = _customer_hashrate_window(conn, hour, hour + HOUR)
+            _save_hashrate_hour(conn, hour, observed_s, workers)
+        hour += HOUR
+        n += 1
+        meta_set(conn, "hashrate_rollup_hour", hour)
+
+
+def _customer_hashrate_stats(conn, hours, now):
+    """有观测依据的时长平均；分母是客户有效墙钟时长，绝不是机器小时数。"""
+    start = now - hours * HOUR
+    first_hour = start - start % HOUR
+    rc = _r(conn)
+    archived = {r["hour"]: [r["observed_s"], {}] for r in rc.execute(
+        "SELECT hour,observed_s FROM hashrate_hourly WHERE hour>=? AND hour<?",
+        (first_hour, now)).fetchall()}
+    for r in rc.execute("SELECT * FROM worker_hashrate_hourly WHERE hour>=? AND hour<?",
+                        (first_hour, now)).fetchall():
+        if r["hour"] in archived:
+            archived[r["hour"]][1][r["worker"]] = dict(r)
+    first_raw = rc.execute("SELECT MIN(ts) t FROM scans WHERE kind IN ('full','quick','manual')").fetchone()["t"]
+    observed_s = 0.0
+    workers = {}
+    hour = first_hour
+    while hour < now:
+        lo, hi = max(start, hour), min(now, hour + HOUR)
+        whole = lo == hour and hi == hour + HOUR
+        raw_available = first_raw is not None and hi > first_raw
+        part = archived.get(hour)
+        # 非整点窗口优先按仍在的快照精确裁切，不能把整小时均值冒充这一截。
+        if (part is None or not whole) and raw_available:
+            seconds, rates = _customer_hashrate_window(conn, lo, hi)
+            if whole:
+                _save_hashrate_hour(conn, hour, seconds, rates)
+        elif part is not None and whole:
+            seconds, rates = part
+        else:
+            # 只有整小时归档时，不知道窗口截取的半小时里实际挖了多少。
+            # 不能按比例摊后声称完整均值；这一截明确计为缺测，保留其余整小时。
+            seconds, rates = 0.0, {}
+        observed_s += seconds
+        for worker, a in rates.items():
+            dst = workers.setdefault(worker, {"th_h": 0.0, "unknown_s": 0.0, "machines": 0})
+            dst["th_h"] += a["th_h"]
+            dst["unknown_s"] += a["unknown_s"]
+            dst["machines"] = max(dst["machines"], a["machines"])
+        hour += HOUR
+    return observed_s, workers
+
+
 def _hour_rows(conn, hour_start, hour_end):
     """取某小时内所有定时扫描的快照行，按 scan_id 升序(保证 worker 归属确定)。"""
     rc = _r(conn)
@@ -870,6 +1075,7 @@ def rollup_hours(conn, now=None, max_hours=48):
     if n:
         log.info("计费聚合: 已归档 %d 个小时，进度至 %s", n,
                  time.strftime("%Y-%m-%d %H:00", time.localtime(hour)))
+    _rollup_customer_hashrates(conn, now, max_hours)
     return n
 
 
@@ -884,14 +1090,16 @@ def coverage_hours(conn):
     return max(1, int((time.time() - earliest) // HOUR))
 
 
-def customer_report(conn, hours=24):
-    """按客户(矿工名)统计周期内：机器数、可用率%、交付算力 TH·h、耗电 kWh。
+def customer_report(conn, hours=24, hashrate_hours=None):
+    """客户实际实时/时段平均算力，以及保留兼容的计费聚合。
 
     数据来源两段拼接：
       - 已归档的整点小时 → worker_hourly（明细快照删了也还在，支持月度对账）
       - 尚未归档的当前小时 → 直接扫 snapshots
     """
     now = int(time.time())
+    hours = max(1, min(8760, int(hours)))
+    rate_hours = hours if hashrate_hours is None else max(1, min(8760, int(hashrate_hours)))
     frm = now - hours * HOUR
     rolled_to = int(meta_get(conn, "rollup_hour", 0) or 0)
     agg = {}
@@ -935,10 +1143,41 @@ def customer_report(conn, hours=24):
             a["th_h"] += a0["th_h"]
             a["kwh"] += a0["kwh"]
 
-    out = [{"worker": a["worker"], "machines": a["machines"],
+    observed_s, rates = _customer_hashrate_stats(conn, rate_hours, now)
+    latest = latest_scan(conn)
+    # 旧快照的离线行可能没有回填客户名；只为当前身份带入上一轮/名册，历史积分不借用未来身份。
+    identities = {ip: a["worker"] for ip, a in known_identity(conn).items() if a.get("worker")}
+    previous_id = prev_scan_id(conn, latest["scan_id"]) if latest else None
+    if previous_id:
+        for r in scan_records(conn, previous_id):
+            if r.get("worker"):
+                identities.setdefault(r["ip"], r["worker"])
+    current = {r["worker"]: r for r in customer_hashrates(
+        latest, scan_records(conn, latest["scan_id"]) if latest else [], now, identities)}
+    for worker in rates.keys() | current.keys():
+        slot(worker)
+    current_ts = int(latest["ts"] or 0) if latest else 0
+    current_fresh = bool(current_ts and -60 <= now - current_ts <= MAX_SAMPLE_GAP)
+    out = []
+    for a in agg.values():
+        rate = rates.get(a["worker"], {})
+        seconds = max(0.0, observed_s - rate.get("unknown_s", 0.0))
+        live = current.get(a["worker"], {})
+        out.append({
+            "worker": a["worker"], "machines": max(a["machines"], rate.get("machines", 0),
+                                                   live.get("machines", 0)),
+            "current_machines": live.get("machines", 0) if current_fresh else None,
             "uptime_pct": round(a["online"] / a["samples"] * 100, 2) if a["samples"] else 0,
-            "delivered_th_h": round(a["th_h"], 1),
-            "power_kwh": round(a["kwh"], 1)} for a in agg.values()]
+            "delivered_th_h": round(a["th_h"], 1), "power_kwh": round(a["kwh"], 1),
+            "hashrate_ths": live.get("hashrate_ths", 0.0) if current_fresh else None,
+            "hashrate_ts": current_ts,
+            "hashrate_age_s": max(0, now - current_ts) if current_ts else None,
+            "hashrate_stale": bool(current_ts and not current_fresh),
+            "avg_hashrate_ths": round(rate.get("th_h", 0.0) * HOUR / seconds, 2)
+            if seconds > 0 else None,
+            "hashrate_hours": rate_hours, "observed_hours": round(seconds / HOUR, 6),
+            "coverage_pct": round(min(100.0, seconds / (rate_hours * HOUR) * 100), 4),
+        })
     out.sort(key=lambda x: x["machines"], reverse=True)
     return out
 
@@ -954,7 +1193,8 @@ def prune(conn, retention_days, roster_days=7, rollup_days=400):
     now = int(time.time())
     time_cut = now - retention_days * 86400
     rolled_to = int(meta_get(conn, "rollup_hour", 0) or 0)
-    snap_cut = min(time_cut, rolled_to) if rolled_to else 0
+    rate_rolled_to = int(meta_get(conn, "hashrate_rollup_hour", 0) or 0)
+    snap_cut = min(time_cut, rolled_to, rate_rolled_to) if rolled_to and rate_rolled_to else 0
     roster_cut = now - roster_days * 86400
     rollup_cut = now - rollup_days * 86400
     old = []
@@ -977,6 +1217,8 @@ def prune(conn, retention_days, roster_days=7, rollup_days=400):
         # 掉出名册的机器不再被评估：它们的掉线告警、整段已清空网段的 segment_down 一并消掉
         _resolve_gone_miners(conn, gone, now)
         conn.execute("DELETE FROM worker_hourly WHERE hour<?", (rollup_cut,))
+        conn.execute("DELETE FROM worker_hashrate_hourly WHERE hour<?", (rollup_cut,))
+        conn.execute("DELETE FROM hashrate_hourly WHERE hour<?", (rollup_cut,))
         # 审计：定位灯/维修标记这类高频低价值记录按条数只留最近 5000；重启/换矿池/下架/
         # 被拒绝的命令按时间长期保留——否则批量点几次"维修中"就能把换矿池记录冲掉
         low = "action IN ('locate','state:repair','state:active')"
