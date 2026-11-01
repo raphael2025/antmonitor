@@ -145,9 +145,11 @@ def main(portable_git=None, portable_cache=None):
             time.sleep(0.1)
         lines = launch_trace.read_text(encoding="utf-8", errors="replace").splitlines()
         assert lines[0].startswith("git version "), lines
-        assert os.path.normcase(lines[1]) == os.path.normcase(str(portable_git)), lines
+        # Path.resolve() in the recovery helper expands Windows 8.3 names such as
+        # RUNNER~1. Check actual file identity, not two spellings of the same path.
+        assert Path(lines[1]).samefile(portable_git), lines
         assert lines[-1] == "done", lines
-        assert os.path.normcase(lines[-2]) == os.path.normcase(str(Path(portable_git).parent)), lines
+        assert Path(lines[-2]).samefile(Path(portable_git).parent), lines
         assert git(site, "rev-parse", "HEAD") == old
         assert git(site, "status", "--porcelain") == ""
         assert Path(git(site, "remote", "get-url", "origin")) == remote
