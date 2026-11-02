@@ -179,13 +179,12 @@
     <div class="card"><div class="num" id="cOffline">–</div><div class="lbl" data-i18n="card.offline">离线</div></div>
     <div class="card alert"><div class="num" id="cAlerts">–</div><div class="lbl" data-i18n="card.alerts">活跃告警</div></div>
     <div class="card"><div class="num" id="cFw">–</div><div class="lbl" data-i18n="card.fw">原厂 / 第三方</div></div>
-    <div class="card" data-i18n-title="power.total_help" title="矿机当前功率按有效读数相加；集装箱配电读数单独展示，不重复加总。此数值不是全场电表读数。"><div class="num" id="cPower">–</div><div class="lbl" data-i18n="card.power">矿机当前总功率 (kW)</div></div>
-    <div class="card"><div class="num" id="cEff">–</div><div class="lbl" data-i18n="card.eff">平均能效 (J/TH)</div></div>
+    <div class="card" data-i18n-title="power.total_help" title="矿机当前功率按有效读数相加；集装箱配电读数单独展示，不重复加总。此数值不是全场电表读数。"><div class="num" id="cPower">–</div><div class="lbl" data-i18n="card.power">总功耗 (kW)</div><span id="cPowerNote" class="rate-note muted hidden"></span></div>
+    <div class="card" data-i18n-title="quality.eff_help"><div class="num" id="cEff">–</div><div class="lbl" data-i18n="card.eff">能耗比 (J/TH)</div><span id="cEffNote" class="rate-note muted hidden"></span></div>
     <div class="card alert"><div class="num" id="cContainers">–</div><div class="lbl" data-i18n="card.containers">集装箱(故障)</div></div>
   </section>
 
   <p id="summaryQuality" class="data-quality-notice muted hidden" role="status"></p>
-  <p class="data-quality-notice muted" data-i18n="power.units_help">kW 表示当前功率，kWh（度）表示统计期累计耗电。1 MW = 1000 kW；1 MWh = 1000 kWh。1000 kW 持续 1 小时，耗电 1000 kWh。</p>
 
   <section class="grid2">
     <div class="panel">

@@ -27,8 +27,9 @@ from fastapi import (Body, Depends, FastAPI, HTTPException, Query, Request,
                      Response, WebSocket)
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from web_assets import index_html
 from fastapi.middleware.gzip import GZipMiddleware
 
 import alerts
@@ -758,7 +759,12 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
            "unknown": stats["unknown"], "total_hr": stats["total_hashrate_th"],
            "known_hashrate_ths": stats["known_hashrate_ths"],
            "hashrate_complete": stats["hashrate_complete"], "power_complete": stats["power_complete"],
-           "total_power": None if stats["total_power_kw"] is None else stats["total_power_kw"] * 1000}
+           "total_power": None if stats["total_power_kw"] is None else stats["total_power_kw"] * 1000,
+           "known_power": None if stats["known_power_kw"] is None else stats["known_power_kw"] * 1000,
+           "power_known_machines": stats["power_known_machines"],
+           "avg_efficiency": stats["avg_efficiency"], "known_efficiency": stats["known_efficiency"],
+           "efficiency_known_machines": stats["efficiency_known_machines"],
+           "efficiency_complete": stats["efficiency_complete"]}
     if sort not in _SORT_FIELDS:   # 防任意字段排序产生空/错误结果
         sort = "hr_rt"
     rev = order == "desc"
@@ -1527,8 +1533,9 @@ def api_machine_state(request: Request, body: dict = Body(...), sess: dict = Dep
 
 
 @app.get("/")
+@app.api_route("/web/index.html", methods=["GET", "HEAD"], include_in_schema=False)
 def index():
-    return FileResponse(os.path.join(WEB_DIR, "index.html"))
+    return HTMLResponse(index_html(WEB_DIR))
 
 
 def _host_name(host_header):
@@ -1636,7 +1643,9 @@ async def _no_cache_static(request: Request, call_next):
     """前端文件禁强缓存(每次向服务器复核, 未变返回304)——否则更新版本后浏览器
     拿旧 JS 渲染新接口, 要手动 Ctrl+F5 才恢复。文件只有几十KB, 代价可忽略。"""
     resp = await call_next(request)
-    if request.url.path.startswith("/web/") or request.url.path == "/":
+    if request.url.path in ("/", "/web/index.html"):
+        resp.headers["Cache-Control"] = "no-store"
+    elif request.url.path.startswith("/web/"):
         resp.headers["Cache-Control"] = "no-cache"
     return resp
 

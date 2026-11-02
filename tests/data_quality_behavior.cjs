@@ -170,7 +170,7 @@ test("real power and energy renderers keep kW distinct from period kWh at site s
   } else {
     h.respond({scanned:true, scan_ts:1800000000, total_power_kw:10070, known_power_kw:10070, power_complete:true});
     await h.ctx.refreshSummary();
-    assert.match(compact(h.el("cPower").innerHTML), /10070/);
+    assert.match(compact(h.el("cPower").textContent), /10070/);
     h.respond({miners:[{ip:"10.0.0.1", status:"online", power:5355}], agg:{total_power:5355}});
     await h.ctx.refreshMiners();
     assert.match(h.el("minerBody").innerHTML, /<td>5.355 kW<\/td>/);
@@ -215,12 +215,15 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
   }else{
     h.respond({scanned:true,scan_ts:1800000000,scan_kind:"inventory",online:1,total:2,unknown:1,offline:0,
       total_hashrate_th:null,known_hashrate_ths:293,hashrate_complete:false,avg_hashrate_th:null,
-      total_power_kw:null,known_power_kw:3,power_complete:false,avg_efficiency:null});
+      total_power_kw:null,known_power_kw:3,power_complete:false,power_known_machines:1,
+      avg_efficiency:null,known_efficiency:10.24,efficiency_complete:false,efficiency_known_machines:1});
     await h.ctx.refreshSummary();
     assert.equal(h.el("cOnline").textContent,"1 / 2");
     assert.match(h.el("cTotalHr").innerHTML,/已知部分：293 TH\/s/);
-    assert.match(h.el("cPower").innerHTML,/rate-value">—/);
-    assert.equal(h.el("cEff").textContent,"—");
+    assert.equal(h.el("cPower").textContent,"3");
+    assert.equal(h.el("cEff").textContent,"10.24");
+    assert.equal(h.el("cPowerNote").textContent,"已统计 1/2 台");
+    assert.equal(h.el("cEffNote").textContent,"已统计 1/2 台");
     assert.match(h.el("summaryQuality").textContent,/未知\/过期状态 1 台/);
     assert.equal(h.ctx.boxPower({power1:1000,power2:null}),null);
     assert.equal(h.ctx.boxPower({power1:1000,power2:500}),1500);
@@ -247,5 +250,51 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
     assert.doesNotMatch(h.el("mInfo").innerHTML,/无故障/);
     assert.match(h.ctx.containerFaultBadge({flag:"leakage_fault",sev:"crit",observed:false,measured_ts:100}),/尚未确认恢复/);
 
+  }
+});
+
+test("current power stays prominent and paired efficiency keeps its own short coverage",async()=>{
+  const h=setup();
+  const partial={scanned:true,scan_ts:1800000000,total:3,online:3,offline:0,
+    total_power_kw:null,known_power_kw:3,power_complete:false,power_known_machines:2,
+    avg_efficiency:null,known_efficiency:20,efficiency_complete:false,efficiency_known_machines:1};
+  h.respond(partial);
+  await h.ctx.refreshSummary();
+  assert.equal(h.el("cPower").textContent,"3");
+  assert.equal(h.el("cEff").textContent,"20");
+  assert.equal(h.el("cPowerNote").textContent,"已统计 2/3 台");
+  assert.equal(h.el("cEffNote").textContent,"已统计 1/3 台");
+  assert.equal(h.el("cPowerNote").classList.contains("hidden"),false);
+  assert.equal(h.el("cEffNote").classList.contains("hidden"),false);
+
+  h.respond({miners:[],count:3,agg:{total_power:null,known_power:3000,
+    power_complete:false,power_known_machines:2}});
+  await h.ctx.refreshMiners();
+  assert.match(h.el("segStat").textContent,/3 kW · 已统计 2\/3 台/);
+
+  h.respond({...partial,total_power_kw:3,avg_efficiency:20,power_complete:true,efficiency_complete:true});
+  await h.ctx.refreshSummary();
+  for (const id of ["cPowerNote","cEffNote"]){
+    assert.equal(h.el(id).textContent,"");
+    assert.equal(h.el(id).classList.contains("hidden"),true);
+  }
+  h.respond({...partial,known_power_kw:0,known_efficiency:0});
+  await h.ctx.refreshSummary();
+  assert.equal(h.el("cPower").textContent,"0");
+  assert.equal(h.el("cEff").textContent,"0");
+  h.respond({...partial,known_power_kw:null,known_efficiency:null});
+  await h.ctx.refreshSummary();
+  assert.equal(h.el("cPower").textContent,"—");
+  assert.equal(h.el("cEff").textContent,"—");
+  assert.equal(h.el("cPowerNote").textContent,"");
+  assert.equal(h.el("cEffNote").textContent,"");
+
+  h.respond(partial);
+  await h.ctx.refreshSummary();
+  h.respond({scanned:false});
+  await h.ctx.refreshSummary();
+  for (const id of ["cPowerNote","cEffNote"]){
+    assert.equal(h.el(id).textContent,"");
+    assert.equal(h.el(id).classList.contains("hidden"),true);
   }
 });
