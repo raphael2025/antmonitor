@@ -11,7 +11,7 @@ const code = values => 'AMC1-' + Buffer.from(JSON.stringify(values), 'utf8').toS
 const payload = {u: 'https://cloud.example.test', t: 'only-a-test-token',
   s: 'site-one', n: '云海 二期', y: 'hydro', f: 'ab'.repeat(32)};
 
-function setup(clipboard, result = {ok: true}) {
+function setup(clipboard, result = {ok: true}, saved = {}) {
   let focused = '';
   const elements = Object.fromEntries([...html.matchAll(/\bid="([^"]+)"/g)].map(match => {
     const classes = new Set(match[1] === 'cloudModal' ? ['hidden'] : []);
@@ -28,7 +28,7 @@ function setup(clipboard, result = {ok: true}) {
     $: id => { assert(elements[id], `Unknown dialog element: ${id}`); return elements[id]; },
     t: key => key, clearTimeout() {}, setTimeout() { return 1; }, console,
     jget: async () => ({site_id: 'existing-id', cloud: {enabled: false, token_set: false,
-      site_name: '', site_type: 'air', url: '', tls_fingerprint: ''}}),
+      site_name: '', site_type: 'air', url: '', tls_fingerprint: '', ...saved}}),
     jpost: async (url, body) => {
       calls.push({url, body: JSON.parse(JSON.stringify(body))});
       if (url.endsWith('/test')) return result;
@@ -52,6 +52,9 @@ function setup(clipboard, result = {ok: true}) {
   assert.equal(direct.calls[1].body.cloud.site_name, payload.n);
   assert.equal(direct.calls[1].body.cloud.site_id, payload.s);
   assert.equal(direct.calls[1].body.cloud.token, payload.t);
+  assert.equal(direct.calls[1].body.cloud.url, payload.u);
+  assert.equal(direct.calls[1].body.cloud.site_type, payload.y);
+  assert.equal(direct.calls[1].body.cloud.tls_fingerprint, payload.f);
   assert.equal(direct.elements.cloudSiteSummary.textContent, payload.n);
   assert.equal(direct.elements.cloudSiteDetails.open, false);
   assert.equal(direct.elements.cloudCode.value, '');
@@ -79,6 +82,8 @@ function setup(clipboard, result = {ok: true}) {
   manual.elements.cloudCode.value = code(payload);
   await manual.elements.cloudCode.handlers.input();
   assert.equal(manual.calls.length, 0);
+  assert.equal(manual.elements.cloudDestination.textContent, payload.u);
+  assert.equal(manual.elements.cloudDestinationRow.classList.contains('hidden'), false);
   await manual.elements.cloudBindingForm.onsubmit({preventDefault() {}});
   assert.equal(manual.calls.length, 2);
 
@@ -110,6 +115,22 @@ function setup(clipboard, result = {ok: true}) {
     await invalid.run('openCloud()');
     await invalid.elements.cloudPaste.onclick();
     assert.equal(invalid.calls.length, 0);
+  }
+  for (const value of [payload.t, code({t: payload.t, n: payload.n, y: payload.y})]) {
+    const saved = {enabled: true, token_set: true, site_name: 'Existing site',
+      site_type: 'mixed', url: 'https://existing.example.test'};
+    const incomplete = setup({readText: async () => value}, {ok: true}, saved);
+    await incomplete.run('openCloud()');
+    const before = incomplete.run('JSON.stringify(_cloudSaved)');
+    await incomplete.elements.cloudPaste.onclick();
+    assert.equal(incomplete.calls.length, 0, 'token-only input must never test or replace the saved binding');
+    assert.equal(incomplete.run('JSON.stringify(_cloudSaved)'), before);
+    assert.equal(incomplete.elements.cloudUrl.value, saved.url);
+    assert.equal(incomplete.elements.cloudToken.value, '');
+    assert.equal(incomplete.elements.cloudName.value, saved.site_name);
+    assert.equal(incomplete.elements.cloudFeedback.textContent,
+      value.startsWith('AMC1-') ? 'toast.connect_bad' : 'cloud.token_only');
+    assert.equal(incomplete.elements.cloudDestinationRow.classList.contains('hidden'), true);
   }
   console.log('Cloud dialog: clipboard, LAN fallback, manual paste, old codes, failure and cancellation passed.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

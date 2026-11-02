@@ -88,7 +88,7 @@ assert.equal(rates.header([steady], t), "24h 平均算力");
 assert.equal(rates.header([{hashrate_hours: 72}], t), "72h 平均算力");
 assert.equal(rates.header([steady, {hashrate_hours: 72}], t), "平均算力");
 assert.equal(rates.machines(steady, t), "1");
-assert.match(rates.machines({machines: 465}, t), /周期内峰值台数/);
+assert.match(rates.machines({machines: 465}, t), /已观测峰值台数/);
 for (const bad of ["<img src=x onerror=alert(1)>", Infinity, NaN, true, -1]) {
   assert.equal(rates.number(bad), null);
   assert.doesNotMatch(cell({...steady, avg_hashrate_ths: bad}), /<img|NaN|Infinity/);
@@ -102,3 +102,6 @@ for (const [lang, dict] of Object.entries(languages))
   }
 console.log("Customer rate UI: units, visible partial means, missing/stale/unknown times, safe site totals and six languages passed");
 
+
+assert.match(rates.machines({machines:465,machines_source:"legacy"},t), /旧报表台数/);
+assert.match(rates.machines({machines:465,machines_source:"observed",sites:2},t), /各场地已观测峰值之和/);

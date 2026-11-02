@@ -36,9 +36,12 @@
       const stale = r.hashrate_stale === true;
       const missing = r.hashrate_unavailable_reason === "not_reported" ? "rate.not_reported" :
         r.hashrate_unavailable_reason === "partial_sites" ? "rate.partial_sites" :
-          r.hashrate_unavailable_reason === "missing_data" ? "rate.missing_measurement" : "rate.waiting";
+          r.hashrate_unavailable_reason === "missing_data" ? "rate.missing_measurement" :
+          r.hashrate_unavailable_reason === "stale_sites" ? "rate.stale" :
+          r.hashrate_unavailable_reason === "unverified_time" ? "rate.time_unknown" : "rate.waiting";
       return '<span class="rate-value">' + (value == null ? "—" : hash(value)) + '</span>' +
         (value == null ? note(t(missing), true) : "") +
+        (value == null && number(r.observed_hashrate_ths) != null ? note(t("quality.known_part", { value: formatHash(number(r.observed_hashrate_ths), "/s") }), true) : "") +
         (stale ? note(t("rate.stale"), true) : "") +
         (sampleAge != null ? note(t("rate.sample_age", { age: ago(sampleAge) })) :
           (value != null ? note(t("rate.time_unknown"), true) : ""));
@@ -50,10 +53,15 @@
     const complete = average != null && (r.avg_complete === true ||
       (r.avg_complete !== false && coverage != null && coverage >= 99.99));
     // Partial windows from different sites need interval intersections, not a sum.
+    const badWindow = ["unaligned_windows", "unverified_windows"].includes(r.avg_unavailable_reason) ||
+      (number(r.sites) > 1 && ["unaligned", "unverified"].includes(r.window_alignment));
+    const staleReports = r.avg_unavailable_reason === "stale_reports";
     const partialSites = r.avg_unavailable_reason === "partial_sites" ||
       (number(r.sites) > 1 && (r.avg_unavailable_reason === "partial_coverage" || (average != null && !complete)));
-    let out = '<span class="rate-value">' + (!mixed && !partialSites && average != null ? hash(average) : "—") + '</span>';
-    if (mixed || partialSites) out += note(t(mixed ? "rate.mixed_periods" : "rate.partial_sites"), true);
+    let out = '<span class="rate-value">' + (!mixed && !partialSites && !badWindow && !staleReports && average != null ? hash(average) : "—") + '</span>';
+    if (badWindow) out += note(t("quality.windows"), true);
+    else if (staleReports) out += note(t("rate.report_stale"), true);
+    else if (mixed || partialSites) out += note(t(mixed ? "rate.mixed_periods" : "rate.partial_sites"), true);
     else if (!complete) {
       if (average != null) out += note(t("rate.partial_average"), true);
       else out += note(t(r.avg_unavailable_reason === "not_reported" ? "rate.not_reported" : "rate.waiting"), true);
@@ -61,6 +69,8 @@
         out += note(t("rate.coverage", { observed: short(observed), hours: short(h) }), true);
       else if (average != null) out += note(t("rate.incomplete"), true);
     }
+    const end = number(r.period_end_ts);
+    if (end) out += note(t("quality.period_end", { time: new Date(end * 1000).toLocaleString() }));
     const reportAge = age(r, "report_age_s", "updated_ts");
     if (reportAge != null) out += note(t("rate.report_age", { age: ago(reportAge) }));
     else if (average != null && !mixed && !partialSites &&
@@ -73,7 +83,7 @@
     const current = number(r.current_machines);
     if (current != null) return short(current);
     const historical = number(r.machines);
-    return historical == null ? "—" : short(historical) + note(t("rate.period_machines"));
+    return historical == null ? "—" : short(historical) + note(t((r.machines_source === "legacy" || (r.machines_source == null && r.billing_source === "legacy_only")) ? "rate.legacy_machines" : number(r.sites) > 1 ? "rate.site_peak_sum" : "rate.period_machines"));
   }
   return { number, period, header, cell, machines };
 });

@@ -16,6 +16,7 @@ import time
 import alerts
 import appconfig
 import db
+import data_metrics
 import logs
 import miner_core
 
@@ -25,6 +26,18 @@ from appconfig import (load_config, load_segments, save_segments,      # noqa: F
                        SEG_FILE, SETTINGS_FILE)
 
 log = logs.get(__name__)
+
+
+def _scan_batch(ips, cfg, **kwargs):
+    """Keep each probe's clock; timestamp legacy records before another phase runs."""
+    records = miner_core.scan(ips, cfg, **kwargs)
+    sampled_at = time.time()
+    result = []
+    for original in records:
+        record = dict(original)
+        record.setdefault("measured_ts", sampled_at)
+        result.append(record)
+    return result
 
 
 class MonitorService:
@@ -81,6 +94,8 @@ class MonitorService:
     # ---- 内存快照 ----
     def _publish(self, scan_id, ts, kind, records):
         with self._snap_lock:
+            if scan_id < self.snapshot["scan_id"]:
+                return  # A concurrent inventory event/new scan already superseded this result.
             self.snapshot = {"scan_id": scan_id, "ts": ts, "kind": kind, "records": records}
 
     def latest(self):
@@ -94,7 +109,8 @@ class MonitorService:
             return None, []
         recs = db.scan_records(self.conn, ls["scan_id"])
         self._publish(ls["scan_id"], ls["ts"], ls.get("kind") or "", recs)
-        return self.snapshot, recs
+        snap = self.snapshot
+        return snap, snap["records"]
 
     def mark_rebooting(self, ips):
         """记下刚下发重启的机器：静默期内掉线不报警(见 alerts.evaluate)。
@@ -326,12 +342,11 @@ class MonitorService:
             self._reboot_lock.release()
 
     def drop_from_snapshot(self, ips):
-        """下架移除后立刻从内存快照剔除，否则要等下一轮扫描列表才更新。"""
-        drop = set(ips)
-        with self._snap_lock:
-            snap = dict(self.snapshot)
-            snap["records"] = [r for r in snap["records"] if r["ip"] not in drop]
-            self.snapshot = snap
+        """db.remove_miners 已追加库存事件；发布新快照，不改写旧扫描的历史含义。"""
+        latest = db.latest_scan(self.conn)
+        if latest:
+            records = db.scan_records(self.conn, latest["scan_id"])
+            self._publish(latest["scan_id"], latest["ts"], latest.get("kind") or "", records)
 
     # ---- 自愈 ----
     def _scheduling_on(self):
@@ -558,7 +573,7 @@ class MonitorService:
             if gen is not None and gen != self._scan_gen:
                 return miners
             self._beat(gen)
-            again = miner_core.scan(remaining, cc, workers=min(100, len(remaining)))
+            again = _scan_batch(remaining, cc, workers=min(100, len(remaining)))
             amap = {r["ip"]: r for r in again if r.get("device") != "container"}
             for ip, r in amap.items():
                 if ip not in fixed or rank(r) > rank(fixed[ip]):
@@ -601,7 +616,7 @@ class MonitorService:
             def cb(done, _t, off=offset):
                 progress_cb(base + off + done, total)
 
-            found += miner_core.scan(chunk, scan_cfg, progress_cb=cb, workers=workers)
+            found += _scan_batch(chunk, scan_cfg, progress_cb=cb, workers=workers)
             if i + batch >= len(ips):
                 break
             if gen != self._scan_gen:
@@ -639,7 +654,7 @@ class MonitorService:
             # MAC is a stable fallback identity for firmware that cannot expose
             # an SN.  Fetch it on discovery scans, not every five-minute patrol.
             scan_cfg["collect_identity"] = kind in {"full", "manual"}
-            records = miner_core.scan(ips, scan_cfg, progress_cb=cb, workers=workers) if ips else []
+            records = _scan_batch(ips, scan_cfg, progress_cb=cb, workers=workers) if ips else []
             # 看门狗恢复会递增世代并启动新扫描。旧线程苏醒后必须在任何进度更新、
             # 二次探测或落库前退出，否则会覆盖新扫描的进度/快照。
             if gen != self._scan_gen:
@@ -675,6 +690,14 @@ class MonitorService:
             ident = db.known_identity(self.conn)
             for r in miners:
                 info = ident.get(r["ip"])
+                # 把本轮可用的归属上下文随快照保存，避免旧命名样本被清理后客户归属丢失。
+                # 明确换了 SN 的在线机不能继承这个 IP 上一台矿机的客户名。
+                if not r.get("worker") and (r["status"] == "online" or
+                        (info and info.get("state") != "migrated")):
+                    changed = bool(info and miner_core.sn_valid(r.get("sn"))
+                                   and miner_core.sn_valid(info.get("sn")) and r["sn"] != info["sn"])
+                    owner = info.get("worker") if info and info.get("state") != "migrated" and not changed else None
+                    r["worker"] = owner or "(未知)"
                 # 只回填离线机：在线机的 MAC 必须是本轮实测值——有合法 SN 的原厂机不读 MAC，
                 # 若回填名册旧值(可能是之前在这个 IP 上的另一台机)，残影判定会把真掉线的
                 # 那台当成"已在别处上线"自动下架、告警静音
@@ -691,30 +714,38 @@ class MonitorService:
                 self._maybe_request_early_full(miners)
             miners = self._drop_migrated_ghosts(miners)
 
-            # 只落库在线机 + 名册内(曾在线/维修)的离线机；丢弃约1.5万死IP空记录。
-            # 全新部署的第一轮还没有名册，此时必须落全量，否则离线数恒为0、面板误显示全在线。
-            # 判据用"库里有没有过扫描"而不是"名册是否为空"——后者会被 IP 迁移批量下架
-            # 清空名册的情况误伤，导致某一轮突然把上万个死地址全写进库。
+            # 首轮也只统计确认过的矿机：空地址不是离线矿机，陌生 HTTP 异常也不是已知矿机。
+            # db.save_scan 仍保留新发现的 online 记录，即使长扫描结束时其读数已过期，
+            # 机器身份仍需入名册；当前状态和历史有效区间另按 measured_ts 判断。
             roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
-            # 名册也要是空的：停机超过 retention_days 后重启，旧扫描已被清理但名册还在，
-            # 那不是首轮，按首轮落全量会把上万个死地址写进库
-            first_run = db.latest_scan(self.conn) is None and not db.known_identity(self.conn)
-            sid, ts, kept = db.save_scan(self.conn, kind, miners,
-                                         keep_ips=(None if first_run else roster))
+            sid, ts, kept = db.save_scan(self.conn, kind, miners, keep_ips=roster)
             # 矿池地址不落库(列表且只用于本轮防篡改检查)，但 kept 是按库列重建的干净记录，
             # 要带回去，否则 alerts 永远看不到 pools、矿池篡改告警形同虚设
             pools_by_ip = {r["ip"]: r["pools"] for r in miners if r.get("pools") is not None}
+            counters_by_ip = {r["ip"]: {key: r[key] for key in ("counter_basis", "counter_samples")
+                                        if key in r} for r in miners}
             for r in kept:
                 if r["ip"] in pools_by_ip:
                     r["pools"] = pools_by_ip[r["ip"]]
+                r.update(counters_by_ip.get(r["ip"], {}))
             alive_ips = {r["ip"] for r in miners if r.get("alive")}
             for r in kept:   # alive 同理不落库：告警层靠它区分"连得上但读不到"与扫描超时
                 if r["ip"] in alive_ips:
                     r["alive"] = True
             self._publish(sid, ts, kind, kept)
             online_recs = [r for r in miners if r["status"] == "online"]
-            online_ips = {r["ip"] for r in online_recs}
             db.upsert_known_miners(self.conn, online_recs, ts)
+            # 原始快照供历史审计；告警和自动动作只使用仍然新鲜的运行视图。
+            # 全网发现可能用掉半小时，不能让半小时前的零算力触发现在的重启。
+            observed_now = time.time()
+            current = []
+            for record in kept:
+                fresh = db.record_freshness(record, ts, observed_now)
+                row = data_metrics.live_record(record, fresh=fresh)
+                if not fresh:
+                    row.pop("alive", None)
+                current.append(row)
+            online_ips = {r["ip"] for r in current if r["status"] == "online"}
             # 扫描+落库已成功 → 立即更新 last_finished(看门狗据此判活)
             self.progress["last_finished"] = ts
 
@@ -722,18 +753,19 @@ class MonitorService:
             try:   # 维修机恢复出算力 → 自动恢复为正常。只看"在线"不够：拆了算力板、控制板
                 # 还通电的机器在线但零算力，一上线就撤销标记会让它照常报警、被零算力自动重启
                 back = db.repair_ips(self.conn) & {
-                    r["ip"] for r in online_recs if (r.get("hr_rt") or 0) > 0}
+                    r["ip"] for r in current
+                    if r["status"] == "online" and (r.get("hr_rt") or 0) > 0}
                 if back:
                     db.set_machine_state(self.conn, list(back), "active")
             except Exception as e:  # noqa: BLE001
                 log.warning("repair-restore error: %s", e)
             try:
-                fired = alerts.evaluate(self.conn, sid, kept, self.cfg, kind=kind,
+                fired = alerts.evaluate(self.conn, sid, current, self.cfg, kind=kind,
                                         state=self._alert_state)
             except Exception as e:  # noqa: BLE001
                 log.exception("alerts.evaluate error: %s", e)
             try:   # 与告警同轮：持续零算力自动重启(开关关则 no-op；限流后异步下发)
-                self._maybe_auto_reboot(kept)
+                self._maybe_auto_reboot(current)
             except Exception as e:  # noqa: BLE001
                 log.exception("auto-reboot error: %s", e)
             # 集装箱：全网扫描只负责发现新箱，已知箱的读数和故障评估全部交给 10 秒刷新。

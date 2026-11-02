@@ -30,6 +30,30 @@ _readers_lock = threading.Lock()
 _reader_gen = 0              # 代数：close_readers() 后 +1，使各线程缓存的旧句柄失效
 
 HOUR = 3600
+MAX_SAMPLE_GAP = 900   # 最后一次实际采样最多代表 15 分钟。
+
+
+def _measurement(value):
+    """未知/非法读数不能被当作实测零值。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value >= 0 else None
+
+
+def record_measured_ts(record, scan_ts):
+    """旧记录没有逐机时间时，只能兼容使用轮次时间，不能伪造更精确的采样。"""
+    value = record.get("measured_ts")
+    value = scan_ts if value is None else value
+    stamp = _measurement(value)
+    return stamp if stamp else None
+
+
+def record_freshness(record, scan_ts, now=None):
+    now = time.time() if now is None else now
+    stamp = record_measured_ts(record, scan_ts)
+    completed = _measurement(scan_ts)
+    return stamp is not None and completed is not None and stamp <= completed + 60 \
+        and -60 <= now - stamp <= MAX_SAMPLE_GAP
 
 WRITE_BUSY_TIMEOUT_MS = 30000
 # 只读连接等得更久：VACUUM 会对整个库加排他锁，大库耗时可达数分钟，
@@ -93,6 +117,7 @@ CREATE TABLE IF NOT EXISTS scans (
     total   INTEGER,
     online  INTEGER,
     offline INTEGER,
+    unknown INTEGER,
     total_hr REAL
 );
 CREATE INDEX IF NOT EXISTS idx_scans_ts ON scans(ts);
@@ -116,6 +141,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     rejected INTEGER,
     stale    INTEGER,
     note     TEXT,
+    measured_ts REAL,
     PRIMARY KEY (scan_id, ip)
 );
 CREATE INDEX IF NOT EXISTS idx_snap_ip ON snapshots(ip);
@@ -142,6 +168,7 @@ CREATE TABLE IF NOT EXISTS container_snaps (
     internal_temp REAL, internal_humidity REAL, tower_inlet_temp REAL, set_temp REAL,
     power1 REAL, power2 REAL, miner_num INTEGER, chip_max_temp INTEGER,
     pumps TEXT, faults TEXT, miner_ips TEXT,
+    measured_ts REAL, data_status TEXT, observed_fault_flags TEXT,
     PRIMARY KEY (ts, ip)
 );
 CREATE INDEX IF NOT EXISTS idx_csnap_ip ON container_snaps(ip);
@@ -163,7 +190,9 @@ CREATE TABLE IF NOT EXISTS containers (
     supply_temp REAL, return_temp REAL, supply_pressure REAL, return_pressure REAL, flow REAL,
     internal_temp REAL, internal_humidity REAL, tower_inlet_temp REAL, set_temp REAL,
     power1 REAL, power2 REAL, miner_num INTEGER, chip_max_temp INTEGER,
-    pumps TEXT, faults TEXT, miner_ips TEXT
+    pumps TEXT, faults TEXT, miner_ips TEXT,
+    measured_ts REAL, data_status TEXT, data_complete INTEGER,
+    last_observed_ts REAL, observed_fault_flags TEXT, known_fault_flags TEXT
 );
 CREATE TABLE IF NOT EXISTS command_log (
     id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,6 +236,25 @@ CREATE TABLE IF NOT EXISTS worker_hashrate_hourly (
     machines INTEGER NOT NULL,
     PRIMARY KEY (hour, worker)
 );
+-- v2 观测统计独立保存，不覆写旧 worker_hourly 账本。
+-- 三种指标各自记录缺测墙钟时长；在线率的分子/分母使用机器秒。
+CREATE TABLE IF NOT EXISTS customer_metrics_hourly (
+    hour INTEGER PRIMARY KEY,
+    observed_s REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS worker_metrics_hourly (
+    hour INTEGER NOT NULL,
+    worker TEXT NOT NULL,
+    th_h REAL NOT NULL,
+    unknown_s REAL NOT NULL,
+    power_kwh REAL NOT NULL,
+    power_unknown_s REAL NOT NULL,
+    status_unknown_s REAL NOT NULL,
+    online_machine_s REAL NOT NULL,
+    known_machine_s REAL NOT NULL,
+    machines INTEGER NOT NULL,
+    PRIMARY KEY (hour, worker)
+);
 -- 重启限流按 action+ok+ip+ts 批量查 24h 成功次数；缺索引时勾选上千台会扫全表
 CREATE INDEX IF NOT EXISTS idx_cmd_reboot ON command_log(action, ok, ip, ts);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
@@ -226,6 +274,8 @@ def init_db(path):
                          ("accepted", "INTEGER"), ("rejected", "INTEGER"), ("stale", "INTEGER")):
             _try(conn, f"ALTER TABLE snapshots ADD COLUMN {col} {typ}")
         _try(conn, "ALTER TABLE snapshots ADD COLUMN mac TEXT")
+        _try(conn, "ALTER TABLE snapshots ADD COLUMN measured_ts REAL")
+        _try(conn, "ALTER TABLE scans ADD COLUMN unknown INTEGER")
         _try(conn, "ALTER TABLE known_miners ADD COLUMN state TEXT DEFAULT 'active'")
         _try(conn, "ALTER TABLE known_miners ADD COLUMN mac TEXT DEFAULT ''")
         for col in ("model TEXT DEFAULT ''", "sn TEXT DEFAULT ''",
@@ -238,6 +288,13 @@ def init_db(path):
         if cols and "ts" not in cols:
             conn.execute("DROP TABLE container_snaps")
             conn.executescript(SCHEMA)
+        for table in ("containers", "container_snaps"):
+            for col, typ in (("measured_ts", "REAL"), ("data_status", "TEXT"),
+                             ("observed_fault_flags", "TEXT")):
+                _try(conn, f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        for col, typ in (("data_complete", "INTEGER"), ("last_observed_ts", "REAL"),
+                         ("known_fault_flags", "TEXT")):
+            _try(conn, f"ALTER TABLE containers ADD COLUMN {col} {typ}")
         # 旧库补重启限流索引(CREATE INDEX IF NOT EXISTS，重复执行无害)
         _try(conn, "CREATE INDEX IF NOT EXISTS idx_cmd_reboot ON command_log(action, ok, ip, ts)")
     return conn
@@ -263,7 +320,17 @@ def meta_set(conn, k, v):
 
 
 SNAP_COLS = ("ip", "status", "firmware", "model", "sn", "mac", "hr_rt", "hr_avg", "power", "temp",
-             "eff", "uptime", "worker", "accepted", "rejected", "stale", "note")
+             "eff", "uptime", "worker", "accepted", "rejected", "stale", "note", "measured_ts")
+
+
+def _scan_totals(records, ts):
+    states = [r.get("status") if record_freshness(r, ts, ts) else "unknown" for r in records]
+    online, offline = states.count("online"), states.count("offline")
+    unknown = len(records) - online - offline
+    rates = [0.0 if state == "offline" else _measurement(r.get("hr_rt"))
+             if state == "online" else None for r, state in zip(records, states)]
+    total_hr = round(sum(rates), 2) if all(v is not None for v in rates) else None
+    return len(records), online, offline, unknown, total_hr
 
 
 def save_scan(conn, kind, records, keep_ips=None):
@@ -278,16 +345,12 @@ def save_scan(conn, kind, records, keep_ips=None):
         kept_src = [r for r in records if r["status"] == "online" or r["ip"] in keep_ips]
     else:
         kept_src = list(records)
-    online = sum(1 for r in kept_src if r["status"] == "online")
-    # status="unknown"(本轮扫描超时没来得及探测的机器)不计入 total/online/offline——
-    # 它既不是确认在线也不是确认离线，算进 offline 会在总览上凭空多出一堆假离线。
-    offline = sum(1 for r in kept_src if r["status"] == "offline")
-    total_hr = round(sum(r.get("hr_rt") or 0 for r in kept_src), 2)
     ts = int(time.time())
+    totals = _scan_totals(kept_src, ts)
     with _wlock, conn:
         cur = conn.execute(
-            "INSERT INTO scans(ts,kind,total,online,offline,total_hr) VALUES(?,?,?,?,?,?)",
-            (ts, kind, online + offline, online, offline, total_hr),
+            "INSERT INTO scans(ts,kind,total,online,offline,unknown,total_hr) VALUES(?,?,?,?,?,?,?)",
+            (ts, kind, *totals),
         )
         sid = cur.lastrowid
         kept = [{"scan_id": sid, "ip": r["ip"], "status": r["status"],
@@ -297,11 +360,12 @@ def save_scan(conn, kind, records, keep_ips=None):
                  "power": r.get("power"), "temp": r.get("temp"), "eff": r.get("eff"),
                  "uptime": r.get("uptime"), "worker": r.get("worker") or "",
                  "accepted": r.get("accepted"), "rejected": r.get("rejected"),
-                 "stale": r.get("stale"), "note": r.get("note") or ""} for r in kept_src]
+                 "stale": r.get("stale"), "note": r.get("note") or "",
+                 "measured_ts": r.get("measured_ts", ts)} for r in kept_src]
         conn.executemany(
             "INSERT INTO snapshots(scan_id,ip,status,firmware,model,sn,mac,hr_rt,hr_avg,power,temp,"
-            "eff,uptime,worker,accepted,rejected,stale,note)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "eff,uptime,worker,accepted,rejected,stale,note,measured_ts)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             [tuple([sid] + [r[c] for c in SNAP_COLS]) for r in kept],
         )
     return sid, ts, kept
@@ -313,20 +377,49 @@ CONTAINER_COLS = ("supply_temp", "return_temp", "supply_pressure", "return_press
 
 
 def upsert_containers(conn, containers, ts):
-    """持久化在线集装箱最新状态（记住箱子）。"""
+    """保存可达性及读数；缺失故障位保留最后证据，不能把未观测当恢复。"""
     if not containers:
         return
-    cols = ",".join(CONTAINER_COLS)
-    qs = ",".join("?" * len(CONTAINER_COLS))
-    rows = [(c["ip"], ts, *[c.get(k) for k in CONTAINER_COLS],
-             json.dumps(c.get("pumps") or {}, ensure_ascii=False),
-             json.dumps(c.get("faults") or [], ensure_ascii=False),
-             json.dumps(c.get("miner_ips") or [], ensure_ascii=False))
-            for c in containers]
+    columns = ("ip", "last_online", "online", *CONTAINER_COLS, "pumps", "faults", "miner_ips",
+               "measured_ts", "data_status", "data_complete", "last_observed_ts",
+               "observed_fault_flags", "known_fault_flags")
     with _wlock, conn:
-        conn.executemany(
-            f"INSERT OR REPLACE INTO containers(ip,last_online,online,{cols},pumps,faults,miner_ips) "
-            f"VALUES(?,?,1,{qs},?,?,?)", rows)
+        for c in containers:
+            old = conn.execute("SELECT * FROM containers WHERE ip=?", (c["ip"],)).fetchone()
+            old = _row_to_container(old) if old else {}
+            measured = record_measured_ts(c, ts)
+            if old.get("measured_ts") and measured and measured < old["measured_ts"]:
+                continue
+            observed = c.get("observed_fault_flags")
+            observed = set(observed) if isinstance(observed, list) else None
+            known = set(old.get("known_fault_flags") or [])
+            previous_faults = {f["flag"]: f for f in old.get("faults", [])}
+            known.update(previous_faults)
+            faults = {}
+            if observed is not None:
+                known.update(observed)
+                for flag, fault in previous_faults.items():
+                    if flag not in observed:
+                        faults[flag] = {**fault, "observed": False,
+                                        "measured_ts": fault.get("measured_ts") or old.get("last_observed_ts")
+                                        or old.get("last_online") or old.get("measured_ts")}
+                complete = bool(observed) and known <= observed
+            else:
+                complete = True  # Legacy/custom drivers expose a complete fault list.
+            complete = complete and c.get("status") != "unknown" and record_freshness(c, ts, ts)
+            for fault in c.get("faults") or []:
+                faults[fault["flag"]] = {**fault, "observed": True, "measured_ts": measured}
+            last_observed = measured if complete else old.get("last_observed_ts")
+            rows = (c["ip"], max(old.get("last_online") or 0, measured or ts), 1,
+                    *(c.get(k) for k in CONTAINER_COLS),
+                    json.dumps(c.get("pumps") or {}, ensure_ascii=False),
+                    json.dumps(list(faults.values()), ensure_ascii=False),
+                    json.dumps(c.get("miner_ips") or [], ensure_ascii=False),
+                    measured, "online" if complete else "unknown", int(complete), last_observed,
+                    json.dumps(sorted(observed) if observed is not None else None),
+                    json.dumps(sorted(known)))
+            conn.execute(f"INSERT OR REPLACE INTO containers({','.join(columns)}) VALUES(" +
+                         ",".join("?" for _ in columns) + ")", rows)
 
 
 def mark_containers_offline(conn, ips):
@@ -335,7 +428,8 @@ def mark_containers_offline(conn, ips):
         return
     qm = ",".join("?" * len(ips))
     with _wlock, conn:
-        conn.execute(f"UPDATE containers SET online=0 WHERE ip IN ({qm})", tuple(ips))
+        conn.execute(f"UPDATE containers SET online=0,data_status='offline',data_complete=0,measured_ts=? "
+                     f"WHERE ip IN ({qm})", (time.time(), *ips))
 
 
 def kick_offline_containers(conn, max_offline_sec=86400):
@@ -366,19 +460,17 @@ def known_container_ips(conn):
 def save_containers(conn, ts, containers):
     if not containers:
         return
+    columns = ("ts", "ip", *CONTAINER_COLS, "pumps", "faults", "miner_ips",
+               "measured_ts", "data_status", "observed_fault_flags")
     with _wlock, conn:
         conn.executemany(
-            "INSERT OR REPLACE INTO container_snaps(ts,ip,supply_temp,return_temp,"
-            "supply_pressure,return_pressure,flow,internal_temp,internal_humidity,tower_inlet_temp,"
-            "set_temp,power1,power2,miner_num,chip_max_temp,pumps,faults,miner_ips)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            [(ts, c["ip"], c.get("supply_temp"), c.get("return_temp"),
-              c.get("supply_pressure"), c.get("return_pressure"), c.get("flow"),
-              c.get("internal_temp"), c.get("internal_humidity"), c.get("tower_inlet_temp"),
-              c.get("set_temp"), c.get("power1"), c.get("power2"), c.get("miner_num"),
-              c.get("chip_max_temp"), json.dumps(c.get("pumps") or {}, ensure_ascii=False),
+            f"INSERT OR REPLACE INTO container_snaps({','.join(columns)}) VALUES(" +
+            ",".join("?" for _ in columns) + ")",
+            [(ts, c["ip"], *(c.get(k) for k in CONTAINER_COLS),
+              json.dumps(c.get("pumps") or {}, ensure_ascii=False),
               json.dumps(c.get("faults") or [], ensure_ascii=False),
-              json.dumps(c.get("miner_ips") or [], ensure_ascii=False)) for c in containers],
+              json.dumps(c.get("miner_ips") or [], ensure_ascii=False), record_measured_ts(c, ts),
+              c.get("status", "online"), json.dumps(c.get("observed_fault_flags"))) for c in containers],
         )
 
 
@@ -389,6 +481,13 @@ def _row_to_container(r):
             d[k] = json.loads(d.get(k) or ("[]" if k != "pumps" else "{}"))
         except (ValueError, TypeError):
             d[k] = [] if k != "pumps" else {}
+    for key in ("observed_fault_flags", "known_fault_flags"):
+        try:
+            d[key] = json.loads(d.get(key) or "null")
+        except (TypeError, ValueError):
+            d[key] = None
+    if not d.get("online"):
+        d["faults"] = [{**fault, "observed": False} for fault in d["faults"]]
     return d
 
 
@@ -433,14 +532,17 @@ def upsert_known_miners(conn, recs, ts):
         else:
             # N/A/error/占位串不算 SN：不能覆盖名册里已知的真 SN(否则掉线后回填出 N/A，搜不到)
             sn = r.get("sn") or ""
-            rows.append((r["ip"], ts, r.get("model") or "", sn if sn_valid(sn) else "",
+            measured = record_measured_ts(r, ts)
+            if measured is None or measured > ts + 60:
+                continue
+            rows.append((r["ip"], int(measured), r.get("model") or "", sn if sn_valid(sn) else "",
                          r.get("mac") or "",
                          r.get("worker") or "", r.get("firmware") or ""))
     with _wlock, conn:
         conn.executemany(
             "INSERT INTO known_miners(ip,last_online,state,model,sn,mac,worker,firmware) "
             "VALUES(?,?,'active',?,?,?,?,?) "
-            "ON CONFLICT(ip) DO UPDATE SET last_online=excluded.last_online, "
+            "ON CONFLICT(ip) DO UPDATE SET last_online=MAX(COALESCE(known_miners.last_online,0),excluded.last_online), "
             "state=CASE WHEN known_miners.state='migrated' THEN 'active' "
             "ELSE known_miners.state END, "
             "model=CASE WHEN excluded.model!='' THEN excluded.model ELSE known_miners.model END, "
@@ -526,11 +628,24 @@ def remove_miners(conn, ips):
     ips = list(dict.fromkeys(ips))
     with _wlock, conn:
         conn.executemany("DELETE FROM known_miners WHERE ip=?", [(ip,) for ip in ips])
-        # 同时从最近一次扫描快照删掉，下架后立刻从矿机列表消失
-        last = conn.execute("SELECT MAX(scan_id) FROM scans").fetchone()[0]
+        # 下架是此刻的库存事件，不能倒改几分钟前的原始采样或结算依据。
+        last = conn.execute("SELECT scan_id,ts FROM scans ORDER BY scan_id DESC LIMIT 1").fetchone()
         if last:
-            conn.executemany("DELETE FROM snapshots WHERE ip=? AND scan_id=?",
-                             [(ip, last) for ip in ips])
+            removed = set(ips)
+            remaining = [dict(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?",
+                                                      (last["scan_id"],)).fetchall() if r["ip"] not in removed]
+            for r in remaining:
+                if r.get("measured_ts") is None:
+                    r["measured_ts"] = last["ts"]  # 旧记录不能借库存事件刷新采样时间。
+                if not record_freshness(r, last["ts"], last["ts"]):
+                    r["status"] = "unknown"  # 原轮次已不可信的时刻，不能经库存事件恢复为有效。
+            totals = _scan_totals(remaining, ts)
+            cur = conn.execute("INSERT INTO scans(ts,kind,total,online,offline,unknown,total_hr) VALUES(?,?,?,?,?,?,?)",
+                               (ts, "inventory", *totals))
+            conn.executemany(
+                "INSERT INTO snapshots(scan_id," + ",".join(SNAP_COLS) + ") VALUES(" +
+                ",".join("?" for _ in range(len(SNAP_COLS) + 1)) + ")",
+                [(cur.lastrowid, *(r.get(key) for key in SNAP_COLS)) for r in remaining])
         _resolve_gone_miners(conn, ips, ts)
 
 
@@ -546,17 +661,30 @@ def online_ips(conn):
 
 def ip_history(conn, ip, limit=200):
     rows = _r(conn).execute(
-        "SELECT s.ts, n.status, n.hr_rt, n.temp, n.power FROM snapshots n "
+        "SELECT s.ts, n.status, n.hr_rt, n.temp, n.power, n.measured_ts FROM snapshots n "
         "JOIN scans s ON s.scan_id=n.scan_id WHERE n.ip=? ORDER BY s.ts DESC LIMIT ?",
         (ip, limit)).fetchall()
     return [dict(r) for r in reversed(rows)]
 
 
 def hashrate_trend(conn, limit=288):
-    # 只取定时扫描，排除 manual(时间点不规则会让趋势出锯齿)
-    rows = _r(conn).execute("SELECT ts,total_hr,online FROM scans WHERE kind IN ('full','quick') "
+    # 完整手动扫描与库存事件都是有效状态边界，按真实时间显示而非等间隔样本。
+    rows = _r(conn).execute("SELECT ts,total_hr,online,unknown FROM scans WHERE kind IN ('full','quick','manual','inventory') "
                             "ORDER BY scan_id DESC LIMIT ?", (limit,)).fetchall()
-    return [dict(r) for r in reversed(rows)]
+    out = []
+    for r in reversed(rows):
+        d = dict(r)
+        legacy = d["unknown"] is None
+        d["legacy_total_hr"] = d["total_hr"] if legacy else None
+        d["legacy_online"] = d["online"] if legacy else None
+        d["known_online"] = d["online"] if not legacy else None
+        if legacy:
+            d["total_hr"] = d["online"] = None
+        elif d["unknown"]:
+            d["online"] = None  # 确认在线的部分计数不能冒充完整在线总数。
+        d["data_quality"] = "legacy" if legacy else "incomplete" if d["total_hr"] is None else "complete"
+        out.append(d)
+    return out
 
 
 # ---- 告警 ----
@@ -789,37 +917,50 @@ def clear_zero_reboot_states(conn, ips):
 
 
 # ---- 计费聚合(rollup) ----
-MAX_SAMPLE_GAP = 900   # 单次扫描最多代表 15 分钟；监控停摆期间不把停机时间算成交付
-
-
-def _customer_rate_sample(records, identities=None):
-    """一轮扫描的客户实际总算力。任何一台读数未知，整个客户总数就是未知。
-
-    identities 只沿时间正向传递身份，绝不把换客户后的名字倒套到旧读数上。
-    空 IP 的离线记录没有客户身份，不能算成客户的矿机。
-    """
+def _customer_metric_sample(records, identities=None, at=None, scan_ts=None, interval=False):
+    """每项独立判定完整性；身份只沿时间向前传播，未知不能变成零。"""
     identities = identities if identities is not None else {}
     out = {}
     for r in records:
         ip = r["ip"]
-        worker = r.get("worker") or identities.get(ip)
         if r.get("worker"):
             identities[ip] = r["worker"]
-        if not worker:
-            if r.get("status") != "online":
-                continue
+        elif r.get("status") == "online":
+            identities.setdefault(ip, "(未知)")  # 已确认真机，即使还没有读到客户名。
+        worker = r.get("worker") or identities.get(ip)
+        if not worker and ip in identities:
             worker = "(未知)"
-        a = out.setdefault(worker, {"machines": 0, "hashrate_ths": 0.0})
+        if not worker:
+            continue  # 历史首扫中的陌生空地址不能成为匿名客户的停机机器。
+        a = out.setdefault(worker, {"machines": 0, "hashrate_ths": 0.0, "power_w": 0.0,
+                                   "status_known": True, "online": 0, "oldest_ts": None,
+                                   "time_known": True})
         a["machines"] += 1
-        if r.get("status") == "offline":
-            continue
-        rate = r.get("hr_rt")
-        if (r.get("status") != "online" or isinstance(rate, bool)
-                or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate < 0):
-            a["hashrate_ths"] = None
-        elif a["hashrate_ths"] is not None:
-            a["hashrate_ths"] += rate
+        stamp = record_measured_ts(r, scan_ts)
+        if stamp is None:
+            a["time_known"] = False
+        else:
+            a["oldest_ts"] = stamp if a["oldest_ts"] is None else min(a["oldest_ts"], stamp)
+        fresh = at is None or record_freshness(r, scan_ts, at)
+        if interval and stamp is not None and at >= stamp + MAX_SAMPLE_GAP:
+            fresh = False
+        state = r.get("status") if fresh else "unknown"
+        if state == "online":
+            a["online"] += 1
+        elif state != "offline":
+            a["status_known"] = False
+        for dest, source in (("hashrate_ths", "hr_rt"), ("power_w", "power")):
+            value = 0.0 if state == "offline" else _measurement(r.get(source)) if state == "online" else None
+            if value is None:
+                a[dest] = None
+            elif a[dest] is not None:
+                a[dest] += value
     return out
+
+
+def _customer_rate_sample(records, identities=None):
+    return {worker: {"machines": a["machines"], "hashrate_ths": a["hashrate_ths"]}
+            for worker, a in _customer_metric_sample(records, identities).items()}
 
 
 def customer_hashrates(scan, records, now=None, identities=None):
@@ -832,8 +973,8 @@ def customer_hashrates(scan, records, now=None, identities=None):
     return [{"worker": worker, "machines": a["machines"],
              "hashrate_ths": round(a["hashrate_ths"], 2)
              if fresh and a["hashrate_ths"] is not None else None,
-             "hashrate_ts": ts}
-            for worker, a in sorted(_customer_rate_sample(records, identities).items())]
+             "hashrate_ts": int(a["oldest_ts"]) if a["time_known"] and a["oldest_ts"] is not None else None}
+            for worker, a in sorted(_customer_metric_sample(records, identities, now, ts).items())]
 
 
 def _past_customer_identities(conn, scans):
@@ -859,16 +1000,23 @@ def _past_customer_identities(conn, scans):
     for ip in missing:
         row = rc.execute(
             "SELECT p.worker FROM snapshots p JOIN scans s ON s.scan_id=p.scan_id "
-            "WHERE p.ip=? AND p.worker<>'' AND s.kind IN ('full','quick','manual') "
+            "WHERE p.ip=? AND (p.worker<>'' OR p.status='online') "
+            "AND s.kind IN ('full','quick','manual','inventory') "
             "AND (s.ts<? OR (s.ts=? AND s.scan_id<?)) "
-            "ORDER BY s.ts DESC, s.scan_id DESC LIMIT 1",
+            "ORDER BY (p.worker<>'') DESC, s.ts DESC, s.scan_id DESC LIMIT 1",
             (ip, first_ts, first_ts, first_id)).fetchone()
         if row:
-            out[ip] = row["worker"]
+            out[ip] = row["worker"] or "(未知)"
     return out
 
 
-def _customer_hashrate_window(conn, start, end):
+def _empty_metrics():
+    return {"th_h": 0.0, "unknown_s": 0.0, "power_kwh": 0.0, "power_unknown_s": 0.0,
+            "status_unknown_s": 0.0, "online_machine_s": 0.0, "known_machine_s": 0.0,
+            "machines": 0}
+
+
+def _customer_metric_window(conn, start, end):
     """按真实扫描时刻积分 [start, end)，不回填首个样本之前的时间。
 
     带入窗口前最多 15 分钟内的最后一轮读数，以正确裁剪跨整点的样本。
@@ -876,10 +1024,10 @@ def _customer_hashrate_window(conn, start, end):
     单条 JOIN 查询保证维护线程清理明细时不会读到只有扫描头、没有明细的半份数据。
     """
     rows = _r(conn).execute(
-        "SELECT s.scan_id, s.ts, p.ip, p.worker, p.status, p.hr_rt "
+        "SELECT s.scan_id, s.ts, p.ip, p.worker, p.status, p.hr_rt, p.power, p.measured_ts "
         "FROM scans s LEFT JOIN snapshots p ON p.scan_id=s.scan_id "
-        "WHERE s.kind IN ('full','quick','manual') AND s.ts<? AND (s.ts>=? OR s.scan_id=("
-        " SELECT scan_id FROM scans WHERE kind IN ('full','quick','manual') AND ts<? AND ts>=?"
+        "WHERE s.kind IN ('full','quick','manual','inventory') AND s.ts<? AND (s.ts>=? OR s.scan_id=("
+        " SELECT scan_id FROM scans WHERE kind IN ('full','quick','manual','inventory') AND ts<? AND ts>=?"
         " ORDER BY ts DESC, scan_id DESC LIMIT 1)) ORDER BY s.ts, s.scan_id, p.ip",
         (end, start, start, start - MAX_SAMPLE_GAP)).fetchall()
     scans = []
@@ -892,21 +1040,45 @@ def _customer_hashrate_window(conn, start, end):
     workers = {}
     identities = _past_customer_identities(conn, scans)
     for i, (_sid, ts, records) in enumerate(scans):
-        sample = _customer_rate_sample(records, identities)
+        # 即使本轮不覆盖窗口，仍应向前传递已知客户身份。
+        for r in records:
+            if r.get("worker"):
+                identities[r["ip"]] = r["worker"]
+            elif r.get("status") == "online":
+                identities.setdefault(r["ip"], "(未知)")
         stop = min(end, ts + MAX_SAMPLE_GAP,
                    scans[i + 1][1] if i + 1 < len(scans) else end)
-        dt = max(0, stop - max(start, ts))
-        if not dt:
+        begin = max(start, ts)
+        if stop <= begin:
             continue
+        # 客户总量要求全部机器有效，故有效终点取最早单机采样+15min，避免逐机事件的平方复杂度。
+        dt = stop - begin
+        sample = _customer_metric_sample(records, identities, begin, ts, interval=True)
         observed_s += dt
         for worker, a in sample.items():
-            dst = workers.setdefault(worker, {"th_h": 0.0, "unknown_s": 0.0, "machines": 0})
+            valid_dt = max(0.0, min(stop, a["oldest_ts"] + MAX_SAMPLE_GAP) - begin) \
+                if a["time_known"] and a["oldest_ts"] is not None else 0.0
+            dst = workers.setdefault(worker, _empty_metrics())
             dst["machines"] = max(dst["machines"], a["machines"])
-            if a["hashrate_ths"] is None:
-                dst["unknown_s"] += dt
-            else:
-                dst["th_h"] += a["hashrate_ths"] * dt / HOUR
+            rate_dt = valid_dt if a["hashrate_ths"] is not None else 0.0
+            dst["unknown_s"] += dt - rate_dt
+            if rate_dt:
+                dst["th_h"] += a["hashrate_ths"] * rate_dt / HOUR
+            power_dt = valid_dt if a["power_w"] is not None else 0.0
+            dst["power_unknown_s"] += dt - power_dt
+            if power_dt:
+                dst["power_kwh"] += a["power_w"] * power_dt / (1000 * HOUR)
+            status_dt = valid_dt if a["status_known"] else 0.0
+            dst["status_unknown_s"] += dt - status_dt
+            dst["online_machine_s"] += a["online"] * status_dt
+            dst["known_machine_s"] += a["machines"] * status_dt
     return observed_s, workers
+
+
+def _customer_hashrate_window(conn, start, end):
+    seconds, workers = _customer_metric_window(conn, start, end)
+    return seconds, {w: {k: a[k] for k in ("th_h", "unknown_s", "machines")}
+                     for w, a in workers.items()}
 
 
 def _save_hashrate_hour(conn, hour, observed_s, workers):
@@ -926,7 +1098,7 @@ def _rollup_customer_hashrates(conn, now, max_hours):
     cur_hour = now - now % HOUR
     hour = int(meta_get(conn, "hashrate_rollup_hour", 0) or 0)
     if not hour:
-        row = _r(conn).execute("SELECT MIN(ts) t FROM scans WHERE kind IN ('full','quick','manual')").fetchone()
+        row = _r(conn).execute("SELECT MIN(ts) t FROM scans WHERE kind IN ('full','quick','manual','inventory')").fetchone()
         if not row or row["t"] is None:
             return
         hour = row["t"] - row["t"] % HOUR
@@ -952,7 +1124,7 @@ def _customer_hashrate_stats(conn, hours, now):
                         (first_hour, now)).fetchall():
         if r["hour"] in archived:
             archived[r["hour"]][1][r["worker"]] = dict(r)
-    first_raw = rc.execute("SELECT MIN(ts) t FROM scans WHERE kind IN ('full','quick','manual')").fetchone()["t"]
+    first_raw = rc.execute("SELECT MIN(ts) t FROM scans WHERE kind IN ('full','quick','manual','inventory')").fetchone()["t"]
     observed_s = 0.0
     workers = {}
     hour = first_hour
@@ -980,6 +1152,116 @@ def _customer_hashrate_stats(conn, hours, now):
             dst["machines"] = max(dst["machines"], a["machines"])
         hour += HOUR
     return observed_s, workers
+
+
+_METRIC_COLUMNS = ("th_h", "unknown_s", "power_kwh", "power_unknown_s", "status_unknown_s",
+                   "online_machine_s", "known_machine_s", "machines")
+
+
+def _save_metric_hour(conn, hour, seconds, workers):
+    with _wlock, conn:
+        conn.execute("INSERT OR REPLACE INTO customer_metrics_hourly(hour,observed_s) VALUES(?,?)",
+                     (hour, seconds))
+        conn.execute("DELETE FROM worker_metrics_hourly WHERE hour=?", (hour,))
+        conn.executemany(
+            "INSERT INTO worker_metrics_hourly(hour,worker,th_h,unknown_s,power_kwh,power_unknown_s,"
+            "status_unknown_s,online_machine_s,known_machine_s,machines) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            [(hour, worker, *(a[k] for k in _METRIC_COLUMNS)) for worker, a in workers.items()])
+        # 保留已有可信算力归档；只补缺项，绝不覆写旧计费账本。
+        if conn.execute("SELECT 1 FROM hashrate_hourly WHERE hour=?", (hour,)).fetchone() is None:
+            conn.execute("INSERT INTO hashrate_hourly(hour,observed_s) VALUES(?,?)", (hour, seconds))
+            conn.executemany(
+                "INSERT INTO worker_hashrate_hourly(hour,worker,th_h,unknown_s,machines) VALUES(?,?,?,?,?)",
+                [(hour, w, a["th_h"], a["unknown_s"], a["machines"]) for w, a in workers.items()])
+
+
+def _customer_metric_stats(conn, hours, now):
+    """同一时间轴生成算力、耗电和在线率；无明细的旧账本不能冒充新观测。"""
+    start = now - hours * HOUR
+    first_hour = start - start % HOUR
+    rc = _r(conn)
+    archived = {r["hour"]: [r["observed_s"], {}] for r in rc.execute(
+        "SELECT hour,observed_s FROM customer_metrics_hourly WHERE hour>=? AND hour<?",
+        (first_hour, now)).fetchall()}
+    for r in rc.execute("SELECT * FROM worker_metrics_hourly WHERE hour>=? AND hour<?",
+                        (first_hour, now)).fetchall():
+        if r["hour"] in archived:
+            archived[r["hour"]][1][r["worker"]] = dict(r)
+    prior = {r["hour"]: [r["observed_s"], {}] for r in rc.execute(
+        "SELECT hour,observed_s FROM hashrate_hourly WHERE hour>=? AND hour<?",
+        (first_hour, now)).fetchall()}
+    for r in rc.execute("SELECT * FROM worker_hashrate_hourly WHERE hour>=? AND hour<?",
+                        (first_hour, now)).fetchall():
+        if r["hour"] in prior:
+            prior[r["hour"]][1][r["worker"]] = dict(r)
+    first_raw = rc.execute("SELECT MIN(ts) t FROM scans WHERE kind IN ('full','quick','manual','inventory')").fetchone()["t"]
+    observed_s, workers = 0.0, {}
+    hour = first_hour
+    while hour < now:
+        lo, hi = max(start, hour), min(now, hour + HOUR)
+        whole = lo == hour and hi == hour + HOUR
+        raw_available = first_raw is not None and hi > first_raw
+        part, old = archived.get(hour), prior.get(hour)
+        if part is not None and whole:
+            seconds, rates = part
+        elif raw_available:
+            seconds, rates = _customer_metric_window(conn, lo, hi)
+            # 清理后只余小时尾部明细时，旧完整算力归档仍可信；它不能恢复功率或状态时间。
+            if whole and old is not None and first_raw > lo and old[0] > seconds:
+                extra = old[0] - seconds
+                merged = {}
+                for worker in rates.keys() | old[1].keys():
+                    a = dict(rates.get(worker, _empty_metrics()))
+                    previous = old[1].get(worker, {})
+                    a["th_h"] = previous.get("th_h", 0.0)
+                    a["unknown_s"] = previous.get("unknown_s", 0.0)
+                    a["machines"] = max(a["machines"], previous.get("machines", 0))
+                    if previous.get("machines", 0):
+                        a["power_unknown_s"] += extra
+                        a["status_unknown_s"] += extra
+                    merged[worker] = a
+                seconds, rates = old[0], merged
+            if whole:
+                _save_metric_hour(conn, hour, seconds, rates)
+        elif whole and old is not None:
+            seconds, rates = old[0], {}
+            for worker, previous in old[1].items():
+                a = _empty_metrics()
+                a.update({k: previous[k] for k in ("th_h", "unknown_s", "machines")})
+                a["power_unknown_s"] = a["status_unknown_s"] = seconds
+                rates[worker] = a
+        else:
+            # 非整小时只有归档时，不知道窗口内与窗口外的实际分布，禁止按比例摊入。
+            seconds, rates = 0.0, {}
+        observed_s += seconds
+        for worker, a in rates.items():
+            dst = workers.setdefault(worker, _empty_metrics())
+            for key in _METRIC_COLUMNS:
+                if key == "machines":
+                    dst[key] = max(dst[key], a[key])
+                else:
+                    dst[key] += a[key]
+        hour += HOUR
+    return observed_s, workers
+
+
+def _rollup_customer_metrics(conn, now, max_hours):
+    """独立 v2 进度保护升级后的原始记录，旧计费表只作为历史证据保留。"""
+    cur_hour = now - now % HOUR
+    hour = int(meta_get(conn, "customer_metrics_rollup_hour", 0) or 0)
+    if not hour:
+        row = _r(conn).execute("SELECT MIN(ts) t FROM scans WHERE kind IN ('full','quick','manual','inventory')").fetchone()
+        if not row or row["t"] is None:
+            return
+        hour = row["t"] - row["t"] % HOUR
+    n = 0
+    while hour < cur_hour and n < max_hours:
+        _customer_metric_stats(conn, 1, hour + HOUR)
+        hour += HOUR
+        n += 1
+        meta_set(conn, "customer_metrics_rollup_hour", hour)
+        # 以上同时补齐旧版独立算力表，保持升级/清理兼容。
+        meta_set(conn, "hashrate_rollup_hour", hour)
 
 
 def _hour_rows(conn, hour_start, hour_end):
@@ -1056,9 +1338,9 @@ def rollup_hours(conn, now=None, max_hours=48):
         if not row or not row["t"]:
             return 0
         done = row["t"] - row["t"] % HOUR
-    n = 0
+    n, processed = 0, 0
     hour = done
-    while hour < cur_hour and n < max_hours:
+    while hour < cur_hour and processed < max_hours:
         rows, deltas = _hour_rows(conn, hour, hour + HOUR)
         if rows:
             agg = _aggregate(rows, deltas)
@@ -1071,33 +1353,45 @@ def rollup_hours(conn, now=None, max_hours=48):
                       round(a["th_h"], 3), round(a["kwh"], 3)) for w, a in agg.items()])
             n += 1
         hour += HOUR
+        processed += 1
         meta_set(conn, "rollup_hour", hour)
     if n:
         log.info("计费聚合: 已归档 %d 个小时，进度至 %s", n,
                  time.strftime("%Y-%m-%d %H:00", time.localtime(hour)))
-    _rollup_customer_hashrates(conn, now, max_hours)
+    _rollup_customer_metrics(conn, now, max_hours)
     return n
 
 
 def coverage_hours(conn):
-    """当前可查询的报表覆盖小时数(取 rollup 与明细快照里最早的数据)。"""
+    """当前可查询的报表跨度；各指标真实有效覆盖另随报表返回。"""
     rc = _r(conn)
-    a = rc.execute("SELECT MIN(hour) h FROM worker_hourly").fetchone()
-    b = rc.execute("SELECT MIN(ts) t FROM scans").fetchone()
-    earliest = min([x for x in ((a and a["h"]), (b and b["t"])) if x] or [0])
+    # 完整 manual 扫描也会产生 v2 归档；不能仅因旧计费表为空、raw 已清理就
+    # 宣称没有历史数据。这里是保留跨度提示，不拿它替代任一指标的有效覆盖。
+    earliest = rc.execute(
+        "SELECT MIN(stamp) t FROM (SELECT MIN(hour) stamp FROM worker_hourly "
+        "UNION ALL SELECT MIN(hour) FROM customer_metrics_hourly "
+        "UNION ALL SELECT MIN(hour) FROM hashrate_hourly "
+        "UNION ALL SELECT MIN(ts) FROM scans)").fetchone()["t"]
     if not earliest:
         return 0
     return max(1, int((time.time() - earliest) // HOUR))
 
 
-def customer_report(conn, hours=24, hashrate_hours=None):
+def customer_report(conn, hours=24, hashrate_hours=None, until_ts=None):
     """客户实际实时/时段平均算力，以及保留兼容的计费聚合。
 
     数据来源两段拼接：
       - 已归档的整点小时 → worker_hourly（明细快照删了也还在，支持月度对账）
       - 尚未归档的当前小时 → 直接扫 snapshots
     """
-    now = int(time.time())
+    realtime_now = int(time.time())
+    if until_ts is None:
+        now = realtime_now
+    else:
+        end = _measurement(until_ts)
+        if end is None or end <= 0 or end > realtime_now:
+            raise ValueError("until_ts must be a positive Unix timestamp no later than now")
+        now = int(end)
     hours = max(1, min(8760, int(hours)))
     rate_hours = hours if hashrate_hours is None else max(1, min(8760, int(hashrate_hours)))
     frm = now - hours * HOUR
@@ -1109,13 +1403,17 @@ def customer_report(conn, hours=24, hashrate_hours=None):
                                   "online": 0, "th_h": 0.0, "kwh": 0.0})
 
     if rolled_to > frm:
-        # 起点所在的整小时只算落在窗口内的那一截(按比例折算)，其余整小时全算。以前整小时
-        # 全算，再加上实时部分，整点后 45 分查"近 1 小时"会得到 1.75 小时的交付算力。
-        # 不去补查那一截的明细快照：长周期报表的起点早已超出明细保留期
+        # 旧估算只读，不改账本；两侧边界都必须裁到查询窗口，不能纳入 until_ts 之后的小时。
+        # 部分小时仍是旧口径的比例估算，只有 v2 明细积分才作为当前观测指标。
+        archived_end = min(rolled_to, now)
         frm_floor = frm - frm % HOUR
-        parts = [(frm_floor + HOUR if frm % HOUR else frm_floor, rolled_to, 1.0)]
-        if frm % HOUR and frm_floor < rolled_to:
-            parts.append((frm_floor, frm_floor + 1, (HOUR - frm % HOUR) / HOUR))
+        first_full = frm_floor + HOUR if frm % HOUR else frm_floor
+        end_floor = archived_end - archived_end % HOUR
+        parts = [(first_full, end_floor, 1.0)]
+        if frm % HOUR and archived_end > frm:
+            parts.append((frm_floor, frm_floor + 1, (min(first_full, archived_end) - frm) / HOUR))
+        if archived_end % HOUR and end_floor >= first_full:
+            parts.append((end_floor, end_floor + 1, (archived_end - end_floor) / HOUR))
         for lo, hi, weight in parts:
             if lo >= hi:
                 continue
@@ -1134,7 +1432,7 @@ def customer_report(conn, hours=24, hashrate_hours=None):
 
     live_from = max(frm, rolled_to)
     if live_from < now:
-        rows, deltas = _hour_rows(conn, live_from, now + 1)
+        rows, deltas = _hour_rows(conn, live_from, now)
         for w, a0 in _aggregate(rows, deltas).items():
             a = slot(w)
             a["machines"] = max(a["machines"], len(a0["ips"]))
@@ -1143,39 +1441,71 @@ def customer_report(conn, hours=24, hashrate_hours=None):
             a["th_h"] += a0["th_h"]
             a["kwh"] += a0["kwh"]
 
-    observed_s, rates = _customer_hashrate_stats(conn, rate_hours, now)
+    legacy_workers = {w for w, a in agg.items() if a["samples"] > 0}
+    observed_s, rates = _customer_metric_stats(conn, rate_hours, now)
+    billing_s, billing = (observed_s, rates) if hours == rate_hours else _customer_metric_stats(conn, hours, now)
     latest = latest_scan(conn)
     # 旧快照的离线行可能没有回填客户名；只为当前身份带入上一轮/名册，历史积分不借用未来身份。
-    identities = {ip: a["worker"] for ip, a in known_identity(conn).items() if a.get("worker")}
+    identities = {ip: a.get("worker") or "(未知)" for ip, a in known_identity(conn).items()}
     previous_id = prev_scan_id(conn, latest["scan_id"]) if latest else None
     if previous_id:
         for r in scan_records(conn, previous_id):
-            if r.get("worker"):
-                identities.setdefault(r["ip"], r["worker"])
+            if r.get("worker") or r.get("status") == "online":
+                identities.setdefault(r["ip"], r.get("worker") or "(未知)")
     current = {r["worker"]: r for r in customer_hashrates(
-        latest, scan_records(conn, latest["scan_id"]) if latest else [], now, identities)}
-    for worker in rates.keys() | current.keys():
+        latest, scan_records(conn, latest["scan_id"]) if latest else [], realtime_now, identities)}
+    for worker in rates.keys() | billing.keys() | current.keys():
         slot(worker)
     current_ts = int(latest["ts"] or 0) if latest else 0
-    current_fresh = bool(current_ts and -60 <= now - current_ts <= MAX_SAMPLE_GAP)
+    current_fresh = bool(current_ts and -60 <= realtime_now - current_ts <= MAX_SAMPLE_GAP)
     out = []
     for a in agg.values():
         rate = rates.get(a["worker"], {})
         seconds = max(0.0, observed_s - rate.get("unknown_s", 0.0))
+        bill = billing.get(a["worker"], {})
+        delivery_s = max(0.0, billing_s - bill.get("unknown_s", 0.0))
+        power_s = max(0.0, billing_s - bill.get("power_unknown_s", 0.0))
+        uptime_s = max(0.0, billing_s - bill.get("status_unknown_s", 0.0))
         live = current.get(a["worker"], {})
+        stamp = live.get("hashrate_ts", current_ts)
+        age = max(0, realtime_now - stamp) if stamp and stamp <= realtime_now + 60 else None
+        measured = observed_s > 0 or billing_s > 0
+        peak = max(rate.get("machines", 0), bill.get("machines", 0)) \
+            if measured else a["machines"]
+        def legacy_metric(key):
+            value = _measurement(a[key]) if a["worker"] in legacy_workers else None
+            return round(value, 1) if value is not None else None
+
         out.append({
-            "worker": a["worker"], "machines": max(a["machines"], rate.get("machines", 0),
-                                                   live.get("machines", 0)),
+            "worker": a["worker"], "machines": peak,
+            "machines_source": "observed" if measured else "legacy",
             "current_machines": live.get("machines", 0) if current_fresh else None,
-            "uptime_pct": round(a["online"] / a["samples"] * 100, 2) if a["samples"] else 0,
-            "delivered_th_h": round(a["th_h"], 1), "power_kwh": round(a["kwh"], 1),
+            "uptime_pct": round(bill.get("online_machine_s", 0.0) / bill["known_machine_s"] * 100, 2)
+            if bill.get("known_machine_s", 0) > 0 else None,
+            "delivered_th_h": round(bill.get("th_h", 0.0), 3) if delivery_s > 0 else None,
+            "power_kwh": round(bill.get("power_kwh", 0.0), 3) if power_s > 0 else None,
+            "billing_method": "time_weighted_v2", "billing_hours": hours,
+            "billing_period_start_ts": now - hours * HOUR, "billing_period_end_ts": now,
+            "billing_source": "observed" if max(delivery_s, power_s, uptime_s) > 0 else
+                "legacy_only" if a["worker"] in legacy_workers else "missing",
+            "delivery_observed_hours": round(delivery_s / HOUR, 6),
+            "delivery_coverage_pct": round(min(100.0, delivery_s / (hours * HOUR) * 100), 4),
+            "power_observed_hours": round(power_s / HOUR, 6),
+            "power_coverage_pct": round(min(100.0, power_s / (hours * HOUR) * 100), 4),
+            "uptime_observed_hours": round(uptime_s / HOUR, 6),
+            "uptime_coverage_pct": round(min(100.0, uptime_s / (hours * HOUR) * 100), 4),
+            "legacy_delivered_th_h": legacy_metric("th_h"),
+            "legacy_power_kwh": legacy_metric("kwh"),
+            "legacy_uptime_pct": round(a["online"] / a["samples"] * 100, 2)
+            if a["worker"] in legacy_workers and a["samples"] else None,
             "hashrate_ths": live.get("hashrate_ths", 0.0) if current_fresh else None,
-            "hashrate_ts": current_ts,
-            "hashrate_age_s": max(0, now - current_ts) if current_ts else None,
-            "hashrate_stale": bool(current_ts and not current_fresh),
+            "hashrate_ts": stamp,
+            "hashrate_age_s": age,
+            "hashrate_stale": age is not None and age > MAX_SAMPLE_GAP,
             "avg_hashrate_ths": round(rate.get("th_h", 0.0) * HOUR / seconds, 2)
             if seconds > 0 else None,
             "hashrate_hours": rate_hours, "observed_hours": round(seconds / HOUR, 6),
+            "period_start_ts": now - rate_hours * HOUR, "period_end_ts": now,
             "coverage_pct": round(min(100.0, seconds / (rate_hours * HOUR) * 100), 4),
         })
     out.sort(key=lambda x: x["machines"], reverse=True)
@@ -1194,7 +1524,9 @@ def prune(conn, retention_days, roster_days=7, rollup_days=400):
     time_cut = now - retention_days * 86400
     rolled_to = int(meta_get(conn, "rollup_hour", 0) or 0)
     rate_rolled_to = int(meta_get(conn, "hashrate_rollup_hour", 0) or 0)
-    snap_cut = min(time_cut, rolled_to, rate_rolled_to) if rolled_to and rate_rolled_to else 0
+    metrics_rolled_to = int(meta_get(conn, "customer_metrics_rollup_hour", 0) or 0)
+    snap_cut = min(time_cut, rolled_to, rate_rolled_to, metrics_rolled_to) \
+        if rolled_to and rate_rolled_to and metrics_rolled_to else 0
     roster_cut = now - roster_days * 86400
     rollup_cut = now - rollup_days * 86400
     old = []
@@ -1219,6 +1551,8 @@ def prune(conn, retention_days, roster_days=7, rollup_days=400):
         conn.execute("DELETE FROM worker_hourly WHERE hour<?", (rollup_cut,))
         conn.execute("DELETE FROM worker_hashrate_hourly WHERE hour<?", (rollup_cut,))
         conn.execute("DELETE FROM hashrate_hourly WHERE hour<?", (rollup_cut,))
+        conn.execute("DELETE FROM worker_metrics_hourly WHERE hour<?", (rollup_cut,))
+        conn.execute("DELETE FROM customer_metrics_hourly WHERE hour<?", (rollup_cut,))
         # 审计：定位灯/维修标记这类高频低价值记录按条数只留最近 5000；重启/换矿池/下架/
         # 被拒绝的命令按时间长期保留——否则批量点几次"维修中"就能把换矿池记录冲掉
         low = "action IN ('locate','state:repair','state:active')"

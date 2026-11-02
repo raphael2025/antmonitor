@@ -271,3 +271,10 @@ footer { text-align: center; padding: 20px; }
 .worker-rates .rate-value { font-size: 18px; color: inherit; }
 .worker-billing { margin-top: 10px; }
 .worker-billing summary { cursor: pointer; margin-bottom: 6px; }
+
+/* Explicit quality notes also apply to cards, energy, availability and archived rows. */
+.card .rate-note { font-size: 11px; font-weight: normal; }
+.legacy-data { margin-top: 4px; font-size: 11px; font-weight: normal; }
+.legacy-data summary { cursor: pointer; color: var(--theme-warning, #fab219); }
+.data-quality-notice { margin: 0 18px 14px; font-size: 12px; }
+.site .rate-note { font-size: 11px; }
