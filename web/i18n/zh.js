@@ -452,8 +452,13 @@ I18N.register('zh', {
   "rate.machines_unit": "台",
   "rate.billing": "累计交付（对账）",
   "rate.firmware_help": "矿机固件返回的平均值，统计周期由固件决定，不等同于本系统近 24 小时平均。",
-  "rate.help": "实时算力为最近一次扫描的实测总和，默认统计近 24 小时平均；数据不足时仅显示已观测时段平均。旧版场地需更新后上报这些指标。",
+  "rate.help": "实时算力是最近一次扫描的实测合计。平均值默认统计近 24 小时；覆盖不足时显示有效时段平均并标明时长，不能视为完整 24 小时结果。",
   "rate.site_customers": "客户（该场地）",
   "rate.partial_sites": "部分场地数据不足，请查看明细",
+  "rate.partial_average": "按有效时段计算",
+  "rate.not_reported": "本地未上报",
+  "rate.missing_measurement": "本轮数据不完整",
+  "rate.report_time_unknown": "报表时间未知",
+  "rate.missing_sites_help": "以下场地尚未上报客户算力：{sites}。请检查本地端是否已更新并重启，完成扫描后会自动上报；保留的原始扫描记录可用于计算平均值。",
   "rate.report_stale": "报表已过期"
 });

@@ -452,8 +452,13 @@ I18N.register('en', {
   "rate.machines_unit": "miners",
   "rate.billing": "Cumulative delivery (billing)",
   "rate.firmware_help": "Average supplied by the miner firmware. Its averaging period is defined by the firmware, not the monitor's rolling 24 hours.",
-  "rate.help": "Current hashrate sums actual readings from the latest scan. The default average covers the last 24 hours; incomplete data shows only an observed-period mean. Update older site agents to report these metrics.",
+  "rate.help": "Current hashrate sums the latest scan measurements. Averages cover the last 24 hours by default. With gaps, the average over valid data is shown with its duration; it is not a complete 24-hour result.",
   "rate.site_customers": "Customers (this site)",
   "rate.partial_sites": "Some sites have incomplete data; see site details",
+  "rate.partial_average": "Average over valid data",
+  "rate.not_reported": "Not reported by site",
+  "rate.missing_measurement": "Incomplete scan data",
+  "rate.report_time_unknown": "Report time unknown",
+  "rate.missing_sites_help": "These sites have not reported customer hashrates: {sites}. Check that each local monitor has been updated and restarted. Reporting starts after a scan; retained raw scan history can be used to calculate averages.",
   "rate.report_stale": "Report is stale"
 });

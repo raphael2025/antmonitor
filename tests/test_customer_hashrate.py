@@ -213,6 +213,60 @@ def test_upgrade_rebuilds_last_day_from_retained_raw_data_without_rebilling(conn
     assert conn.execute("SELECT COUNT(*) FROM worker_hourly").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("archive_first", [False, True])
+def test_rolling_day_with_irregular_scans_has_no_hour_boundary_coverage_loss(
+        conn, monkeypatch, archive_first):
+    # 实际扫描完成时间不落整点；开始/结束两截不能凭空少算成 23.x/24h。
+    now = BASE + 24 * 3600 + 137
+    ts = BASE - 600
+    intervals = (337, 418, 295, 531)
+    i = 0
+    while ts <= now:
+        insert_scan(conn, ts, "quick", [rec("10.0.0.1", worker="A", hr=293)])
+        ts += intervals[i % len(intervals)]
+        i += 1
+    if archive_first:
+        db.rollup_hours(conn, now=now, max_hours=100)
+    r = report(conn, monkeypatch, now)["A"]
+    assert r["avg_hashrate_ths"] == r["hashrate_ths"] == 293
+    assert r["observed_hours"] == r["hashrate_hours"] == 24
+    assert r["coverage_pct"] == 100
+
+
+def test_opening_legacy_database_migrates_and_reuses_existing_history(
+        tmp_path, monkeypatch):
+    # 复现升级前真实文件库没有新表的情况，而非只清空新版表。
+    monkeypatch.setattr(db, "_DB_PATH", None)
+    path = str(tmp_path / "legacy.db")
+    old = db.init_db(path)
+    now = BASE + 24 * 3600 + 137
+    try:
+        readings(old, BASE, BASE + 24 * 3600)
+        old.execute("INSERT INTO worker_hourly VALUES(?,?,?,?,?,?,?)",
+                    (BASE, "A", 1, 12, 12, 293, 3))
+        old.execute("DROP TABLE worker_hashrate_hourly")
+        old.execute("DROP TABLE hashrate_hourly")
+        old.commit()
+        db.meta_set(old, "rollup_hour", BASE + 24 * 3600)
+        legacy_bill = [tuple(r) for r in old.execute("SELECT * FROM worker_hourly")]
+    finally:
+        db.close_readers()
+        old.close()
+    upgraded = db.init_db(path)
+    try:
+        r = report(upgraded, monkeypatch, now)["A"]
+        assert r["avg_hashrate_ths"] == r["hashrate_ths"] == 293
+        assert r["observed_hours"] == r["hashrate_hours"] == 24
+        assert r["coverage_pct"] == 100
+        assert r["current_machines"] == 1
+        assert r["hashrate_ts"] == BASE + 24 * 3600
+        assert upgraded.execute("SELECT COUNT(*) FROM hashrate_hourly").fetchone()[0] > 0
+        assert [tuple(row) for row in upgraded.execute("SELECT * FROM worker_hourly")] == legacy_bill
+    finally:
+        db.close_readers()
+        upgraded.close()
+
+
 def test_new_metrics_include_completed_manual_discovery_scan(conn, monkeypatch):
     insert_scan(conn, BASE, "manual", [rec("10.0.0.1", worker="A", hr=293)])
     r = report(conn, monkeypatch, BASE + 300, 1)["A"]
