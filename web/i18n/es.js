@@ -452,8 +452,13 @@ I18N.register('es', {
   "rate.machines_unit": "equipos",
   "rate.billing": "Entrega acumulada (facturación)",
   "rate.firmware_help": "Media proporcionada por el firmware del minero. El periodo lo define el firmware, no las últimas 24 horas del monitor.",
-  "rate.help": "El hashrate actual suma las lecturas reales del último escaneo. La media cubre 24 horas por defecto; con datos incompletos solo se muestra la media observada. Actualice los agentes antiguos para enviar estas métricas.",
+  "rate.help": "El hashrate actual suma las mediciones del último escaneo. La media cubre las últimas 24 horas por defecto. Si faltan datos, se muestra la media de los periodos válidos y su duración; no es un resultado de 24 horas completas.",
   "rate.site_customers": "Clientes de este centro",
   "rate.partial_sites": "Faltan datos de algunos centros; consulte el detalle",
+  "rate.partial_average": "Media de los periodos con datos",
+  "rate.not_reported": "El sitio no lo ha enviado",
+  "rate.missing_measurement": "Datos del escaneo incompletos",
+  "rate.report_time_unknown": "Hora del informe desconocida",
+  "rate.missing_sites_help": "Estos sitios aún no han enviado el hashrate de sus clientes: {sites}. Compruebe que el monitor local se haya actualizado y reiniciado. El envío comienza tras un escaneo; el historial conservado de escaneos originales se usa para calcular las medias.",
   "rate.report_stale": "Informe desactualizado"
 });

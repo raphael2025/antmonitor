@@ -452,8 +452,13 @@ I18N.register('de', {
   "rate.machines_unit": "Miner",
   "rate.billing": "Kumulierte Leistung (Abrechnung)",
   "rate.firmware_help": "Von der Miner-Firmware gelieferter Mittelwert. Die Firmware bestimmt den Zeitraum, nicht die letzten 24 Stunden des Monitors.",
-  "rate.help": "Die aktuelle Hashrate summiert die Messwerte des letzten Scans. Der Mittelwert umfasst standardmäßig 24 Stunden; bei Datenlücken erscheint nur der beobachtete Mittelwert. Ältere Standort-Agenten für diese Werte aktualisieren.",
+  "rate.help": "Die aktuelle Hashrate summiert die Messwerte des letzten Scans. Der Durchschnitt umfasst standardmäßig die letzten 24 Stunden. Bei Lücken werden der Durchschnitt der gültigen Zeiträume und deren Dauer angezeigt; das ist kein vollständiges 24-Stunden-Ergebnis.",
   "rate.site_customers": "Kunden dieses Standorts",
   "rate.partial_sites": "Unvollständige Standortdaten; siehe Details",
+  "rate.partial_average": "Durchschnitt gültiger Zeiträume",
+  "rate.not_reported": "Vom Standort nicht gemeldet",
+  "rate.missing_measurement": "Unvollständige Scandaten",
+  "rate.report_time_unknown": "Berichtszeit unbekannt",
+  "rate.missing_sites_help": "Diese Standorte haben noch keine Kunden-Hashraten gemeldet: {sites}. Prüfen Sie, ob der lokale Monitor aktualisiert und neu gestartet wurde. Die Übertragung beginnt nach einem Scan; aufbewahrte ursprüngliche Scandaten werden für die Mittelwerte genutzt.",
   "rate.report_stale": "Bericht veraltet"
 });
