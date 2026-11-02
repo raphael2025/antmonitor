@@ -12,6 +12,15 @@ def measurement(value, signed=False):
     return value if math.isfinite(value) and (signed or value >= 0) else None
 
 
+def efficiency(watts, hashrate):
+    """Return J/TH for usable current readings, including a real zero power."""
+    watts, hashrate = measurement(watts), measurement(hashrate)
+    if watts is None or hashrate is None or hashrate <= 0:
+        return None
+    value = watts / hashrate
+    return round(value, 2) if math.isfinite(value) else None
+
+
 def live_record(record, fresh=True):
     """Project raw evidence into a current view without modifying stored samples."""
     out = dict(record)
@@ -30,6 +39,9 @@ def live_record(record, fresh=True):
         # Monitoring convention: confirmed offline contributes zero to estimated work.
         # This is not a physical power-meter measurement.
         out["hr_rt"] = out["power"] = 0.0
+    # The current view uses the same power and realtime hashrate shown beside it.
+    # Firmware may calculate its own efficiency over a different averaging window.
+    out["eff"] = efficiency(out["power"], out["hr_rt"])
     return out
 
 
@@ -46,6 +58,12 @@ def aggregate(records):
     known_kw = round(sum(watts) / 1000, 3) if watts or not records else None
     total_hr = known_hr if hr_complete else None
     total_kw = known_kw if power_complete else None
+    # Use matched readings: separate power/hashrate subtotals may describe
+    # different machines. Include known idle power when the matched total hashes.
+    paired = [r for r in records if r["hr_rt"] is not None and r["power"] is not None]
+    paired_hr = sum(r["hr_rt"] for r in paired)
+    known_efficiency = efficiency(sum(r["power"] for r in paired), paired_hr)
+    efficiency_complete = len(paired) == len(records)
     fw = {}
     for r in online:
         name = r.get("firmware") or ""
@@ -63,7 +81,9 @@ def aggregate(records):
         "avg_hashrate_th": round(total_hr / len(online), 2)
         if hr_complete and online else None,
         # Fleet energy intensity: total watts / total TH/s, including idle online power.
-        "avg_efficiency": round(sum(watts) / sum(rates), 2)
-        if hr_complete and power_complete and sum(rates) > 0 else None,
+        "avg_efficiency": known_efficiency if efficiency_complete else None,
+        "known_efficiency": known_efficiency,
+        "efficiency_known_machines": len(paired),
+        "efficiency_complete": efficiency_complete,
         "by_firmware": fw,
     }

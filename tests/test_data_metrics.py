@@ -25,6 +25,52 @@ def test_fleet_efficiency_is_ratio_of_total_watts_to_total_hashrate():
                                 rec("10.0.0.2", hr=300, power=12000, eff=40)])
     assert s["total_hashrate_th"] == 400 and s["total_power_kw"] == 14
     assert s["avg_efficiency"] == 35  # (2000+12000)/(100+300), not mean(20,40)
+    assert s["known_efficiency"] == 35 and s["efficiency_complete"]
+    assert s["efficiency_known_machines"] == 2
+
+
+def test_partial_efficiency_uses_only_matched_power_and_hashrate_readings():
+    s = data_metrics.aggregate([
+        rec("10.0.0.1", hr=100, power=2000),
+        rec("10.0.0.2", hr=300, power=None),
+        rec("10.0.0.3", hr=None, power=1000),
+    ])
+    assert s["known_power_kw"] == 3 and s["power_known_machines"] == 2
+    assert s["known_hashrate_ths"] == 400
+    assert s["total_power_kw"] is None and s["avg_efficiency"] is None
+    # 3000/400 would combine different machine sets and falsely show 7.5 J/TH.
+    assert s["known_efficiency"] == 20
+    assert s["efficiency_known_machines"] == 1 and not s["efficiency_complete"]
+    disjoint = data_metrics.aggregate([rec("10.0.0.1", hr=100, power=None),
+                                       rec("10.0.0.2", hr=None, power=2000)])
+    assert disjoint["known_efficiency"] is None and disjoint["efficiency_known_machines"] == 0
+
+
+def test_partial_efficiency_includes_idle_power_and_preserves_measured_zero():
+    s = data_metrics.aggregate([rec("10.0.0.1", hr=100, power=2000),
+                                rec("10.0.0.2", hr=0, power=1000),
+                                rec("10.0.0.3", status="unknown")])
+    assert s["known_efficiency"] == 30  # Idle power still costs energy.
+    assert s["efficiency_known_machines"] == 2 and not s["efficiency_complete"]
+    zero = data_metrics.aggregate([rec("10.0.0.1", hr=100, power=0),
+                                   rec("10.0.0.2", status="unknown")])
+    assert zero["known_power_kw"] == zero["known_efficiency"] == 0
+    stopped = data_metrics.aggregate([rec("10.0.0.1", hr=0, power=1000)])
+    assert stopped["known_power_kw"] == 1 and stopped["known_efficiency"] is None
+    assert stopped["efficiency_complete"] and stopped["efficiency_known_machines"] == 1
+
+
+def test_current_miner_efficiency_uses_realtime_readings_without_changing_raw():
+    raw = rec("10.0.0.1", hr=313.34, power=5539, eff=18.28)
+    assert data_metrics.live_record(raw)["eff"] == 17.68
+    assert raw["eff"] == 18.28
+    assert data_metrics.live_record(raw, fresh=False)["eff"] is None
+    for values in ({"hr_rt": 0}, {"hr_rt": None}, {"power": None}, {"status": "unknown"}):
+        assert data_metrics.live_record(dict(raw, **values))["eff"] is None
+    assert data_metrics.live_record(dict(raw, power=0))["eff"] == 0
+    extreme = dict(raw, power=1e100, hr_rt=1e-300)
+    assert data_metrics.live_record(extreme)["eff"] is None
+    assert data_metrics.aggregate([extreme])["known_efficiency"] is None
 
 
 def test_zero_is_valid_and_power_completeness_is_independent():
@@ -105,6 +151,32 @@ def test_antbox_distribution_power_is_not_added_again_to_miner_totals(api, monke
     assert api.api_public_miners(None)["total_power_w"] == 5000
     box = api.api_containers()["containers"][0]
     assert box["power1"] + box["power2"] == 5000
+
+
+def test_summary_filtered_totals_and_current_rows_expose_consistent_available_values(api, monkeypatch):
+    rows = [rec("10.0.0.1", worker="A", hr=100, power=2000, eff=99),
+            rec("10.0.0.2", worker="A", hr=300, power=None),
+            rec("10.0.0.3", worker="B", hr=None, power=1000)]
+    publish(api, monkeypatch, rows)
+    summary = api.api_summary()
+    assert summary["total_power_kw"] is None and summary["avg_efficiency"] is None
+    assert summary["known_power_kw"] == 3 and summary["known_efficiency"] == 20
+    assert summary["efficiency_known_machines"] == 1 and not summary["efficiency_complete"]
+    miners = api.api_miners(limit=50000)
+    assert miners["agg"]["known_power"] == 3000  # List API remains in watts.
+    assert miners["agg"]["power_known_machines"] == 2
+    assert miners["agg"]["known_efficiency"] == 20
+    filtered = api.api_miners(q="A", limit=50000)["agg"]
+    assert filtered["count"] == 2 and filtered["known_power"] == 2000
+    assert filtered["known_efficiency"] == 20 and filtered["efficiency_known_machines"] == 1
+    assert next(r for r in miners["miners"] if r["ip"] == "10.0.0.1")["eff"] == 20
+    assert api.api_miner("10.0.0.1")["current"]["eff"] == 20
+    assert api.api_public_miners(None)["miners"][0]["efficiency_jth"] == 20
+    assert rows[0]["eff"] == 99
+    # Quality and full-total fields sent to the cloud retain their existing meaning.
+    public = api._build_public_summary()
+    assert public["total_power_kw"] is None and public["known_power_kw"] == 3
+    assert public["power_complete"] is False
 
 
 def test_public_missing_sample_never_turns_into_zero(api, monkeypatch):

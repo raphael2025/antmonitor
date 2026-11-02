@@ -199,6 +199,16 @@ function fmtUptime(sec) {
 }
 const KIND_LABEL = { get full(){return t("kind.full");}, get quick(){return t("kind.quick");}, get manual(){return t("kind.manual");}, get inventory(){return t("kind.inventory");} };
 
+function currentMetric(id, noteId, full, known, complete, count, total) {
+  const value = AntDataQuality.number(full) ?? AntDataQuality.number(known);
+  $(id).textContent = value == null ? "—" : AntDataQuality.short(value);
+  const measured = AntDataQuality.number(count), machines = AntDataQuality.number(total);
+  const partial = complete === false && value != null;
+  $(noteId).textContent = partial ? (measured != null && machines != null
+    ? t("power.coverage", { known: measured, total: machines }) : t("power.partial")) : "";
+  $(noteId).classList.toggle("hidden", !partial);
+}
+
 async function refreshSummary() {
   const s = await jget("/api/summary");
   updateProgress(s.progress);
@@ -208,6 +218,7 @@ async function refreshSummary() {
     lastScanTs = 0;
     $("lastScan").textContent = t("scan.none_wait");
     ["cOnline", "cTotalHr", "cAvgHr", "cOffline", "cAlerts", "cFw", "cPower", "cEff", "cContainers"].forEach(id => { $(id).textContent = "—"; });
+    ["cPowerNote", "cEffNote"].forEach(id => { $(id).textContent = ""; $(id).classList.add("hidden"); });
     $("summaryQuality").textContent = t("quality.missing");
     $("summaryQuality").classList.remove("hidden");
     return;
@@ -220,8 +231,10 @@ async function refreshSummary() {
   $("cAlerts").textContent = s.active_alerts;
   const fw = s.by_firmware || {};
   $("cFw").textContent = `${fw.stock || 0} / ${fw.uniplus || 0}`;
-  $("cPower").innerHTML = AntDataQuality.partial(s.total_power_kw, s.known_power_kw, s.power_complete, t, n => n.toLocaleString(undefined, { maximumFractionDigits: 3 }));
-  $("cEff").textContent = s.avg_efficiency == null ? "—" : AntDataQuality.short(s.avg_efficiency);
+  currentMetric("cPower", "cPowerNote", s.total_power_kw, s.known_power_kw,
+    s.power_complete, s.power_known_machines, s.total);
+  currentMetric("cEff", "cEffNote", s.avg_efficiency, s.known_efficiency,
+    s.efficiency_complete, s.efficiency_known_machines, s.total);
   $("cEff").title = t("quality.eff_help");
   const quality = $("summaryQuality");
   quality.textContent = s.unknown ? t("quality.local_help", { n: s.unknown }) : "";
@@ -502,7 +515,13 @@ async function refreshMiners() {
   }
   $("minerCount").textContent = d.count != null ? d.count : lastMiners.length;
   const a = d.agg || {};
-  $("segStat").textContent = t("seg.stat", { seg: seg ? seg + ".x ｜ " : "", online: a.online || 0, hr: fmtHash(a.total_hr), pw: fmtPower(a.total_power) });
+  let power = fmtPower(a.total_power ?? a.known_power);
+  if (a.power_complete === false && AntDataQuality.number(a.known_power) != null) {
+    const known = AntDataQuality.number(a.power_known_machines);
+    power += " · " + (known == null ? t("power.partial")
+      : t("power.coverage", { known, total: d.count ?? lastMiners.length }));
+  }
+  $("segStat").textContent = t("seg.stat", { seg: seg ? seg + ".x ｜ " : "", online: a.online || 0, hr: fmtHash(a.total_hr), pw: power });
 
   const rows = showAllRows ? lastMiners : lastMiners.slice(0, RENDER_CAP);
   $("minerBody").innerHTML = rows.map(r => {
