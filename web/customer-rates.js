@@ -63,7 +63,9 @@
     }
     const reportAge = age(r, "report_age_s", "updated_ts");
     if (reportAge != null) out += note(t("rate.report_age", { age: ago(reportAge) }));
-    else if (average != null && !mixed && !partialSites) out += note(t("rate.report_time_unknown"), true);
+    else if (average != null && !mixed && !partialSites &&
+      (Object.prototype.hasOwnProperty.call(r, "report_age_s") || Object.prototype.hasOwnProperty.call(r, "updated_ts")))
+      out += note(t("rate.report_time_unknown"), true);
     if (r.report_stale === true) out += note(t("rate.report_stale"), true);
     return out;
   }

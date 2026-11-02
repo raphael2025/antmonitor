@@ -65,6 +65,11 @@ assert.match(cell({...steady, hashrate_stale: true}, "current"), /293 TH\/s/);
 // A known stale site still invalidates a sum when another site's timestamp is unknown.
 assert.match(cell({...steady, sites: 2, hashrate_age_s: null, hashrate_stale: true}, "current"), /数据已过期/);
 assert.match(cell({...steady, sites: 2, report_age_s: null, report_stale: true}), /报表已过期/);
+// Local reports are computed on request and have no cloud receipt-time channel.
+const localReport = {...steady};
+delete localReport.report_age_s;
+assert.match(cell(localReport), /rate-value">293 TH\/s/);
+assert.doesNotMatch(cell(localReport), /报表时间未知/);
 const now = Date.now() / 1000;
 for (const ts of [now - 60, now + 3600]) {
   const unknown = {...steady, hashrate_ts: ts, hashrate_age_s: null, updated_ts: ts, report_age_s: null};
