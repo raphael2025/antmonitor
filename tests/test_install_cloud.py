@@ -99,6 +99,20 @@ class CloudSetupTests(unittest.TestCase):
         self.assertEqual(ping.call_args.args[1], "new-site")
         self.assertIn("连接验证通过", output)
         self.assertNotIn("test-token-only", output)
+        self.assertIn("https://cloud.example.invalid:8443", "\n".join(terminal.messages))
+        self.assertIn("new-site", "\n".join(terminal.messages))
+
+    def test_token_without_address_never_tests_or_changes_existing_binding(self):
+        before = self.settings.read_bytes()
+        for value in ["test-token-only", connect_code(u=None)]:
+            with self.subTest(value=value):
+                status, output, ping = self.run_setup(value)
+                self.assertEqual(status, 1)
+                ping.assert_not_called()
+                self.assertEqual(self.settings.read_bytes(), before)
+                self.assertIn("地址", output)
+                self.assertIn("未修改", output)
+                self.assertNotIn("test-token-only", output)
 
     def test_legacy_code_prompts_default_to_effective_saved_values_and_preserves_other_settings(self):
         terminal = Terminal("", "")
@@ -202,7 +216,7 @@ class CloudSetupTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(self.saved()["cloud"]["site_id"], "right-site")
         self.assertTrue(terminal.prompts[0][1], "code input must be hidden")
-        self.assertIn("未修改原云端配置", terminal.messages[1])
+        self.assertIn("未修改原云端配置", "\n".join(terminal.messages))
 
     def test_failed_code_can_be_skipped_and_keeps_original_bytes(self):
         before = self.settings.read_bytes()

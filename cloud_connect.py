@@ -63,7 +63,7 @@ def site_key(value):
 def decode_code(code):
     code = str(code or "").strip()
     if len(code) > MAX_CODE_LENGTH or not re.fullmatch(r"AMC1-[A-Za-z0-9_-]+", code):
-        raise SetupError("接入信息格式不对，应以 AMC1- 开头")
+        raise SetupError("请复制云端完整接入信息（AMC1- 开头，含地址和上报密钥）；单独 token 不含上报地址，无法一键绑定")
     try:
         encoded = code[5:]
         data = json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4),
@@ -187,7 +187,7 @@ def configure(code, name="", site_type="", terminal=None):
         if not code:
             if terminal is None:
                 raise SetupError("未收到接入信息，请在终端运行后粘贴，或通过 --stdin 传入。")
-            code = terminal.ask("粘贴云端接入信息（AMC1-…，输入不显示，回车跳过）: ", secret=True)
+            code = terminal.ask("粘贴云端完整接入信息（AMC1-…，含地址和上报密钥；输入不显示，回车跳过）: ", secret=True)
             if not code:
                 print("已跳过连接云端，原配置未修改。")
                 return 10
@@ -197,6 +197,7 @@ def configure(code, name="", site_type="", terminal=None):
             current = read_state()
             cloud = candidate(data, current, name, site_type, terminal)
             if terminal:
+                terminal.write("将上报到：" + cloud["url"] + "\n场地：" + cloud["site_name"] + "（" + cloud["site_id"] + "）")
                 terminal.write("正在验证云端连接…")
             passed, message = cloud_report.test(cloud, cloud["site_id"])
             if not passed:
@@ -257,7 +258,7 @@ def main(argv=None):
         if args.stdin:
             result = configure(sys.stdin.read(MAX_CODE_LENGTH + 1).strip())
         else:
-            print("粘贴云端复制的接入信息即可，无需分别填写地址或 token。")
+            print("粘贴云端复制的完整接入信息（AMC1-…）即可，其中已包含地址、上报密钥和场地信息。")
             result = configure("", terminal=Terminal())
     except (EOFError, KeyboardInterrupt):
         print("已取消连接云端，原配置未修改。")

@@ -647,7 +647,7 @@ def use_service_account(user, group):
 def decode_code(code):
     code = code.strip()
     if len(code) > 16384 or not re.fullmatch(r"AMC1-[A-Za-z0-9_-]+", code):
-        raise SetupError("接入码格式不对，应以 AMC1- 开头")
+        raise SetupError("请复制云端完整接入信息（AMC1- 开头，含地址和上报密钥）；单独 token 不含上报地址，无法一键绑定")
     try:
         encoded = code[5:]
         data = json.loads(base64.b64decode(encoded + "=" * (-len(encoded) % 4),
@@ -767,7 +767,7 @@ def configure(code, name="", site_type="", terminal=None):
         if not code:
             if terminal is None:
                 raise SetupError("请在 SSH 终端运行 connect 并粘贴接入码")
-            code = terminal.ask("粘贴云端接入码（AMC1-…，输入不显示，回车跳过）: ", secret=True)
+            code = terminal.ask("粘贴云端接入码（完整的 AMC1-…，含地址和上报密钥；输入不显示，回车跳过）: ", secret=True)
             if not code:
                 print("已跳过连接云端，原配置未修改。")
                 return 10
@@ -777,6 +777,7 @@ def configure(code, name="", site_type="", terminal=None):
             current = read_state()
             cloud = candidate(data, current, name, site_type, terminal)
             if terminal:
+                terminal.write("将上报到：" + cloud["url"] + "\n场地：" + cloud["site_name"] + "（" + cloud["site_id"] + "）")
                 terminal.write("正在验证云端连接…")
             passed, message = cloud_report.test(cloud, cloud["site_id"])
             if not passed:

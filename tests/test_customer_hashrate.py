@@ -178,7 +178,10 @@ def test_old_integral_without_raw_history_is_not_presented_as_measured_mean(conn
     conn.commit()
     db.meta_set(conn, "rollup_hour", BASE + 3600)
     r = report(conn, monkeypatch, BASE + 3600, 1)["A"]
-    assert r["delivered_th_h"] == 293
+    assert r["delivered_th_h"] is None
+    assert r["power_kwh"] is None and r["uptime_pct"] is None
+    assert r["legacy_delivered_th_h"] == 293 and r["legacy_power_kwh"] == 3
+    assert r["billing_source"] == "legacy_only"
     assert r["avg_hashrate_ths"] is None
     assert r["coverage_pct"] == r["observed_hours"] == 0
 

@@ -78,8 +78,27 @@ def test_complete_packet_needs_one_hidden_paste_preserves_settings_and_database(
     assert database.read_bytes() == b"Existing database must not be touched"
     assert not identity.exists()
     output = capsys.readouterr().out + "\n".join(terminal.messages)
+    assert PAYLOAD["u"] in output
+    assert PAYLOAD["s"] in output
     assert PAYLOAD["t"] not in output
     assert connection_code() not in output
+
+
+@pytest.mark.parametrize("value", [PAYLOAD["t"], connection_code(u=None)])
+def test_token_without_address_never_tests_or_changes_existing_binding(value, state, monkeypatch, capsys):
+    before = state[0].read_bytes()
+
+    def unexpected_ping(*args):
+        pytest.fail("a token without an address cannot be used for one-paste binding")
+
+    monkeypatch.setattr(cli.cloud_report, "test", unexpected_ping)
+    assert cli.configure(value) == 1
+    assert state[0].read_bytes() == before
+    assert not state[2].exists()
+    output = capsys.readouterr().out
+    assert "地址" in output
+    assert "未修改" in output
+    assert PAYLOAD["t"] not in output
 
 
 def test_legacy_packet_keeps_existing_identity_and_asks_only_optional_defaults(state):

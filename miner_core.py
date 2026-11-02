@@ -5,6 +5,7 @@
 CLI / 定时服务 / Web API 全部复用本模块。
 """
 import json
+import hashlib
 import math
 import re
 import socket
@@ -165,9 +166,11 @@ def tcp_open(ip, port, timeout):
 
 def _number(v, integer=False):
     """把设备返回值收敛为有限数值；拒绝 HTML、NaN/Infinity 等异常载荷。"""
+    if isinstance(v, bool):
+        return None
     try:
         n = float(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if not math.isfinite(n):
         return None
@@ -178,6 +181,23 @@ def _number(v, integer=False):
             return None
         return int(n)
     return n
+
+
+def _nonnegative(v, integer=False):
+    """Rates, consumed power and cumulative counters cannot be negative."""
+    n = _number(v)
+    if n is None or n < 0:
+        return None
+    return _number(n, integer=True) if integer else n
+
+
+def _counter(v):
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v if 0 <= v <= 2**63 - 1 else None
+    n = _nonnegative(v)
+    return _number(n, integer=True) if n is not None and n.is_integer() else None
 
 
 def normalize_mac(value):
@@ -193,10 +213,25 @@ def _truthy(v):
     return bool(v)
 
 
+def _flag(v):
+    """PLC bits have three states: explicit true, explicit false, or unreadable."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        value = v.strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            return True
+        if value in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
 def gh_to_th(v):
     """GH/s -> TH/s"""
     try:
-        n = _number(v)
+        n = _nonnegative(v)
         return round(n / 1000.0, 2) if n is not None else None
     except (TypeError, ValueError, OverflowError):
         return None
@@ -211,6 +246,7 @@ def _blank(ip, status):
         "hr_rt": None, "hr_avg": None, "power": None, "temp": None,
         "eff": None, "uptime": None, "worker": "",
         "accepted": None, "rejected": None, "stale": None, "note": "",
+        "measured_ts": time.time(),
     }
 
 
@@ -242,27 +278,37 @@ ANTBOX_FAULTS = [
 
 def antbox_faults(p):
     return [{"flag": f, "label": lab, "sev": sev}
-            for f, lab, sev in ANTBOX_FAULTS if _truthy(p.get(f))]
+            for f, lab, sev in ANTBOX_FAULTS if _flag(p.get(f)) is True]
 
 
-def probe_antbox(ip, online_to, data_to):
+def _unknown_container(ip):
+    return {"device": "container", "ip": ip, "status": "unknown", "name": ip,
+            "faults": [], "pumps": {}, "miner_ips": [], "measured_ts": time.time(),
+            "observed_fault_flags": [], "data_complete": False,
+            "note": "控制器可达，但冷却数据缺失或无效"}
+
+
+def probe_antbox(ip, online_to, data_to, known=False):
     """AntBox 集装箱控制器：GET /cooler?operation=coolerState（免认证）。返回容器记录或 None。"""
     s = get_session()
     try:
         r = s.get(f"http://{ip}/cooler?operation=coolerState", timeout=online_to)
-        d = r.json()
-    except (requests.RequestException, ValueError):
+    except requests.RequestException:
         return None
+    try:
+        d = r.json()
+    except ValueError:
+        return _unknown_container(ip) if known else None
     if not (isinstance(d, dict) and _truthy(d.get("ok"))
             and d.get("method") == "coolerState"):
-        return None
+        return _unknown_container(ip) if known else None
     p = d.get("params")
-    if not isinstance(p, dict):
-        # 读不出冷却数据：按"本轮没采到"交给连续未采到→控制器离线告警。绝不能返回一条
-        # 故障位全空的记录，那会把正在报的漏液等告警当成"已恢复"消掉
-        return None
+    if not isinstance(p, dict) or not p:
+        return _unknown_container(ip)
+    observed = [f for f, _label, _severity in ANTBOX_FAULTS if _flag(p.get(f)) is not None]
     rec = {
         "device": "container", "ip": ip, "status": "online", "name": ip,
+        "measured_ts": time.time(), "observed_fault_flags": observed,
         "supply_temp": _number(p.get("supply_liquid_temp")),
         "return_temp": _number(p.get("return_liquid_temp")),
         "supply_pressure": _number(p.get("supply_liquid_pressure")),
@@ -272,23 +318,26 @@ def probe_antbox(ip, online_to, data_to):
         "internal_humidity": _number(p.get("antbox_internal_humidity")),
         "tower_inlet_temp": _number(p.get("colding_tower_inlet_temp")),
         "set_temp": _number(p.get("supply_liquid_set_temp")),
-        "power1": _number(p.get("distribution_box1_power")),
-        "power2": _number(p.get("distribution_box2_power")),
-        "pumps": {"循环泵": _truthy(p.get("circulating_pump")),
-                  "喷淋泵": _truthy(p.get("spray_pump")),
-                  "风扇1": _truthy(p.get("fan1")), "风扇2": _truthy(p.get("fan2")),
-                  "塔风扇1": _truthy(p.get("cooling_tower_fan1")),
-                  "塔风扇2": _truthy(p.get("cooling_tower_fan2")),
-                  "塔风扇3": _truthy(p.get("cooling_tower_fan3"))},
+        "power1": _nonnegative(p.get("distribution_box1_power")),
+        "power2": _nonnegative(p.get("distribution_box2_power")),
+        "pumps": {"循环泵": _flag(p.get("circulating_pump")),
+                  "喷淋泵": _flag(p.get("spray_pump")),
+                  "风扇1": _flag(p.get("fan1")), "风扇2": _flag(p.get("fan2")),
+                  "塔风扇1": _flag(p.get("cooling_tower_fan1")),
+                  "塔风扇2": _flag(p.get("cooling_tower_fan2")),
+                  "塔风扇3": _flag(p.get("cooling_tower_fan3"))},
         "faults": antbox_faults(p),
         "miner_num": None, "chip_max_temp": None, "miner_ips": [],
     }
+    if not observed:
+        rec["status"] = "unknown"
+        rec["note"] = "控制器可达，但未取得有效故障状态位"
     try:  # 矿机信息（best-effort，箱内矿机数/芯片温/成员列表）
         mj = s.get(f"http://{ip}/cooler?operation=minerInfo", timeout=data_to).json()
         m = mj.get("params") if isinstance(mj, dict) else None
         if not isinstance(m, dict):    # 数组/字符串等怪结构：忽略附加信息，冷却数据照常返回
             m = {}
-        rec["miner_num"] = _number(m.get("miner_num"), integer=True)
+        rec["miner_num"] = _nonnegative(m.get("miner_num"), integer=True)
         ct = _number(m.get("chip_max_temp"))
         rec["chip_max_temp"] = ct if (ct is not None and ct > -100000) else None
         mi = m.get("miner_info")
@@ -353,12 +402,14 @@ def _cgminer(ip, command, timeout):
 
 def fetch_pool(ip, timeout):
     """cgminer 4028 端口 pools 命令：取矿工名 + 接受/拒绝/陈旧份额（明文、跨固件）。
-    返回 {worker, accepted, rejected, stale} 或 None。"""
+    counter_basis/counter_samples 仅供内存告警比较同一组累计计数，不持久化池地址。"""
     d = _cgminer(ip, "pools", timeout)
     if d is None:
         return None
     try:
         pools = d.get("POOLS") or []
+        if not isinstance(pools, list) or not all(isinstance(p, dict) for p in pools):
+            return None
         # 只统计活跃池(Status=Alive)：备用/失活池的历史拒绝份额会把拒绝率顶过阈值误报；
         # worker 也取活跃池中优先级最高(Priority 最小)的主池，避免归属到备用池的异名 worker。
         active = [p for p in pools
@@ -371,18 +422,35 @@ def fetch_pool(ip, timeout):
             except (TypeError, ValueError):
                 return 999
 
-        worker, acc, rej, stl = None, 0, 0, 0
+        worker = None
         for p in sorted(use, key=_prio):
             u = p.get("User") or p.get("user")
-            if u and worker is None:
+            if isinstance(u, str) and u and worker is None:
                 worker = u.split(".", 1)[0].strip()   # 去掉 .25x146 后缀
+        totals = {key: [] for key in ("Accepted", "Rejected", "Stale")}
+        samples = {}
         for p in use:
-            acc += int(p.get("Accepted") or p.get("accepted") or 0)
-            rej += int(p.get("Rejected") or p.get("rejected") or 0)
-            stl += int(p.get("Stale") or p.get("stale") or 0)
+            for key in totals:
+                totals[key].append(_counter(p[key] if key in p else p.get(key.lower())))
+            # Counter identities use opaque digests: URLs may include credentials.
+            # The separate pools field remains available for the allowlist guard.
+            identity = [p.get("POOL", pools.index(p)), p.get("URL") or p.get("url"),
+                        p.get("User") or p.get("user")]
+            key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+            samples[key] = (totals["Accepted"][-1], totals["Rejected"][-1])
+        basis = hashlib.sha256(json.dumps(sorted(samples)).encode()).hexdigest()
+
+        def total(key):
+            values = totals[key]
+            if not values or len(samples) != len(use) or any(v is None for v in values):
+                return None
+            return sum(values)
+
         # 全部配置的矿池地址(含备用/失活池)：换池防篡改检查用。攻击者常把自己的池塞在备用位
         urls = [str(p.get("URL") or p.get("url") or "").strip() for p in sorted(pools, key=_prio)]
-        return {"worker": worker, "accepted": acc, "rejected": rej, "stale": stl,
+        return {"worker": worker, "accepted": total("Accepted"),
+                "rejected": total("Rejected"), "stale": total("Stale"),
+                "counter_basis": "cgminer-pools:" + basis, "counter_samples": samples,
                 "pools": [u for u in urls if u]}
     except Exception:
         return None
@@ -401,14 +469,14 @@ def fetch_summary(ip, timeout):
         def rate(key):
             if sm.get(f"GHS {key}") is not None:
                 return gh_to_th(sm.get(f"GHS {key}"))
-            n = _number(sm.get(f"MHS {key}"))
+            n = _nonnegative(sm.get(f"MHS {key}"))
             return round(n / 1e6, 2) if n is not None else None
 
         hr = rate("5s")
         if hr is None:
             return None
         return {"hr_rt": hr, "hr_avg": rate("av"),
-                "uptime": _number(sm.get("Elapsed"), integer=True)}
+                "uptime": _nonnegative(sm.get("Elapsed"), integer=True)}
     except Exception:
         return None
 
@@ -424,7 +492,9 @@ def _temp(v):
 
 
 def reject_pct(accepted, rejected):
-    a, r = accepted or 0, rejected or 0
+    a, r = _counter(accepted), _counter(rejected)
+    if a is None or r is None:
+        return None
     return round(r / (a + r) * 100, 3) if (a + r) > 0 else 0.0
 
 
@@ -458,17 +528,31 @@ def probe_stock(ip, online_to, data_to, passwords, collect_identity=False):
             if r.status_code == 401:
                 continue
             d = r.json()
-            info = d.get("INFO", {})
-            st = (d.get("STATS") or [{}])[0]
-            rec["model"] = info.get("type", "")
+            if not isinstance(d, dict):
+                raise ValueError("stats.cgi response is not an object")
+            info = d.get("INFO")
+            info = info if isinstance(info, dict) else {}
+            rows = d.get("STATS")
+            st = rows[0] if isinstance(rows, list) and rows else None
+            if not isinstance(st, dict):
+                raise ValueError("stats.cgi has no valid STATS record")
+            model = info.get("type")
+            rec["model"] = model if isinstance(model, str) else ""
             rec["hr_rt"] = gh_to_th(st.get("rate_5s"))
             rec["hr_avg"] = gh_to_th(st.get("rate_avg"))
-            rec["power"] = _number(st.get("watt"), integer=True)
-            rec["eff"] = _number(st.get("jt"))     # J/TH
-            rec["uptime"] = _number(st.get("elapsed"), integer=True)
+            rec["power"] = _nonnegative(st.get("watt"), integer=True)
+            rec["eff"] = _nonnegative(st.get("jt"))     # J/TH
+            rec["uptime"] = _nonnegative(st.get("elapsed"), integer=True)
+            rec["measured_ts"] = time.time()
             temps = []
-            for c in (st.get("chain") or []):
-                temps += [n for n in (_temp(t) for t in (c.get("temp_chip") or []))
+            chains = st.get("chain")
+            for c in chains if isinstance(chains, list) else []:
+                if not isinstance(c, dict):
+                    continue
+                chips = c.get("temp_chip")
+                if not isinstance(chips, list):
+                    continue
+                temps += [n for n in (_temp(t) for t in chips)
                           if n is not None]
             rec["temp"] = max(temps) if temps else None
             # 6060 does not expose a MAC.  Only machines without a usable SN
@@ -507,17 +591,20 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False):
     m = d.get("miner")
     if not isinstance(m, dict):
         return None
-    ct = m.get("chip_temp", {}) or {}
+    ct = m.get("chip_temp")
+    ct = ct if isinstance(ct, dict) else {}
+    state = m.get("miner_status")
+    state = state if isinstance(state, dict) else {}
     rec = _blank(ip, "online")
     rec["firmware"] = "uniplus"
-    rec["model"] = m.get("miner_type", "")
+    model = m.get("miner_type")
+    rec["model"] = model if isinstance(model, str) else ""
     rec["hr_rt"] = gh_to_th(m.get("hr_realtime"))
     rec["hr_avg"] = gh_to_th(m.get("hr_average"))
-    rec["power"] = _number(m.get("power_consumption"), integer=True)
+    rec["power"] = _nonnegative(m.get("power_consumption"), integer=True)
     rec["temp"] = _temp(ct.get("max"))
-    rec["eff"] = _number(m.get("power_efficiency"))  # J/TH
-    rec["uptime"] = _number(
-        (m.get("miner_status") or {}).get("miner_state_time"), integer=True)
+    rec["eff"] = _nonnegative(m.get("power_efficiency"))  # J/TH
+    rec["uptime"] = _nonnegative(state.get("miner_state_time"), integer=True)
     if collect_identity:
         try:
             info = s.get(f"http://{ip}/api/v1/info", timeout=data_to or online_to).json()
@@ -577,6 +664,7 @@ def probe(ip, cfg, limiter=None):
         # 在线但 stats.cgi 超时/读不出：用 4028 补算力，免得"读不到算力"一直没数据
         sm = fetch_summary(ip, min(data_to, 3.0))
         if sm:
+            rec["measured_ts"] = time.time()
             for k, v in sm.items():
                 if rec.get(k) is None:
                     rec[k] = v
@@ -589,6 +677,8 @@ def probe(ip, cfg, limiter=None):
             rec["accepted"] = pi.get("accepted")
             rec["rejected"] = pi.get("rejected")
             rec["stale"] = pi.get("stale")
+            rec["counter_basis"] = pi.get("counter_basis")
+            rec["counter_samples"] = pi.get("counter_samples")
             rec["pools"] = pi.get("pools") or []   # 只在内存/本轮使用，不落库
     return rec
 
@@ -624,14 +714,24 @@ def scan(ips, cfg, progress_cb=None, workers=None):
     bag = _new_bag()          # 本次调用私有的会话袋，收尾只关自己创建的会话
     ex = ThreadPoolExecutor(max_workers=workers, initializer=_bind_bag, initargs=(bag,))
     futs = {ex.submit(probe, ip, cfg, limiter): ip for ip in ips}
+
+    def result(f, ip):
+        try:
+            record = dict(f.result())
+            # Legacy/custom probes may omit this field; never renew a timestamp
+            # already supplied by the driver when a slow batch finally ends.
+            record.setdefault("measured_ts", time.time())
+            return record
+        except Exception:
+            record = _blank(ip, "unknown")
+            record["note"] = "探测结果异常(未确认离线)"
+            return record
+
     try:
         for f in as_completed(futs, timeout=overall_to):
             ip = futs[f]
             seen.add(ip)
-            try:
-                results.append(f.result(timeout=5))
-            except Exception:
-                results.append(_blank(ip, "offline"))
+            results.append(result(f, ip))
             done += 1
             if progress_cb and done % 200 == 0:
                 progress_cb(done, total)
@@ -650,10 +750,7 @@ def scan(ips, cfg, progress_cb=None, workers=None):
                 # as_completed 的超时检查发生在"取下一个已完成结果"之前：有极小概率
                 # 恰好卡在"结果已经算出来、但还没被 as_completed 取走"这个窗口触发
                 # TimeoutError，这种 future 其实是真探测完了，绝不能当unknown丢掉。
-                try:
-                    results.append(f.result())
-                except Exception:
-                    results.append(_blank(ip, "offline"))
+                results.append(result(f, ip))
                 done += 1
                 continue
             if f.cancel():
@@ -693,7 +790,7 @@ def scan_containers(ips, cfg, progress_cb=None):
     seen = set()
     bag = _new_bag()          # 本次调用私有的会话袋
     ex = ThreadPoolExecutor(max_workers=workers, initializer=_bind_bag, initargs=(bag,))
-    futs = {ex.submit(probe_antbox, ip, online_to, data_to): ip for ip in ips}
+    futs = {ex.submit(probe_antbox, ip, online_to, data_to, known=True): ip for ip in ips}
     try:
         for f in as_completed(futs, timeout=overall_to):
             seen.add(futs[f])

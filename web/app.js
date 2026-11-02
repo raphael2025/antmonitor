@@ -174,14 +174,17 @@ function ago(ts) {
   if (s < 3600) return t("time.min_ago", { n: Math.floor(s / 60) });
   return t("time.hour_ago", { n: Math.floor(s / 3600) });
 }
-function fmtPower(w) {   // 功率 W → kW/MW
-  if (w == null) return "-";
-  const v = Number(w);
-  return v >= 1e6 ? (v / 1e6).toFixed(2) + " MW" : (v / 1000).toFixed(1) + " kW";
+function fmtPower(w) {   // 矿机/配电原始读数为 W；界面固定用 kW 表示当前功率。
+  const v = AntDataQuality.number(w);
+  return v == null ? "-" : (v / 1000).toLocaleString(undefined, { maximumFractionDigits: 3 }) + " kW";
+}
+function fmtEnergy(kwh) {   // 累计电量固定用 kWh，避免与当前负荷混淆。
+  const v = AntDataQuality.number(kwh);
+  return v == null ? "-" : v.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " kWh";
 }
 function boxPower(c) {   // 集装箱总功耗 = 两路配电之和(W)
-  if (c.power1 == null && c.power2 == null) return null;
-  return (c.power1 || 0) + (c.power2 || 0);
+  const p1 = AntDataQuality.number(c.power1), p2 = AntDataQuality.number(c.power2);
+  return p1 == null || p2 == null ? null : p1 + p2;
 }
 function fmtDT(ts) {   // 告警时间戳: MM-DD HH:MM
   if (!ts) return "";
@@ -194,25 +197,38 @@ function fmtUptime(sec) {
   if (h) return t("time.h_m", { h, m });
   return t("time.m_only", { m });
 }
-const KIND_LABEL = { get full(){return t("kind.full");}, get quick(){return t("kind.quick");}, get manual(){return t("kind.manual");} };
+const KIND_LABEL = { get full(){return t("kind.full");}, get quick(){return t("kind.quick");}, get manual(){return t("kind.manual");}, get inventory(){return t("kind.inventory");} };
 
 async function refreshSummary() {
   const s = await jget("/api/summary");
   updateProgress(s.progress);
   if (s.scan_ts) lastScanTs = s.scan_ts;   // 记录服务器最近完成扫描时间(失联自检用)
   if (s.stale_after) staleAfter = s.stale_after;
-  if (!s.scanned) { $("lastScan").textContent = t("scan.none_wait"); return; }
+  if (!s.scanned) {
+    lastScanTs = 0;
+    $("lastScan").textContent = t("scan.none_wait");
+    ["cOnline", "cTotalHr", "cAvgHr", "cOffline", "cAlerts", "cFw", "cPower", "cEff", "cContainers"].forEach(id => { $(id).textContent = "—"; });
+    $("summaryQuality").textContent = t("quality.missing");
+    $("summaryQuality").classList.remove("hidden");
+    return;
+  }
   $("cOnline").textContent = `${s.online} / ${s.total}`;
-  $("cTotalHr").textContent = fmtHash(s.total_hashrate_th);
+  $("cTotalHr").innerHTML = AntDataQuality.partial(s.total_hashrate_th, s.known_hashrate_ths, s.hashrate_complete, t, n => fmtHash(n, "/s"));
   $("cAvgHr").textContent = fmtHash(s.avg_hashrate_th);
+  $("cAvgHr").title = t("quality.avg_machine_help");
   $("cOffline").textContent = s.offline;
   $("cAlerts").textContent = s.active_alerts;
   const fw = s.by_firmware || {};
   $("cFw").textContent = `${fw.stock || 0} / ${fw.uniplus || 0}`;
-  $("cPower").textContent = (s.total_power_kw || 0).toLocaleString();
-  $("cEff").textContent = s.avg_efficiency || 0;
-  $("cContainers").textContent = `${s.containers || 0}`
-    + ((s.containers_faulty || s.containers_offline) ? ` (${(s.containers_faulty || 0) + (s.containers_offline || 0)})` : "");
+  $("cPower").innerHTML = AntDataQuality.partial(s.total_power_kw, s.known_power_kw, s.power_complete, t, n => n.toLocaleString(undefined, { maximumFractionDigits: 3 }));
+  $("cEff").textContent = s.avg_efficiency == null ? "—" : AntDataQuality.short(s.avg_efficiency);
+  $("cEff").title = t("quality.eff_help");
+  const quality = $("summaryQuality");
+  quality.textContent = s.unknown ? t("quality.local_help", { n: s.unknown }) : "";
+  quality.classList.toggle("hidden", !s.unknown);
+  $("cContainers").innerHTML = `${s.containers || 0}`
+    + ((s.containers_faulty || s.containers_offline) ? ` (${(s.containers_faulty || 0) + (s.containers_offline || 0)})` : "")
+    + (s.containers_unknown ? AntDataQuality.note(t("quality.unknown_count", { n: s.containers_unknown }), true) : "");
   $("lastScan").textContent = t("scan.last", { ago: ago(s.scan_ts), kind: KIND_LABEL[s.scan_kind] || s.scan_kind });
 }
 
@@ -381,46 +397,57 @@ document.addEventListener("click", () => {
 function trendYScale(data) {
   // 小幅正常抖动(约±1%)不拉满图高；真实大跌/大涨仍清晰可见。
   // 量程至少覆盖均值的 8%，再在数据上下各留一点边。
+  data = data.filter(v => v != null && Number.isFinite(v));
   if (!data.length) return {};
   const lo = Math.min(...data), hi = Math.max(...data);
   const mid = (lo + hi) / 2 || 1;
   const span = Math.max(hi - lo, Math.abs(mid) * 0.08);
   const pad = span * 0.15;
-  return { min: mid - span / 2 - pad, max: mid + span / 2 + pad };
+  return { min: Math.max(0, mid - span / 2 - pad), max: mid + span / 2 + pad };
 }
 
 async function refreshTrend() {
   const d = await jget("/api/trend?points=288");
-  // 注意：不可用局部变量名 t —— 会遮蔽全局 i18n 的 t()，导致标题赋值抛错、整段趋势图画不出
   const pts = d.trend || [];
-  const loc = uiLocale();
-  const labels = pts.map(x => new Date(x.ts * 1000).toLocaleTimeString(loc, { hour12: false }));
-  const raw = pts.map(x => x.total_hr);
-  const { div, unit } = hashUnit(raw.length ? Math.max(...raw) : 0);
-  const data = raw.map(v => v / div);
-  const yScale = trendYScale(data);
-  const tt = $("trendTitle"); if (tt) tt.textContent = t("trend.title_u", { unit });
-  if (!window.Chart) return;   // Chart.js 未加载时跳过，不拖垮整页
-  const canvas = $("trendChart");
-  if (!canvas) return;
+  const values = pts.flatMap(p => [p.total_hr, p.legacy_total_hr]).filter(v => AntDataQuality.number(v) != null);
+  const { div, unit } = hashUnit(values.length ? Math.max(...values) : 0);
+  const line = key => {
+    const points = AntDataQuality.points(pts, "ts", key, div), out = [];
+    points.forEach((p, i) => {
+      if (i && p.x - points[i - 1].x > 900) out.push({ x: points[i - 1].x + 900, y: null });
+      out.push(p);
+    });
+    return out;
+  };
+  const data = line("total_hr"), legacy = line("legacy_total_hr");
+  const hasLegacy = legacy.some(p => p.y != null);
+  const datasets = [{ label: t("card.total_hr"), data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: 0, pointRadius: 0, borderWidth: 2 }];
+  if (hasLegacy) datasets.push({ label: t("quality.legacy"), data: legacy, borderColor: "#8b949e", borderDash: [5, 4], pointRadius: 0, borderWidth: 2, tension: 0 });
+  const yScale = trendYScale([...data, ...legacy].map(p => p.y));
+  const tt = $("trendTitle"); if (tt) tt.textContent = t("trend.title_u", { unit: unit + "/s" });
+  if (!window.Chart || !$("trendChart")) return;
+  const tick = ts => new Date(ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false });
+  const tooltip = c => c.parsed.y == null ? "—" : AntDataQuality.short(c.parsed.y) + " " + unit + "/s";
   if (!trendChart) {
-    trendChart = new Chart(canvas, {
-      type: "line",
-      data: { labels, datasets: [{ data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: .3, pointRadius: 0, borderWidth: 2 }] },
+    trendChart = new Chart($("trendChart"), {
+      type: "line", data: { datasets },
       options: {
-        interaction: { mode: "index", intersect: false },   // 鼠标放在图上任意处即显示数值
-        plugins: { legend: { display: false }, tooltip: { callbacks: {
-          title: (items) => items.length ? items[0].label : "",
-          label: (c) => c.parsed.y.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " " + unit } } },
+        spanGaps: false, animation: false,
+        interaction: { mode: "nearest", axis: "x", intersect: false },
+        plugins: { legend: { display: hasLegacy }, tooltip: { callbacks: {
+          title: items => items.length ? new Date(items[0].parsed.x * 1000).toLocaleString(uiLocale()) : "",
+          label: tooltip } } },
         scales: {
-          x: { ticks: { color: "#6e7681", maxTicksLimit: 8 } },
+          x: { type: "linear", ticks: { color: "#6e7681", maxTicksLimit: 8, callback: tick } },
           y: { ticks: { color: "#6e7681" }, min: yScale.min, max: yScale.max }
         }
       }
     });
   } else {
-    trendChart.data.labels = labels; trendChart.data.datasets[0].data = data;
-    trendChart.options.plugins.tooltip.callbacks.label = (c) => c.parsed.y.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " " + unit;
+    trendChart.data.datasets = datasets;
+    trendChart.options.plugins.legend.display = hasLegacy;
+    trendChart.options.plugins.tooltip.callbacks.label = tooltip;
+    trendChart.options.scales.x.ticks.callback = tick;
     trendChart.options.scales.y.min = yScale.min;
     trendChart.options.scales.y.max = yScale.max;
     trendChart.update("none");
@@ -442,10 +469,11 @@ function tempCell(r) {
 }
 const REJECT_HI = 5;
 function rejCell(r) {
-  if (r.accepted == null && r.rejected == null) return `<td>-</td>`;
-  const tot = (r.accepted || 0) + (r.rejected || 0);
+  const accepted = AntDataQuality.number(r.accepted), rejected = AntDataQuality.number(r.rejected);
+  if (accepted == null || rejected == null) return `<td>-</td>`;
+  const tot = accepted + rejected;
   if (tot === 0) return `<td>0%</td>`;
-  const p = Math.round((r.rejected || 0) / tot * 1000) / 10;
+  const p = Math.round(rejected / tot * 1000) / 10;
   return `<td class="${p >= REJECT_HI ? "hot" : ""}">${p}%</td>`;
 }
 
@@ -486,7 +514,7 @@ async function refreshMiners() {
       + `<td>${r.firmware ? `<span class="pill ${esc(r.firmware)}">${esc(r.firmware)}</span>` : "-"}</td>`
       + `<td>${esc(r.model) || "-"}</td>`
       + hrCell(r) + `<td>${r.hr_avg != null ? fmtHash(r.hr_avg) : "-"}</td>`
-      + `<td>${r.power != null ? safeVal(r.power) + " W" : "-"}</td>`
+      + `<td>${fmtPower(r.power)}</td>`
       + `<td>${r.eff != null ? esc(r.eff) : "-"}</td>`
       + rejCell(r)
       + tempCell(r)
@@ -558,6 +586,7 @@ async function refreshWorkers() {
       return `<div class="worker"><div class="worker-head">`
         + `<span class="wname">${esc(w.worker)}</span>`
         + `<span class="wstat">${t("worker.stat", { n: w.total, hr: fmtHash(w.hashrate, "/s") })}</span></div>`
+        + (w.hashrate_complete === false && w.known_hashrate_ths != null ? `<div class="muted">${esc(t("quality.known_part", { value: fmtHash(w.known_hashrate_ths, "/s") }))}</div>` : "")
         + `<div class="wmodels">${models}</div></div>`;
     }).join("") || `<div class="muted">${esc(t("worker.none"))}</div>`;
   } else {
@@ -567,17 +596,16 @@ async function refreshWorkers() {
       ? `<div class="muted" style="margin-bottom:8px">${esc(t("worker.cover_warn", { d: (d.covered_hours / 24).toFixed(1) }))}</div>`
       : "";
     $("workerList").innerHTML = note + ((d.customers || []).map(c => {
-      const up = c.uptime_pct;
-      const upCls = up >= 99 ? "res-ok" : up >= 95 ? "" : "res-fail";
       return `<div class="worker"><div class="worker-head">`
         + `<span class="wname">${esc(c.worker)}</span>`
         + `<span class="wstat">${AntCustomerRates.machines(c, t)} ${esc(t("rate.machines_unit"))}</span></div>`
         + `<div class="wmodels">`
         + `<div class="worker-rates"><div><span>${esc(t("rate.current"))}</span>${AntCustomerRates.cell(c, "current", t, fmtHash, rateAgo)}</div>`
         + `<div><span>${esc(AntCustomerRates.header([c], t))}</span>${AntCustomerRates.cell(c, "average", t, fmtHash, rateAgo)}</div></div>`
-        + `${esc(t("worker.uptime"))} <b class="${upCls}">${up}%</b><br>`
-        + `${esc(t("worker.kwh"))} <b>${c.power_kwh.toLocaleString()}</b> kWh`
-        + `<details class="worker-billing"><summary>${esc(t("rate.billing"))}</summary>${esc(t("worker.delivered"))} <b>${fmtHashH(c.delivered_th_h)}</b></details>`
+        + `${esc(t("worker.uptime"))}${AntDataQuality.billing(c, "uptime", t, n => AntDataQuality.short(n) + "%")}`
+        + `${esc(t("worker.kwh"))}${AntDataQuality.billing(c, "power", t, fmtEnergy)}`
+        + `<details class="worker-billing"><summary>${esc(t("rate.billing"))}</summary>${esc(t("worker.delivered"))}${AntDataQuality.billing(c, "delivery", t, fmtHashH)}</details>`
+        + (c.period_end_ts ? `<div class="muted">${esc(t("quality.period_end", { time: fmtTime(c.period_end_ts) }))}</div>` : "")
         + `</div></div>`;
     }).join("") || `<div class="muted">${esc(t("worker.none_period"))}</div>`);
   }
@@ -655,7 +683,7 @@ async function openMiner(ip) {
   $("mInfo").innerHTML =
     t("miner.detail_fw", { fw: esc(c.firmware) || "-", st: esc(c.status) || "-", sn: esc(c.sn) || "-" }) + "<br>"
     + t("miner.detail_mac", { mac: esc(c.mac) || "-" }) + "<br>"
-    + t("miner.detail_hr", { hr: c.hr_rt == null ? t("td.no_hr") : fmtHash(c.hr_rt), avg: fmtHash(c.hr_avg), pw: safeVal(c.power) }) + "<br>"
+    + t("miner.detail_hr", { hr: c.hr_rt == null ? t("td.no_hr") : fmtHash(c.hr_rt), avg: fmtHash(c.hr_avg), pw: fmtPower(c.power) }) + "<br>"
     + t("miner.detail_eff", { eff: safeVal(c.eff), temp: safeVal(c.temp), up: fmtUptime(c.uptime) }) + "<br>"
     + t("miner.detail_worker", { w: esc(c.worker) || "-", a: safeVal(c.accepted), r: safeVal(c.rejected), s: safeVal(c.stale) })
     + (c.note ? "<br>" + t("miner.detail_note", { n: esc(c.note) }) : "");
@@ -700,6 +728,15 @@ function containerFaultLabel(fault) {
   return t("cbox.fault_generic", { fault: readable });
 }
 
+function containerQuality(c) {
+  return c.data_status === "unknown" || c.data_stale || (c.online && c.data_complete !== 1 && c.data_complete !== true);
+}
+
+function containerFaultBadge(f, ignored = false) {
+  return `<span class="fbadge ${ignored ? "info" : esc(f.sev)}">${esc(containerFaultLabel(f))}`
+    + (f.observed === false ? ` · ${esc(t("quality.last_fault", { time: f.measured_ts ? fmtTime(f.measured_ts) : t("rate.time_unknown") }))}` : "") + `</span>`;
+}
+
 async function refreshContainers() {
   const d = await jget("/api/containers");
   const cs = d.containers || [];
@@ -707,9 +744,10 @@ async function refreshContainers() {
   const spMin = d.supply_pressure_min || 0, rpMin = d.return_pressure_min || 0;
   $("containerPanel").style.display = cs.length ? "" : "none";
   $("containerCount").textContent = `${cs.length}`
-    + (d.faulty ? t("cbox.faulty", { n: d.faulty }) : "") + (d.offline ? t("cbox.offline", { n: d.offline }) : "");
+    + (d.faulty ? t("cbox.faulty", { n: d.faulty }) : "") + (d.offline ? t("cbox.offline", { n: d.offline }) : "")
+    + (d.unknown ? " · " + t("quality.unknown_count", { n: d.unknown }) : "");
   $("containerList").innerHTML = cs.map(c => {
-    if (!c.online) {
+    if (!c.online && !containerQuality(c)) {
       return `<div class="cbox offline" onclick="openContainer('${esc(c.ip)}')">`
         + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
         + `<span class="fbadge crit">${esc(t("cbox.ctrl_off"))}</span></div>`
@@ -718,13 +756,14 @@ async function refreshContainers() {
     const dt = (c.supply_temp != null && c.return_temp != null) ? (c.return_temp - c.supply_temp).toFixed(1) : "-";
     const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `<span class="pump ${v ? "on" : ""}">${esc(containerPumpLabel(k))}</span>`).join("");
     // 忽略列表内的故障置灰(info)，其余按严重级；按阈值标红低压力
-    const faults = (c.faults || []).map(f => `<span class="fbadge ${ign.has(f.flag) ? "info" : esc(f.sev)}">${esc(containerFaultLabel(f))}</span>`).join("");
+    const faults = (c.faults || []).map(f => containerFaultBadge(f, ign.has(f.flag))).join("");
     const spLow = spMin && c.supply_pressure != null && c.supply_pressure < spMin;
     const rpLow = rpMin && c.return_pressure != null && c.return_pressure < rpMin;
     const realFault = (c.faults || []).some(f => !ign.has(f.flag)) || spLow || rpLow;
     return `<div class="cbox ${realFault ? "fault" : ""}" onclick="openContainer('${esc(c.ip)}')">`
       + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
       + `<span class="cbox-meta">${esc(t("cbox.miners_line", { n: safeVal(c.miner_num) }))} ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span></div>`
+      + (containerQuality(c) ? AntDataQuality.note(t(c.data_stale ? "quality.stale" : "quality.partial"), true) : "")
       + `<div class="cbox-temps"><div>${esc(t("cbox.supply"))} <span class="v in">${safeVal(c.supply_temp)}℃</span></div>`
       + `<div>${esc(t("cbox.return"))} <span class="v out">${safeVal(c.return_temp)}℃</span></div><div>ΔT <span class="v">${safeVal(dt)}℃</span></div></div>`
       + `<div class="cbox-meta">${esc(t("cbox.meta_env", { t: safeVal(c.internal_temp), h: safeVal(c.internal_humidity), f: safeVal(c.flow) }))} `
@@ -740,23 +779,36 @@ async function openContainer(ip) {
   const c = d.current || {};
   $("mTitle").textContent = t("cbox.title", { ip });
   const h = d.history || [];
-  const labels = h.map(x => new Date(x.ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false }));
+  const maxGap = Math.max(60, Number(d.stale_after) || 60);
+  const series = key => {
+    const out = [];
+    h.forEach((r, i) => {
+      if (i && r.ts - h[i - 1].ts > maxGap) out.push({ x: h[i - 1].ts + maxGap, y: null });
+      const n = typeof r[key] === "number" && Number.isFinite(r[key]) ? r[key] : null;
+      out.push({ x: r.ts, y: n }); // Temperatures may be negative; don't use nonnegative power validation.
+    });
+    return out;
+  };
   if (modalChart) modalChart.destroy();
   if (window.Chart) modalChart = new Chart($("mChart"), {
     type: "line",
     data: {
-      labels, datasets: [
-        { label: t("chart.supply"), data: h.map(x => x.supply_temp), borderColor: "#56d4dd", pointRadius: 0, tension: .3 },
-        { label: t("chart.return"), data: h.map(x => x.return_temp), borderColor: "#f0883e", pointRadius: 0, tension: .3 },
-        { label: t("chart.internal"), data: h.map(x => x.internal_temp), borderColor: "#3fb950", pointRadius: 0, tension: .3 }]
+      datasets: [
+        { label: t("chart.supply"), data: series("supply_temp"), borderColor: "#56d4dd", pointRadius: 0, tension: 0 },
+        { label: t("chart.return"), data: series("return_temp"), borderColor: "#f0883e", pointRadius: 0, tension: 0 },
+        { label: t("chart.internal"), data: series("internal_temp"), borderColor: "#3fb950", pointRadius: 0, tension: 0 }]
     },
-    options: { interaction: { mode: "index", intersect: false },
-      scales: { x: { ticks: { color: "#6e7681", maxTicksLimit: 6 } }, y: { ticks: { color: "#6e7681" } } }, plugins: { legend: { labels: { color: "#adbac7" } } } }
+    options: { spanGaps: false, interaction: { mode: "nearest", axis: "x", intersect: false },
+      scales: { x: { type: "linear", ticks: { color: "#6e7681", maxTicksLimit: 6,
+        callback: ts => new Date(ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false }) } }, y: { ticks: { color: "#6e7681" } } },
+      plugins: { legend: { labels: { color: "#adbac7" } }, tooltip: { callbacks: {
+        title: items => items.length ? fmtTime(items[0].parsed.x) : "" } } } }
   });
-  const faults = (c.faults || []).map(f => `<span class="fbadge ${esc(f.sev)}">${esc(containerFaultLabel(f))}</span>`).join("") || t("cbox.none_fault");
+  const faults = (c.faults || []).map(f => containerFaultBadge(f)).join("") || t(containerQuality(c) ? "quality.partial" : "cbox.none_fault");
   const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${esc(containerPumpLabel(k))}:${v ? t("cmd.open") : t("cmd.close")}`).join(" ｜ ");
   $("mInfo").innerHTML =
-    `${esc(t("cbox.detail_temps", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp), set: safeVal(c.set_temp) }))}<br>`
+    (containerQuality(c) ? AntDataQuality.note(t(c.data_stale ? "quality.stale" : "quality.partial"), true) : "")
+    + `${esc(t("cbox.detail_temps", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp), set: safeVal(c.set_temp) }))}<br>`
     + `${esc(t("cbox.detail_press", { sp: safeVal(c.supply_pressure), rp: safeVal(c.return_pressure), f: safeVal(c.flow), ti: safeVal(c.tower_inlet_temp) }))}<br>`
     + `${esc(t("cbox.detail_box", { t: safeVal(c.internal_temp), h: safeVal(c.internal_humidity), n: safeVal(c.miner_num), chip: safeVal(c.chip_max_temp) }))}<br>`
     + `${esc(t("cbox.detail_power", { total: fmtPower(boxPower(c)), p1: fmtPower(c.power1), p2: fmtPower(c.power2) }))}<br>`
@@ -1010,6 +1062,9 @@ function cloudFeedback(key, vars = {}, kind = "muted") {
 }
 function renderCloudLabels() {
   $("cloudCodeHint").textContent = t(_cloudCodeHintKey);
+  $("cloudDestination").textContent = $("cloudUrl").value.trim();
+  $("cloudDestinationRow").classList.toggle("hidden",
+    !_cloudAppliedCode || $("cloudCode").value.trim() !== _cloudAppliedCode);
   $("cloudTokenEye").textContent = t($("cloudToken").type === "password" ? "seg.token_eye" : "seg.token_hide");
   $("cloudToken").placeholder = _cloudSaved && _cloudSaved.token_set
     ? t("seg.token_saved_ph", { hint: _cloudSaved.token_hint || "****" }) : "ingest token";
@@ -1086,7 +1141,7 @@ function applyCloudCode(showError = false) {
   const d = AntMonitorCloud.parseCode(raw);
   if (!d) {
     _cloudCodeHintKey = "cloud.code_hint";
-    if (showError) cloudFeedback("toast.connect_bad", {}, "res-fail");
+    if (showError) cloudFeedback(raw.startsWith("AMC1-") ? "toast.connect_bad" : "cloud.token_only", {}, "res-fail");
     renderCloudLabels();
     return false;
   }
@@ -1270,6 +1325,7 @@ $("cloudBindingForm").onsubmit = connectCloud;
 $("cloudPaste").onclick = pasteCloudAndConnect;
 $("cloudPause").onclick = pauseCloud;
 $("cloudName").addEventListener("input", renderCloudLabels);
+$("cloudUrl").addEventListener("input", renderCloudLabels);
 $("cloudCode").addEventListener("input", () => { cloudFeedback(""); applyCloudCode(); });
 $("cloudCode").addEventListener("paste", event => {
   // On a LAN HTTP page browsers may forbid clipboard reads. After the operator

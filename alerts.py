@@ -186,6 +186,50 @@ class _Batch:
         return self.to_fire
 
 
+def _share_delta(record, bases):
+    """Only difference comparable counters; preserve a separate last sample for resets."""
+    ip = record["ip"]
+    accepted, rejected = (miner_core._counter(record.get(k)) for k in ("accepted", "rejected"))
+    if accepted is None or rejected is None:
+        bases.pop(ip, None)
+        return None
+    basis = record.get("counter_basis") or "legacy-aggregate"
+    samples = record.get("counter_samples")
+    if samples is None:
+        samples = {"aggregate": (accepted, rejected)}
+    if not isinstance(samples, dict) or not samples:
+        bases.pop(ip, None)
+        return None
+    current = {}
+    for key, values in samples.items():
+        if not isinstance(values, (list, tuple)) or len(values) != 2:
+            bases.pop(ip, None)
+            return None
+        a, j = (miner_core._counter(v) for v in values)
+        if a is None or j is None:
+            bases.pop(ip, None)
+            return None
+        current[key] = (a, j)
+    uptime = miner_core._nonnegative(record.get("uptime"))
+    previous = bases.get(ip)
+    reset = not isinstance(previous, dict) or previous.get("basis") != basis
+    if not reset:
+        last = previous["last"]
+        reset = (last.keys() != current.keys()
+                 or any(a < last[key][0] or j < last[key][1] for key, (a, j) in current.items())
+                 or (uptime is not None and previous["uptime"] is not None
+                     and uptime < previous["uptime"]))
+    if reset:
+        bases[ip] = {"basis": basis, "base": current, "last": current, "uptime": uptime}
+        return None  # Pool switch/restart is a new origin, not newly rejected shares.
+    previous["last"] = current
+    if uptime is not None:
+        previous["uptime"] = uptime
+    base = previous["base"]
+    return (sum(a - base[key][0] for key, (a, _) in current.items()),
+            sum(j - base[key][1] for key, (_, j) in current.items()))
+
+
 def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     """对比上一次同类扫描，产生/恢复告警，返回本轮新增告警列表。
 
@@ -197,7 +241,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     state = state if state is not None else {}
     streak = state.setdefault("low_hr_streak", {})
     zero_since = state.setdefault("zero_since", {})   # ip → 连续零算力起始时间
-    shares = state.setdefault("reject_base", {})   # ip → (accepted, rejected) 拒绝率增量基准
+    shares = state.setdefault("reject_base", {})   # ip → 同源的份额基准/最近采样/uptime
     rebooting = state.setdefault("rebooting", {})   # ip → 下发重启的时间(MonitorService.mark_rebooting 写入)
     # 跨轮次确认用的起始时间/计数。大场地网络抖动(交换机重启、STP 收敛、ARP 表刷新)和矿机
     # 网页服务卡顿一两分钟就过去，单轮判定会"报掉线→几分钟后恢复"反复误报，所以掉线/整段
@@ -264,6 +308,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             continue
         seg_total[seg] = seg_total.get(seg, 0) + 1
         if r["status"] == "offline":
+            shares.pop(ip, None)
             seg_off[seg] = seg_off.get(seg, 0) + 1
     down_segments = set()   # 满足整段掉线条件的网段(含确认中)：段内单机告警一律静音
     active_segs = {a["ip"][:-2] for a in db.active_alerts_by_type(conn, "segment_down")
@@ -496,27 +541,20 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         # 拒绝率（矿池健康）：按两次判定之间的份额增量算。矿机给的是开机以来的累计值，
         # 直接用累计值的话，跑了 30 天的机器突然全拒要一天多才报，刚重启 12 个份额拒 1 个
         # 就立刻报。增量不足 reject_min_shares 份额时保留基准继续累积，告警状态不变
-        acc, rej = r.get("accepted"), r.get("rejected")
-        if rej_thresh and rej_thresh > 0 and (acc is not None or rej is not None):
-            a, j = acc or 0, rej or 0
-            base = shares.get(ip)
-            if base is None:
-                shares[ip] = (a, j)            # 首次见到：只记基准
-            else:
-                if a < base[0] or j < base[1]:  # 计数归零(矿机/挖矿程序重启)：当前值就是增量
-                    base = (0, 0)
-                da, dj = a - base[0], j - base[1]
-                if muted:
-                    shares[ip] = (a, j)
+        if rej_thresh and rej_thresh > 0:
+            delta = _share_delta(r, shares)
+            if muted and ip in shares:
+                shares[ip]["base"] = shares[ip]["last"]
+                b.resolve(ip, "reject")
+            elif delta is not None and sum(delta) >= rej_min:
+                da, dj = delta
+                shares[ip]["base"] = shares[ip]["last"]
+                rp = round(dj / (da + dj) * 100, 3)
+                if rp >= rej_thresh:
+                    b.fire(ip, "reject", "warn",
+                           f"{ip} 拒绝率 {rp}% ≥ {rej_thresh}%(最近 {da + dj} 份额)")
+                else:
                     b.resolve(ip, "reject")
-                elif da + dj >= rej_min:
-                    shares[ip] = (a, j)
-                    rp = round(dj / (da + dj) * 100, 3)
-                    if rp >= rej_thresh:
-                        b.fire(ip, "reject", "warn",
-                               f"{ip} 拒绝率 {rp}% ≥ {rej_thresh}%(最近 {da + dj} 份额)")
-                    else:
-                        b.resolve(ip, "reject")
 
     for ip in list(streak):     # 已不在本轮样本内的机器(下架/换IP)：别让计数无限增长
         if ip not in cur:
@@ -584,6 +622,8 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
     existing = db.active_alerts_by_type(conn, like="cooler")
 
     for ip, c in cur.items():
+        observed = c.get("observed_fault_flags")
+        observed = set(observed) if isinstance(observed, list) else None
         # 故障位（忽略列表内的不报警，但仍在卡片显示）
         active = {f"cooler:{f['flag']}": f for f in (c.get("faults") or [])
                   if f["flag"] not in ignore}
@@ -624,23 +664,34 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
         for a in existing:      # 消除已恢复的该箱冷却告警
             if a["ip"] != ip or not a["type"].startswith("cooler:") or a["type"] in active:
                 continue
+            k = (ip, a["type"])
+            flag = a["type"].split(":", 1)[1]
+            software_pressure = a["type"] in {"cooler:supply_pressure_low", "cooler:return_pressure_low_th"}
+            if not software_pressure and observed is not None and flag not in observed and flag not in ignore:
+                clean.pop(k, None)  # 缺测打断“连续正常”，不能把间隔两端拼成恢复证据。
+                continue
             # 压力阈值开着但这轮读不到压力：不是"恢复"的证据，保持原状
             if (a["type"] == "cooler:supply_pressure_low" and sp_min and sp is None) or \
                     (a["type"] == "cooler:return_pressure_low_th" and rp_min and rp is None):
+                clean.pop(k, None)
                 continue
             # 压力还在 hold 确认中：等同"条件仍可能成立"，不要提前消已有告警
             if a["type"] in pending_pressure:
                 continue
-            k = (ip, a["type"])
             need = press_clear if a["type"] in _PRESSURE_ALERT_TYPES else COOLER_CLEAR_SEC
             first_ok = clean.setdefault(k, now)    # 从第一次读到正常开始计时
             if now - first_ok >= need:
                 clean.pop(k, None)
                 b.resolve(ip, a["type"])
-        b.resolve(ip, "cooler_offline")   # 箱体恢复在线
+        if c.get("status") != "unknown":
+            b.resolve(ip, "cooler_offline")   # 取得有效状态，恢复监测。
 
     for ip in known_before:              # 已记住的箱、本次未采到
         if ip not in cur:
+            for timer in (clean, low_since):
+                for key in list(timer):
+                    if key[0] == ip:
+                        timer.pop(key, None)
             # force：与其他冷却 crit 一致不受冷却限制。控制器离线 = 漏液监测失效，
             # 短暂掉线恢复后 30 分钟内再次掉线，不能被冷却推迟
             b.fire(ip, "cooler_offline", "crit", f"集装箱 {ip} 控制器离线", force=True)

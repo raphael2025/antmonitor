@@ -38,6 +38,7 @@ import cloud_alert_summary
 import cloud_connect
 import cloud_report
 import control
+import data_metrics
 import db
 import logs
 import miner_core
@@ -65,7 +66,7 @@ MAIN_LOOP = None
 def _start_cloud_report():
     """(重新)启动云端上报线程，供启动、设置热更新、看门狗自愈共用同一套参数。"""
     return cloud_report.start(CFG, _build_cloud_summary,
-                              lambda hours: db.customer_report(SVC.conn, hours))
+                              _customer_report_packet)
 
 
 @contextlib.asynccontextmanager
@@ -313,8 +314,12 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 def _latest_records():
-    """(scan_meta, records)。records 是共享只读列表——需要改写字段的调用方必须先拷贝。"""
-    return SVC.latest()
+    """Current projection of immutable raw samples; stale measurements remain unknown."""
+    scan, records = SVC.latest()
+    now = time.time()
+    stamp = (scan or {}).get("ts")
+    return scan, [data_metrics.live_record(r, db.record_freshness(r, stamp, now))
+                  for r in records]
 
 
 # ---- 通用短缓存 + 每来源限流 ----
@@ -382,58 +387,66 @@ def api_summary(_: dict = Depends(require_viewer)):
     return {"scanned": True, **_summary_stats(ls, recs), **extra}
 
 
+def _container_stale_after():
+    return max(60, float(CFG.get("schedule", {}).get("container_interval", 10) or 10) * 3)
+
+
+def _current_containers():
+    """Keep raw/last-known evidence, but never call a stalled reader current."""
+    now = time.time()
+    lifetime = _container_stale_after()
+    out = []
+    for original in db.get_containers(SVC.conn):
+        c = dict(original)
+        stamp = data_metrics.measurement(c.get("measured_ts"))
+        if not stamp or stamp > now + 60 or now - stamp > lifetime:
+            c.update(data_status="unknown", data_complete=0, data_stale=True)
+        out.append(c)
+    return out
+
+
+def _container_unknown(c):
+    return bool(c.get("data_stale") or c.get("data_status") == "unknown" or
+                (c.get("online") and c.get("data_complete") != 1))
+
+
 def _container_faulty(c, ignore):
     """该集装箱是否有"未被忽略"的真实故障——口径必须与 alerts.evaluate_containers 一致，
     否则用户明明已经把某个故障位加进忽略列表(不报警)，总览/列表的"故障"计数却还在算它。"""
-    if not c.get("online"):
+    if not c.get("online") or c.get("data_stale"):
         return False
-    if any(f["flag"] not in ignore for f in (c.get("faults") or [])):
+    if any(f["flag"] not in ignore and f.get("observed") is not False for f in (c.get("faults") or [])):
         return True
     # 供/回液压力低也是告警条件(alerts 里按阈值判)：以前卡片标红、告警也报了，"故障 N"却不算它
     a = CFG.get("alerts", {})
     for key, lim in (("supply_pressure", a.get("container_supply_pressure_min", 0) or 0),
                      ("return_pressure", a.get("container_return_pressure_min", 0) or 0)):
-        v = c.get(key)
-        if lim and isinstance(v, (int, float)) and v < lim:
+        v = data_metrics.measurement(c.get(key))
+        if lim and v is not None and v < lim:
             return True
     return False
 
 
 def _summary_stats(ls, recs):
     """/api/summary 与 /api/public/summary 共用的统计口径，保证两边永远一致。"""
-    with_hr, no_hr, _offline = miner_core.rank(recs)
-    by_fw = {}
-    online = 0
-    offline = 0
-    total_power = 0
-    for r in recs:
-        if r["status"] == "online":
-            online += 1
-            by_fw[r["firmware"]] = by_fw.get(r["firmware"], 0) + 1
-            if r.get("power"):
-                total_power += r["power"]
-        elif r["status"] == "offline":
-            offline += 1
-        # status="unknown"(本轮扫描超时没来得及探测)不计入 total/online/offline——
-        # 口径须跟 db.save_scan 一致，否则总览/云端上报的"总数"、"离线数"会被虚高
-    total_hr = round(sum(r["hr_rt"] for r in with_hr), 2) if with_hr else 0.0
-    effs = [r["eff"] for r in with_hr if r.get("eff")]
-    cs = db.get_containers(SVC.conn)
-    total = online + offline
+    stats = data_metrics.aggregate(recs)
+    stamps = [db.record_measured_ts(r, ls.get("ts")) for r in recs]
+    measured = min(stamps) if stamps and all(ts is not None for ts in stamps) else None
+    if not recs:  # A completed empty-inventory scan is known zero at its scan time.
+        measured = ls.get("ts")
+    if stats["unknown"]:
+        measured = None
+    cs = _current_containers()
     ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
     return {
+        **stats,
         "scan_id": ls.get("scan_id"), "scan_ts": ls.get("ts"), "scan_kind": ls.get("kind"),
-        "total": total, "online": online, "offline": offline,
-        "with_hashrate": len(with_hr), "no_hashrate": len(no_hr),
-        "total_hashrate_th": total_hr,
-        "avg_hashrate_th": round(total_hr / len(with_hr), 2) if with_hr else 0,
-        "total_power_kw": round(total_power / 1000, 1),
-        "avg_efficiency": round(sum(effs) / len(effs), 2) if effs else 0,
-        "by_firmware": by_fw,
+        "measurement_ts": measured,
         "active_alerts": db.count_active(SVC.conn),
         "containers": len(cs),
         "containers_faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
-        "containers_offline": sum(1 for c in cs if not c.get("online")),
+        "containers_offline": sum(1 for c in cs if not c.get("online") and not _container_unknown(c)),
+        "containers_unknown": sum(_container_unknown(c) for c in cs),
     }
 
 
@@ -486,36 +499,42 @@ def _build_public_summary():
         base = {"ok": True, "ts": int(time.time()), "progress": SVC.progress}
         if not ls:
             return {**base, "scanned": False,
-                    "online": 0, "offline": 0, "total": 0,
-                    "online_count": 0, "offline_count": 0, "total_count": 0,
-                    "total_hashrate_ths": 0.0, "active_alerts": 0, "miners": []}
+                    "online": None, "offline": None, "total": None, "unknown": None,
+                    "online_count": None, "offline_count": None, "total_count": None,
+                    "total_hashrate_ths": None, "total_power_kw": None,
+                    "hashrate_complete": False, "power_complete": False,
+                    "measurement_ts": None, "active_alerts": None, "miners": []}
         s = _summary_stats(ls, recs)
         # 在线矿机有时能读到算力但读不到矿池名；只补已知身份，不能把客户误清成 0。
         # 正常快照不查名册，保持每轮云端客户实时摘要轻量。
         customer_identity = None
-        if any(not r.get("worker") and r.get("status") in ("online", "unknown") for r in recs):
-            customer_identity = {ip: a["worker"] for ip, a in db.known_identity(SVC.conn).items()
-                                 if a.get("worker")}
+        if any(not r.get("worker") for r in recs):
+            customer_identity = {ip: a.get("worker") or "(未知)"
+                                 for ip, a in db.known_identity(SVC.conn).items()}
         return {
             **base, "scanned": True,
             "scan_id": s["scan_id"], "scan_ts": s["scan_ts"], "scan_kind": s["scan_kind"],
+            "measurement_ts": s["measurement_ts"],
             "total": s["total"], "online": s["online"], "offline": s["offline"],
+            "unknown": s["unknown"],
             "online_count": s["online"], "offline_count": s["offline"],
             "total_count": s["total"],
             "with_hashrate": s["with_hashrate"], "no_hashrate": s["no_hashrate"],
             "total_hashrate_ths": s["total_hashrate_th"],
+            "known_hashrate_ths": s["known_hashrate_ths"],
+            "hashrate_complete": s["hashrate_complete"],
+            "hashrate_known_machines": s["hashrate_known_machines"],
             "avg_hashrate_ths": s["avg_hashrate_th"],
             "total_power_kw": s["total_power_kw"],
+            "known_power_kw": s["known_power_kw"],
+            "power_complete": s["power_complete"],
+            "power_known_machines": s["power_known_machines"],
             "active_alerts": s["active_alerts"],
             "containers": s["containers"], "containers_faulty": s["containers_faulty"],
             "containers_offline": s["containers_offline"],
+            "containers_unknown": s["containers_unknown"],
             "customer_hashrates": db.customer_hashrates(ls, recs, identities=customer_identity),
-            "miners": [{"ip": r["ip"], "model": r.get("model") or "",
-                        "firmware": r.get("firmware") or "",
-                        "status": r.get("status") or "unknown",
-                        "hashrate_ths": round(r.get("hr_rt") or 0.0, 2),
-                        "temp_c": r.get("temp") or 0, "power_w": r.get("power") or 0,
-                        "worker": r.get("worker") or ""} for r in recs],
+            "miners": [_public_miner_row(r) for r in recs],
         }
     except Exception as e:  # noqa: BLE001
         log.exception("build_public_summary error")
@@ -536,14 +555,15 @@ def _build_cloud_summary():
 
 def _public_miner_row(r):
     """单台矿机的 Agent 友好视图（稳定字段名 + 显式单位）。"""
+    r = data_metrics.live_record(r)
     return {
         "ip": r["ip"], "status": r.get("status") or "unknown",
         "firmware": r.get("firmware") or "", "model": r.get("model") or "",
         "sn": r.get("sn") or "", "mac": r.get("mac") or "",
         "worker": r.get("worker") or "",
-        "hashrate_ths": round(r.get("hr_rt") or 0.0, 2),
-        "hashrate_avg_ths": round(r.get("hr_avg") or 0.0, 2),
-        "power_w": r.get("power") or 0, "temp_c": r.get("temp") or 0,
+        "hashrate_ths": r["hr_rt"], "hashrate_avg_ths": r["hr_avg"],
+        "power_w": r["power"], "temp_c": r["temp"],
+        "measured_ts": r.get("measured_ts"), "data_stale": bool(r.get("data_stale")),
         "efficiency_jth": r.get("eff"), "uptime_s": r.get("uptime"),
         "accepted": r.get("accepted"), "rejected": r.get("rejected"),
     }
@@ -610,10 +630,13 @@ def api_public_miners(request: Request, status: str = "", fw: str = "", seg: str
     def build():
         _, recs = _latest_records()
         out = _filter_recs(recs, status, fw, seg, q)
-        online = [r for r in out if r["status"] == "online"]
-        return {"ok": True, "ts": int(time.time()), "count": len(out), "online": len(online),
-                "total_hashrate_ths": round(sum(r["hr_rt"] for r in online if r.get("hr_rt")), 2),
-                "total_power_w": sum(r["power"] for r in online if r.get("power")),
+        stats = data_metrics.aggregate(out)
+        return {"ok": True, "ts": int(time.time()), "count": len(out), "online": stats["online"],
+                "unknown": stats["unknown"],
+                "total_hashrate_ths": stats["total_hashrate_th"],
+                "known_hashrate_ths": stats["known_hashrate_ths"],
+                "hashrate_complete": stats["hashrate_complete"], "power_complete": stats["power_complete"],
+                "total_power_w": None if stats["total_power_kw"] is None else stats["total_power_kw"] * 1000,
                 "miners": [_public_miner_row(r) for r in out[:max(1, limit)]]}
     return _cached(("miners", status, fw, seg, q, limit), 8, build)
 
@@ -626,10 +649,11 @@ def api_public_miner(ip: str, request: Request):
     cur = next((r for r in recs if r["ip"] == ip), None)
     if not cur:
         return {"ok": True, "ts": int(time.time()), "found": False, "ip": ip}
-    hist = [{"ts": h["ts"], "status": h.get("status"),
-             "hashrate_ths": round(h.get("hr_rt") or 0.0, 2),
-             "temp_c": h.get("temp") or 0, "power_w": h.get("power") or 0}
-            for h in db.ip_history(SVC.conn, ip, 200)]
+    hist = []
+    for h in db.ip_history(SVC.conn, ip, 200):
+        point = data_metrics.live_record(h, db.record_freshness(h, h["ts"], h["ts"]))
+        hist.append({"ts": h["ts"], "measured_ts": h.get("measured_ts"), "status": point["status"],
+                     "hashrate_ths": point["hr_rt"], "temp_c": point["temp"], "power_w": point["power"]})
     return {"ok": True, "ts": int(time.time()), "found": True,
             "miner": _public_miner_row(cur), "history": hist}
 
@@ -656,38 +680,62 @@ def api_public_containers(request: Request):
     _check_public_token(request)
 
     def build():
-        cs = db.get_containers(SVC.conn)
+        cs = _current_containers()
         ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
         return {"ok": True, "ts": int(time.time()), "count": len(cs),
                 "faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
-                "offline": sum(1 for c in cs if not c.get("online")),
+                "offline": sum(1 for c in cs if not c.get("online") and not _container_unknown(c)),
+                "unknown": sum(_container_unknown(c) for c in cs),
                 "containers": cs}
     return _cached(("containers",), 8, build)
 
 
 def _report_window(hours):
-    """把请求周期收敛到实际有数据的范围，返回 (生效小时数, 是否被截断)。"""
+    """兼容的历史跨度提示，不能用这个取整数替换实际查询窗口。"""
     cov = db.coverage_hours(SVC.conn) or 1
     eff = min(max(1, int(hours)), cov)
     return eff, eff < hours
 
 
+def _report_end(until_ts=None):
+    """共同的 UTC 十分钟边界；各端必须真的查询同一时间窗才能合计。"""
+    now = int(time.time())
+    if until_ts is None:
+        return now // 600 * 600
+    end = data_metrics.measurement(until_ts)
+    if end is None or end <= 0 or end > now:
+        raise HTTPException(400, "统计截止时间必须是已经过去的有效 Unix 秒数")
+    return int(end)
+
+
+def _customer_report_packet(hours=24, until_ts=None):
+    """One query and its exact window, including a verifiably empty customer list."""
+    hours = max(1, min(8760, int(hours)))
+    end = _report_end(until_ts)
+    rows = _cached(("customers", hours, end), 45,
+                   lambda: db.customer_report(SVC.conn, hours, until_ts=end))
+    # A first query may create hourly archives; report the resulting retained span.
+    eff, truncated = _report_window(hours)
+    return {"hours": hours, "covered_hours": eff, "truncated": truncated,
+            "period_start_ts": end - hours * 3600, "period_end_ts": end,
+            "billing_period_start_ts": end - hours * 3600, "billing_period_end_ts": end,
+            "customers": rows}
+
+
 @app.get("/api/public/customers")
-def api_public_customers(request: Request, hours: int = 24):
+def api_public_customers(request: Request, hours: int = 24, until_ts: float = None):
     """客户实时/时段平均算力、有效观测覆盖，以及兼容的计费报表字段。"""
     _check_public_token(request)
     hours = max(1, min(8760, hours))   # 顺手封顶，避免任意 hours 撑爆缓存键空间
-    eff, truncated = _report_window(hours)
+    end = _report_end(until_ts)
 
     def build():   # 最重的查询, 缓存 45 秒(报表变化慢)
-        return {"ok": True, "ts": int(time.time()), "hours": hours,
-                "covered_hours": eff, "truncated": truncated,
-                "customers": db.customer_report(SVC.conn, eff, hashrate_hours=hours)}
+        return {"ok": True, "ts": int(time.time()), **_customer_report_packet(hours, end)}
     # 缓存槽位必须按**原始入参 hours** 区分：响应里带了 hours/truncated 两个随原始入参
     # 变化的字段，若按收敛后的 eff 做键，hours=20 与 hours=21(都收敛到 eff=20)会互相
     # 拿到对方的元数据。另外键名与 /api/reports/customers 的 ("customers", eff) 区分开
     # ——那边缓存的是裸行列表，同键会让两个端点互相返回对方的数据结构。
-    return _cached(("public_customers", hours), 45, build)
+    return _cached(("public_customers", hours, end), 45, build)
 
 
 # ---- 会话 API ----
@@ -705,11 +753,12 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
     _, recs = _latest_records()
     repair = db.repair_ips(SVC.conn)
     out = _filter_recs(recs, status, fw, seg, q, repair=repair)
-    online = [r for r in out if r["status"] == "online"]
-    agg = {"count": len(out), "online": len(online),
-           "offline": sum(1 for r in out if r["status"] == "offline"),
-           "total_hr": round(sum(r["hr_rt"] for r in online if r.get("hr_rt")), 2),
-           "total_power": sum(r["power"] for r in online if r.get("power"))}
+    stats = data_metrics.aggregate(out)
+    agg = {"count": len(out), "online": stats["online"], "offline": stats["offline"],
+           "unknown": stats["unknown"], "total_hr": stats["total_hashrate_th"],
+           "known_hashrate_ths": stats["known_hashrate_ths"],
+           "hashrate_complete": stats["hashrate_complete"], "power_complete": stats["power_complete"],
+           "total_power": None if stats["total_power_kw"] is None else stats["total_power_kw"] * 1000}
     if sort not in _SORT_FIELDS:   # 防任意字段排序产生空/错误结果
         sort = "hr_rt"
     rev = order == "desc"
@@ -729,40 +778,46 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
 
 @app.get("/api/workers")
 def api_workers(_: dict = Depends(require_viewer)):
-    """按矿工名(矿池User)聚合在线矿机：总台数 / 总算力 / 机型分布。"""
+    """同一完整快照内的已知客户机器；离线/未知不从客户名下消失。"""
     _, recs = _latest_records()
+    identities = {ip: r.get("worker") for ip, r in db.known_identity(SVC.conn).items()}
     agg = {}
     for r in recs:
-        if r["status"] != "online":
-            continue
-        w = r.get("worker") or "(未知)"
+        w = r.get("worker") or identities.get(r["ip"]) or "(未知)"
         model = r.get("model") or "Unknown"
-        a = agg.setdefault(w, {"worker": w, "total": 0, "hashrate": 0.0, "models": {}})
-        a["total"] += 1
-        if r.get("hr_rt"):
-            a["hashrate"] = round(a["hashrate"] + r["hr_rt"], 2)
+        a = agg.setdefault(w, {"worker": w, "models": {}, "_records": []})
+        a["_records"].append(r)
         a["models"][model] = a["models"].get(model, 0) + 1
+    for a in agg.values():
+        stats = data_metrics.aggregate(a.pop("_records"))
+        a.update(total=stats["total"], online=stats["online"], unknown=stats["unknown"],
+                 hashrate=stats["total_hashrate_th"], known_hashrate_ths=stats["known_hashrate_ths"],
+                 hashrate_complete=stats["hashrate_complete"])
     out = sorted(agg.values(), key=lambda x: x["total"], reverse=True)
     return {"workers": out, "count": len(out)}
 
 
 @app.get("/api/reports/customers")
-def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(require_viewer)):
+def api_report_customers(hours: int = 24, format: str = "", until_ts: float = None,
+                         _: dict = Depends(require_viewer)):
     hours = max(1, min(8760, hours))
-    eff, truncated = _report_window(hours)
-    rows = _cached(("customers", hours, eff), 45,
-                   lambda: db.customer_report(SVC.conn, eff, hashrate_hours=hours))
+    packet = _customer_report_packet(hours, until_ts)
+    end, rows = packet["period_end_ts"], packet["customers"]
     if format == "csv":   # 对客户出账：UTF-8 BOM 的 CSV(Excel 直接打开不乱码)
         import csv as _csv
         import io
         buf = io.StringIO()
         buf.write("﻿")
         w = _csv.writer(buf)
-        days = round(eff / 24, 1)
-        w.writerow([f"客户报表  数据覆盖近 {days} 天" + ("（已按可用数据截断）" if truncated else "")])
-        w.writerow(["客户(矿工名)", "周期内峰值机器数", "可用率%", "交付算力(TH·h)", "耗电(kWh)",
+        w.writerow([f"客户报表  请求 {hours} 小时，截止 Unix 秒 {end}；各指标有效覆盖见明细，耗电为监控估算"])
+        w.writerow(["客户(矿工名)", "报表机器数(口径见台数来源列)", "可用率%", "交付算力(TH·h)", "耗电(kWh)",
                     "当前机器数", "实时算力(TH/s)", f"近{hours}小时观测平均算力(TH/s)",
-                    "有效观测(小时)", "观测覆盖率%", "实时采样时间(Unix秒)"])
+                    "有效观测(小时)", "观测覆盖率%", "实时采样时间(Unix秒)",
+                    "统计开始(Unix秒)", "统计截止(Unix秒)", "计费窗口(小时)", "计费数据来源",
+                    "交付有效时长(小时)", "交付覆盖率%", "功率有效时长(小时)", "功率覆盖率%",
+                    "在线状态有效时长(小时)", "在线状态覆盖率%",
+                    "旧口径交付(TH·h,未验证)", "旧口径耗电(kWh,未验证)", "旧口径可用率%(未验证)",
+                    "台数来源(observed=已观测同时峰值,legacy=旧报表计数)"])
         def cell(v):   # 矿工名来自矿机(可被篡改)：= + - @ 开头会被 Excel 当公式执行
             s = str(v or "")
             return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
@@ -771,21 +826,29 @@ def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(re
             w.writerow([cell(r["worker"]), r["machines"], r["uptime_pct"],
                         r["delivered_th_h"], r["power_kwh"], r.get("current_machines"),
                         r.get("hashrate_ths"), r.get("avg_hashrate_ths"),
-                        r.get("observed_hours"), r.get("coverage_pct"), r.get("hashrate_ts")])
+                        r.get("observed_hours"), r.get("coverage_pct"), r.get("hashrate_ts"),
+                        r.get("period_start_ts"), r.get("period_end_ts"),
+                        r.get("billing_hours"), r.get("billing_source"),
+                        r.get("delivery_observed_hours"), r.get("delivery_coverage_pct"),
+                        r.get("power_observed_hours"), r.get("power_coverage_pct"),
+                        r.get("uptime_observed_hours"), r.get("uptime_coverage_pct"),
+                        r.get("legacy_delivered_th_h"), r.get("legacy_power_kwh"), r.get("legacy_uptime_pct"),
+                        r.get("machines_source")])
         return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition":
-                                 f'attachment; filename="customers_{eff}h.csv"'})
-    return {"hours": hours, "covered_hours": eff, "truncated": truncated, "customers": rows}
+                                 f'attachment; filename="customers_{hours}h.csv"'})
+    return packet
 
 
 @app.get("/api/containers")
 def api_containers(_: dict = Depends(require_viewer)):
-    cs = db.get_containers(SVC.conn)
+    cs = _current_containers()
     acfg = CFG.get("alerts", {})
     ignore = set(acfg.get("container_faults_ignore", []))
     return {"count": len(cs),
             "faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
-            "offline": sum(1 for c in cs if not c.get("online")),
+            "offline": sum(1 for c in cs if not c.get("online") and not _container_unknown(c)),
+            "unknown": sum(_container_unknown(c) for c in cs),
             "containers": cs,
             "faults_ignore": acfg.get("container_faults_ignore", []),
             "supply_pressure_min": acfg.get("container_supply_pressure_min", 0),
@@ -801,8 +864,9 @@ def api_containers_scan(_: dict = Depends(require_ops)):
 
 @app.get("/api/container/{ip}")
 def api_container(ip: str, _: dict = Depends(require_viewer)):
-    cur = next((c for c in db.get_containers(SVC.conn) if c["ip"] == ip), None)
-    return {"current": cur, "history": db.container_history(SVC.conn, ip)}
+    cur = next((c for c in _current_containers() if c["ip"] == ip), None)
+    return {"current": cur, "history": db.container_history(SVC.conn, ip),
+            "stale_after": _container_stale_after()}
 
 
 @app.get("/api/racks")
@@ -839,21 +903,24 @@ def api_racks(_: dict = Depends(require_viewer)):
     out = []
     for seg in sorted(by_seg, key=lambda n: tuple(int(x) for x in n.split("."))):
         hosts = by_seg[seg]
-        slots, cnt, hr_sum = [], {}, 0.0
+        slots, cnt, rack_records = [], {}, []
         for h in range(hs, he + 1):
             r = hosts.get(h)
             st = state(r)
             cnt[st] = cnt.get(st, 0) + 1
-            if r and r.get("hr_rt"):
-                hr_sum += r["hr_rt"]
+            if r:
+                rack_records.append(r)
             slots.append({"h": h, "ip": f"{seg}.{h}", "st": st,
                           "hr": (r.get("hr_rt") if r else None),
                           "temp": (r.get("temp") if r else None)})
+        stats = data_metrics.aggregate(rack_records)
         out.append({"name": seg, "slots": slots,
                     "online": cnt.get("ok", 0) + cnt.get("zero", 0),
                     "abnormal": cnt.get("zero", 0), "offline": cnt.get("offline", 0),
                     "empty": cnt.get("empty", 0), "unknown": cnt.get("unknown", 0),
-                    "hashrate": round(hr_sum, 2)})
+                    "hashrate": stats["total_hashrate_th"],
+                    "known_hashrate_ths": stats["known_hashrate_ths"],
+                    "hashrate_complete": stats["hashrate_complete"]})
     return {"racks": out}
 
 
@@ -861,7 +928,9 @@ def api_racks(_: dict = Depends(require_viewer)):
 def api_miner(ip: str, _: dict = Depends(require_viewer)):
     _, recs = _latest_records()
     cur = next((r for r in recs if r["ip"] == ip), None)
-    return {"current": cur, "history": db.ip_history(SVC.conn, ip)}
+    history = [data_metrics.live_record(h, db.record_freshness(h, h["ts"], h["ts"]))
+               for h in db.ip_history(SVC.conn, ip)]
+    return {"current": cur, "history": history}
 
 
 @app.post("/api/alerts/ack")
