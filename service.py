@@ -296,44 +296,124 @@ class MonitorService:
 
     def _maybe_auto_reboot_zero(self, targets):
         import control
-        allowed, skipped = control.filter_reboot_targets(self.conn, targets, self.cfg)
-        user = "system@auto-zero-reboot"
-        if skipped:
-            db.log_commands(self.conn, user, "reboot", skipped)
-            log.info("零算力自动重启限流跳过 %d 台", len(skipped))
-        if not allowed:
-            return
+        import updater
         if not self._reboot_lock.acquire(blocking=False):
-            log.info("零算力自动重启跳过: 已有重启任务在执行(%d 台待重启)", len(allowed))
+            log.info("零算力自动重启跳过: 已有重启任务在执行(%d 台待重启)", len(targets))
             return
-        threading.Thread(target=self._run_auto_zero_reboot, args=(allowed, user),
-                         daemon=True, name="auto-zero-reboot").start()
+        started = False
+        try:
+            if updater.is_applying():
+                log.info("零算力自动重启推迟: 程序正在更新或等待重启")
+                return
+            # 与手动重启共用锁，限流必须在拿锁后查，才看得到上一批刚写入的审计。
+            control.flush_reboot_audit(self)
+            allowed, skipped = control.filter_reboot_targets(self.conn, targets, self.cfg)
+            user = "system@auto-zero-reboot"
+            if skipped:
+                db.log_commands(self.conn, user, "reboot", skipped)
+                log.info("零算力自动重启限流跳过 %d 台", len(skipped))
+            if not allowed:
+                return
+            threading.Thread(target=self._run_auto_zero_reboot, args=(allowed, user),
+                             daemon=True, name="auto-zero-reboot").start()
+            started = True  # 后台线程接管锁；启动失败或全被限流则由本线程释放。
+        finally:
+            if not started:
+                self._reboot_lock.release()
+
+    def _filter_auto_zero_group(self, targets):
+        """分批等待期间状态可能已变；只给仍满足自动重启条件的机器下发命令。"""
+        import control
+        ctl = self.cfg.get("control") or {}
+        stopped = getattr(self, "_stop", None)
+        if not ctl.get("enabled") or not ctl.get("reboot_enabled") or (stopped and stopped.is_set()):
+            return [], [{"ip": ip, "ok": False, "skipped": True,
+                         "msg": "零算力自动重启已关闭或服务正在停止，未下发"} for ip, _fw in targets]
+
+        now = time.time()
+        meta, records = self.latest()
+        scan_ts = (meta or {}).get("ts")
+        current = {r["ip"]: r for r in records}
+        roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
+        repair = db.repair_ips(self.conn)
+        states = db.zero_reboot_states(self.conn)
+        active_segments = {a["ip"][:-2] for a in db.active_alerts_by_type(self.conn, "segment_down")
+                           if a["ip"].endswith(".x")}
+        paused = self._alert_state.get("zero_mass_segs") or set()
+        rebooting = self._alert_state.get("rebooting") or {}
+        rb_grace = int(ctl.get("reboot_grace_sec", 600))
+        grace = int((self.cfg.get("alerts") or {}).get("zero_grace_sec", 600) or 0)
+        eligible, skipped = [], []
+        for ip, firmware in targets:
+            row, st = current.get(ip), states.get(ip)
+            seg = ".".join(ip.split(".")[:3])
+            reason = ""
+            if ip in repair:
+                reason = "机器已标记维修"
+            elif ip not in roster:
+                reason = "机器已移出监控名册"
+            elif not row or not db.record_freshness(row, scan_ts, now):
+                reason = "最新采样缺失或已过期"
+            elif row.get("status") != "online" or data_metrics.measurement(row.get("hr_rt")) != 0:
+                reason = "最新采样已不是在线零算力"
+            elif seg in active_segments or seg in paused:
+                reason = "网段故障或成片零算力事件，自动重启已暂停"
+            elif now - int(rebooting.get(ip, 0) or 0) < rb_grace:
+                reason = "机器仍在重启静默期"
+            elif (grace and isinstance(row.get("uptime"), (int, float))
+                  and row["uptime"] < grace):
+                reason = "机器仍在开机宽限期"
+            elif not st or int(st.get("attempts") or 0) >= 4:
+                reason = "零算力计时已取消或自动尝试已达上限"
+            elif now < int(st.get("last_attempt_at") or st["started_at"]) + 900:
+                reason = "尚未到下一次自动重启时间"
+            if reason:
+                skipped.append({"ip": ip, "ok": False, "skipped": True,
+                                "msg": f"{reason}，未下发"})
+            else:
+                eligible.append((ip, row.get("firmware") or firmware))
+        # 本方法只在 _run_auto_zero_reboot 持锁时调用；再次限流也覆盖等待期间调整的配置。
+        allowed, limited = control.filter_reboot_targets(self.conn, eligible, self.cfg)
+        skipped.extend({**r, "skipped": True} for r in limited)
+        return allowed, skipped
 
     def _run_auto_zero_reboot(self, targets, user):
         import control
         try:
+            def filter_group(group):
+                allowed, skipped = self._filter_auto_zero_group(group)
+                if skipped:
+                    db.log_commands(self.conn, user, "reboot", skipped)
+                return allowed, skipped
+
             def after_group(group, results):
                 # Count each attempted command, including a definite device-side failure;
                 # otherwise a dead miner would be hammered on every 5-minute scan.
-                ips = [r["ip"] for r in results]
-                db.record_zero_reboot_attempts(self.conn, ips, int(time.time()))
+                ips = [r["ip"] for r in results if not r.get("skipped")]
                 self.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
                 # 逐批写审计：中途进程退出(更新重启)也不丢已下发的记录，限流照样有效
-                db.log_commands(self.conn, user, "reboot", results)
+                # 先缓存真实命令结果，持久化异常时下一请求须先补记，不能当作从未重启。
+                try:
+                    control.audit_reboot_results(self, user, results)
+                finally:
+                    db.record_zero_reboot_attempts(self.conn, ips, int(time.time()))
 
             results, err = control.run_batch(targets, "reboot", {}, self.cfg,
                                              before_group=self.mark_rebooting,
-                                             after_group=after_group)
+                                             after_group=after_group,
+                                             filter_group=filter_group)
             if err:
                 self.unmark_rebooting([ip for ip, _fw in targets])
                 log.warning("零算力自动重启批次错误: %s", err)
-            if results:
-                ok_n = sum(1 for r in results if r["ok"])
-                log.info("零算力自动重启完成: 尝试 %d 台，已下发 %d 台", len(results), ok_n)
+            attempted = [r for r in results if not r.get("skipped")]
+            if attempted:
+                ok_n = sum(1 for r in attempted if r["ok"])
+                log.info("零算力自动重启完成: 尝试 %d 台，已下发 %d 台，跳过 %d 台",
+                         len(attempted), ok_n, len(results) - len(attempted))
                 try:
                     alerts.push_text(
                         self.cfg,
-                        f"⚙ {user} 自动重启 {len(results)} 台(成功 {ok_n})")
+                        f"⚙ {user} 自动重启 {len(attempted)} 台(成功 {ok_n})")
                 except Exception:  # noqa: BLE001
                     log.exception("零算力自动重启推送失败")
         except Exception as e:  # noqa: BLE001

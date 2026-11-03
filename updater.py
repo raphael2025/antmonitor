@@ -44,6 +44,16 @@ HEALTHY_AFTER_SEC = 60
 # 同一份工作区(TOCTOU)，自检结果不可信。取不到锁就直接拒绝，绝不排队等待。
 _apply_lock = threading.Lock()
 
+
+def is_applying():
+    """包含已安排重启的阶段。重启命令须在持有自己的共享锁时检查此状态。
+
+    apply 先持更新锁，再由 BUSY_CHECK 检查重启锁；新重启先持重启锁，再检查这里。
+    两个方向一起约束，避免更新通过一次忙碌检查后又插入新的分批重启任务。
+    """
+    return _apply_lock.locked()
+
+
 # 由 server 注册：返回非空字符串 = 现在不宜更新(例如分批重启正在执行)，本次更新推迟。
 # 更新会重启进程，分批重启跑到一半被打断，后面几批就不执行了
 BUSY_CHECK = None

@@ -1001,9 +1001,11 @@ async function pollCmdProgress(onlyIfRunning) {
       _cmdPollTimer = setTimeout(pollCmdProgress, 3000);
     } else if (p.total) {
       document.title = t("doc.title");
-      let msg = t("cmd.batch_done", { ok: p.success, fail: p.failed, total: p.total });
+      let msg = p.error
+        ? `${p.error}\n${t("cmd.result", { act: p.action, ok: p.success, fail: p.failed })}`
+        : t("cmd.batch_done", { ok: p.success, fail: p.failed, total: p.total });
       if (p.fail_ips && p.fail_ips.length) msg += t("cmd.fail_ips", { ips: p.fail_ips.slice(0, 8).join(", ") });
-      toast(msg, p.failed ? "fail" : "ok");
+      toast(msg, p.failed || p.error ? "fail" : "ok");
       refreshMiners();
     }
   } catch (e) { if (!_wsStop) _cmdPollTimer = setTimeout(pollCmdProgress, 5000); }

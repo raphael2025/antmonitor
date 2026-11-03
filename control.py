@@ -10,6 +10,7 @@
 import ipaddress
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -21,6 +22,27 @@ import appconfig
 import miner_core
 
 ACTIONS = {"reboot", "locate", "set_pools"}
+
+
+def flush_reboot_audit(svc):
+    """共享重启锁内调用；未写入的执行记录补记成功前，不再允许新的重启。"""
+    import db
+    pending = getattr(svc, "_pending_reboot_audit", [])
+    while pending:
+        ts, user, results = pending[0]
+        db.log_commands(svc.conn, user, "reboot", results, ts=ts)
+        pending.pop(0)
+
+
+def audit_reboot_results(svc, user, results):
+    """先保留原执行时刻和结果，防磁盘/审计故障后同一进程把已下发误当未下发。"""
+    if not results:
+        return
+    pending = getattr(svc, "_pending_reboot_audit", None)
+    if pending is None:
+        pending = svc._pending_reboot_audit = []
+    pending.append((int(time.time()), user, [dict(result) for result in results]))
+    flush_reboot_audit(svc)
 
 
 def filter_reboot_targets(conn, targets, cfg):
@@ -339,9 +361,12 @@ def run_one(ip, firmware, action, params, cfg):
         miner_core._local.no_register = True
         try:
             rec = miner_core.probe(ip, cfg["scan"])
+            firmware = rec.get("firmware")
+        except Exception as e:  # 一台识别失败不能丢掉同组其他机器已经执行的结果。
+            return {"ip": ip, "ok": False, "skipped": True,
+                    "msg": f"识别固件失败，未下发命令: {e}"}
         finally:
             miner_core._local.no_register = False
-        firmware = rec.get("firmware")
 
     try:
         if firmware == "stock":
@@ -356,19 +381,52 @@ def run_one(ip, firmware, action, params, cfg):
 
 
 def _run_group(group, action, params, cfg):
-    out = []
+    # 结果由每个 worker 独立保存，不能等整组所有 future 成功才返回。
+    # submit 也可能先把任务放入队列、再因线程启动失败抛异常；退出 executor 等待
+    # 已排入任务结束后，才能确定哪些机器确实没有执行，不能盲目重发整批。
+    results, futures = {}, []
+    result_lock = threading.Lock()
+    submit_error = ""
+
+    def invoke(ip, firmware):
+        try:
+            result = run_one(ip, firmware, action, params, cfg)
+        except Exception as e:
+            result = {"ip": ip, "ok": False, "uncertain": True,
+                      "msg": f"执行异常，结果未确认，请检查机器状态: {e}"}
+        with result_lock:
+            results[ip] = result
+        return result
+
     with ThreadPoolExecutor(max_workers=min(64, max(4, len(group)))) as ex:
-        futs = [ex.submit(run_one, ip, fw, action, params, cfg) for ip, fw in group]
-        for f in futs:
-            out.append(f.result())
-    return out
+        for ip, fw in group:
+            try:
+                future = ex.submit(invoke, ip, fw)
+            except Exception as e:
+                submit_error = str(e)
+                break
+            futures.append((ip, future))
+        for ip, future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                # 包括执行器级异常；一台失败时仍收集其他 future 的结果。
+                with result_lock:
+                    results.setdefault(ip, {"ip": ip, "ok": False, "uncertain": True,
+                                             "msg": f"执行结果未确认，请检查机器状态: {e}"})
+    return [results.get(ip) or {"ip": ip, "ok": False, "skipped": True,
+                               "msg": f"任务未能启动，未下发命令: {submit_error}"}
+            for ip, _fw in group]
 
 
-def run_batch(targets, action, params, cfg, progress=None, before_group=None, after_group=None):
+def run_batch(targets, action, params, cfg, progress=None, before_group=None, after_group=None,
+              filter_group=None):
     """targets: [(ip, firmware), ...]；并发执行，返回结果列表。
     reboot 时按 control.reboot_* 打乱+分批+延迟，避免同变压器机器同时重启的浪涌跳闸。
     progress(done, total) 可选回调(后台异步执行时上报进度)。
-    before_group(ips) 在每组下发前调用；after_group(targets, results) 在一组完成后调用。"""
+    before_group(ips) 在每组下发前调用；after_group(targets, results) 在一组完成后调用。
+    filter_group(group) 可在真正下发前复核，返回 (允许目标, 跳过结果)。跳过项计入
+    总体结果/进度，但不会触发 before_group/after_group 或算成一次重启尝试。"""
     if action not in ACTIONS:
         return [], "不支持的命令"
     ctl = cfg.get("control", {})
@@ -376,29 +434,27 @@ def run_batch(targets, action, params, cfg, progress=None, before_group=None, af
     batch = int(ctl.get("reboot_concurrency", 0) or 0) if action == "reboot" else 0
     delay = float(ctl.get("reboot_delay_sec", 0) or 0)
 
-    out = []
     if batch and batch > 0 and len(targets) > batch:
         if ctl.get("reboot_shuffle", True):
             random.shuffle(targets)   # 打乱：把同变压器的连号机器分散到不同批次/时间
         groups = [targets[i:i + batch] for i in range(0, len(targets), batch)]
-        for gi, grp in enumerate(groups):
+    else:
+        groups = [targets]
+    out = []
+    for gi, grp in enumerate(groups):
+        if filter_group:
+            grp, skipped = filter_group(grp)
+            out.extend(skipped)
+        if grp:
             if before_group:
                 before_group([ip for ip, _fw in grp])
             group_results = _run_group(grp, action, params, cfg)
             out.extend(group_results)
             if after_group:
                 after_group(grp, group_results)
-            if progress:
-                progress(len(out), len(targets))
-            if delay and gi < len(groups) - 1:
-                time.sleep(delay)
-    else:
-        if before_group:
-            before_group([ip for ip, _fw in targets])
-        out = _run_group(targets, action, params, cfg)
-        if after_group:
-            after_group(targets, out)
         if progress:
             progress(len(out), len(targets))
+        if grp and delay and gi < len(groups) - 1:
+            time.sleep(delay)
     out.sort(key=lambda r: tuple(int(x) for x in r["ip"].split(".")) if r["ip"].count(".") == 3 else (0,))
     return out, ""

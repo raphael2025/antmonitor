@@ -109,9 +109,9 @@ def _startup_selfcheck():
         weak = auth.weak_default_users(CFG)
         if weak:
             log.error("=" * 64)
-            log.error("安全警告: 用户 %s 仍在使用默认弱口令(admin888 等)", weak)
-            log.error("这些账号只能在本机 http://127.0.0.1:%d 登录，登录后网页会强制改密码；"
-                      "或运行 `python auth.py passwd 用户名` 设置", CFG["server"]["port"])
+            log.error("账号配置提醒: 用户 %s 存在默认弱口令、明文口令或尚未设置密码", weak)
+            log.error("弱口令登录只提示修改，仍保留该账号的角色权限。请在网页修改密码；"
+                      "空口令/示例占位符不能登录，可运行 `python auth.py passwd 用户名` 设置后重启服务")
             log.error("=" * 64)
     else:
         log.warning("auth.enabled=false：任何人可匿名只读访问面板")
@@ -1248,7 +1248,7 @@ def _audit_reject(user, action, reason):
 
 # 批量重启后台进度(分批+延迟会耗时，异步执行，前端轮询)
 CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
-                "success": 0, "failed": 0, "fail_ips": [], "user": ""}
+                "success": 0, "failed": 0, "fail_ips": [], "user": "", "error": ""}
 # 重启互斥锁挂在 SVC 上(手动 API 与零算力自动重启共用)，见 MonitorService._reboot_lock
 
 
@@ -1274,7 +1274,10 @@ def _audit_command(user, action, params, results):
         desc = _pools_desc(params)
         for r in results:
             r["msg"] = f'{r["msg"]} | {desc}'[:500]
-    db.log_commands(SVC.conn, user, action, results)
+    if action == "reboot":
+        control.audit_reboot_results(SVC, user, results)
+    else:
+        db.log_commands(SVC.conn, user, action, results)
 
 
 def _record_command(user, action, params, results, audited=False):
@@ -1295,37 +1298,67 @@ def _record_command(user, action, params, results, audited=False):
 
 
 def _run_command_bg(targets, action, params, user, skipped=None):
+    # 逐批保留执行结果：异常中断时已完成的机器不能变回“0 成功 / 0 失败”。
+    results_by_ip = {r["ip"]: r for r in (skipped or [])}
+    attempted = set()
+    error = ""
+
+    def update_progress():
+        rows = list(results_by_ip.values())
+        CMD_PROGRESS.update({
+            "done": len(rows), "total": len(targets) + len(skipped or []),
+            "success": sum(1 for r in rows if r["ok"]),
+            "failed": sum(1 for r in rows if not r["ok"]),
+            "fail_ips": [r["ip"] for r in rows if not r["ok"]][:100],
+            "error": error,
+        })
+
     try:
-        def prog(done, total):
-            CMD_PROGRESS["done"] = done
-            CMD_PROGRESS["total"] = total
+        def before_group(ips):
+            attempted.update(ips)
+            SVC.mark_rebooting(ips)
+
         def after_group(_grp, group_results):
             # 逐批写审计：分批重启要跑好几分钟，等全部跑完才记的话，中途进程退出(更新重启/
             # 断电)会丢掉已重启机器的记录，24h 次数上限和 15 分钟间隔对它们就失效了
+            results_by_ip.update((r["ip"], r) for r in group_results)
             SVC.unmark_rebooting([r["ip"] for r in group_results if not r["ok"]])
             _audit_command(user, action, params, group_results)
+            update_progress()
 
         if skipped:
             _audit_command(user, action, params, skipped)
-        results, _err = control.run_batch(targets, action, params, CFG, progress=prog,
-                                          before_group=SVC.mark_rebooting,
-                                          after_group=after_group)
-        all_results = list(skipped or []) + list(results)
-        _record_command(user, action, params, all_results, audited=True)
-        ok_n = sum(1 for r in results if r["ok"])
-        fail_n = len(results) - ok_n + len(skipped or [])
-        CMD_PROGRESS["success"] = ok_n
-        CMD_PROGRESS["failed"] = fail_n
-        CMD_PROGRESS["fail_ips"] = (
-            [r["ip"] for r in (skipped or []) if not r["ok"]]
-            + [r["ip"] for r in results if not r["ok"]])[:100]
-        log.info("批量 %s 完成: 成功 %d / 失败 %d (发起人 %s, 限流跳过 %d)",
-                 action, ok_n, fail_n, user, len(skipped or []))
+        update_progress()
+        results, err = control.run_batch(targets, action, params, CFG,
+                                         before_group=before_group, after_group=after_group)
+        results_by_ip.update((r["ip"], r) for r in results)
+        if err:
+            raise RuntimeError(err)
     except Exception as e:  # noqa: BLE001
+        error = "批量任务已中断，请检查未完成机器的状态后再操作"
+        unresolved = []
+        for ip, _fw in targets:
+            if ip not in results_by_ip:
+                sent = ip in attempted
+                unresolved.append({"ip": ip, "ok": False, "uncertain": sent,
+                                   "msg": "执行结果未确认，请检查机器状态" if sent
+                                   else "任务已中断，未下发"})
+        results_by_ip.update((r["ip"], r) for r in unresolved)
+        # 未下发的目标不能继续静默；已经开始请求但没有结果的目标保留重启宽限期。
+        SVC.unmark_rebooting([r["ip"] for r in unresolved if not r["uncertain"]])
+        try:
+            _audit_command(user, action, params, unresolved)
+        except Exception:
+            log.exception("批量中断结果审计写入失败")
         log.exception("async command error: %s", e)
     finally:
+        update_progress()
+        success, failed = CMD_PROGRESS["success"], CMD_PROGRESS["failed"]
         CMD_PROGRESS["running"] = False
         SVC._reboot_lock.release()
+    _record_command(user, action, params, list(results_by_ip.values()), audited=True)
+    log.info("批量 %s %s: 成功 %d / 未成功 %d (发起人 %s)",
+             action, "中断" if error else "完成", success, failed, user)
 
 
 @app.get("/api/command/progress")
@@ -1422,55 +1455,78 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
     _, recs = _latest_records()
     fw_map = {r["ip"]: r["firmware"] for r in recs}
     targets = [(ip, fw_map.get(ip, "")) for ip in ips]
-    skipped = []
     if action == "reboot":
-        # 手动与自动共用 15min/24h 限流：超限 IP 跳过并记审计，不打断整批
-        targets, skipped = control.filter_reboot_targets(SVC.conn, targets, CFG)
-        ips = [t[0] for t in targets]
-        if not targets:
-            _record_command(user, action, params, skipped)
-            return {"ok": True, "action": action, "success": 0,
-                    "failed": len(skipped), "results": skipped, "skipped": len(skipped)}
-    log.info("命令 %s: %d 台(限流跳过 %d), 发起人 %s", action, len(targets), len(skipped), user)
-    # 重启且开启分批(打乱+延迟会耗时) → 后台异步执行，前端轮询 /api/command/progress
-    ctl = CFG.get("control", {})
-    rb = int(ctl.get("reboot_concurrency", 0) or 0)
-    if action == "reboot" and rb > 0 and len(targets) > rb:
+        # 限流查询、下发、成功审计必须在同一个共享锁内。
+        # 在锁外先查限流时，并发请求能拿着旧配额依次抢锁，重复重启同一台。
         if not SVC._reboot_lock.acquire(blocking=False):
             _audit_reject(user, action, "已有批量命令在执行")
             return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
                                 status_code=409)
-        SVC.mark_rebooting(ips)
-        CMD_PROGRESS.update({"running": True, "action": action, "done": 0,
-                             "total": len(targets) + len(skipped), "success": 0, "failed": 0,
-                             "fail_ips": [], "user": user})
-        threading.Thread(target=_run_command_bg,
-                         args=(targets, action, params, user, skipped),
-                         daemon=True).start()
-        return {"ok": True, "async": True, "action": action, "count": len(targets),
-                "skipped": len(skipped), "batch": rb, "delay": ctl.get("reboot_delay_sec", 0)}
-    if action == "reboot":
-        # 小批量同步重启也要占锁：否则异步分批跑着时再提交几批 ≤reboot_concurrency 的，
-        # 会和当前批次同时上电，绕过防浪涌分批；也挡住自动重启撞车
-        if not SVC._reboot_lock.acquire(blocking=False):
-            _audit_reject(user, action, "已有批量命令在执行")
-            return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
-                                status_code=409)
+        background_owns_lock = False
+        results, skipped = [], []
         try:
+            if updater.is_applying():
+                return JSONResponse({"ok": False, "error": "程序正在更新或等待重启，请更新完成后再执行矿机重启"},
+                                    status_code=409)
+            # 上轮命令已下发但审计失败时，先按原执行时刻补记；失败则继续阻止新命令。
+            control.flush_reboot_audit(SVC)
+            targets, skipped = control.filter_reboot_targets(SVC.conn, targets, CFG)
+            ips = [ip for ip, _fw in targets]
+            ctl = CFG.get("control", {})
+            rb = int(ctl.get("reboot_concurrency", 0) or 0)
+            log.info("命令 %s: %d 台(限流跳过 %d), 发起人 %s",
+                     action, len(targets), len(skipped), user)
+            if rb > 0 and len(targets) > rb:
+                CMD_PROGRESS.update({"running": True, "action": action, "done": 0,
+                                     "total": len(targets) + len(skipped), "success": 0,
+                                     "failed": 0, "fail_ips": [], "user": user, "error": ""})
+                try:
+                    threading.Thread(target=_run_command_bg,
+                                     args=(targets, action, params, user, skipped),
+                                     daemon=True).start()
+                except Exception:
+                    CMD_PROGRESS.update({"running": False, "done": len(targets) + len(skipped),
+                                         "failed": len(targets) + len(skipped),
+                                         "fail_ips": (ips + [r["ip"] for r in skipped])[:100],
+                                         "error": "任务未能启动，没有下发重启命令"})
+                    log.exception("启动批量重启线程失败")
+                    return JSONResponse({"ok": False, "error": CMD_PROGRESS["error"]},
+                                        status_code=503)
+                background_owns_lock = True
+                return {"ok": True, "async": True, "action": action, "count": len(targets),
+                        "skipped": len(skipped), "batch": rb,
+                        "delay": ctl.get("reboot_delay_sec", 0)}
             SVC.mark_rebooting(ips)
-            results, err = control.run_batch(targets, action, params, CFG,
-                                             before_group=SVC.mark_rebooting)
-            SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
+            if targets:
+                results, err = control.run_batch(targets, action, params, CFG,
+                                                 before_group=SVC.mark_rebooting)
+                SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
+                if err:
+                    return JSONResponse({"ok": False, "error": err}, status_code=400)
+            # 审计落库后才放开锁；Telegram 推送在锁外进行。
+            _audit_command(user, action, params, skipped + results)
+        except Exception:
+            ok_n = sum(1 for r in results if r["ok"])
+            log.exception("重启任务或审计失败，已确认下发 %d 台", ok_n)
+            if results:
+                message = (f"已确认下发 {ok_n} 台，但执行记录保存失败；"
+                           "已暂停新的重启，记录恢复后自动解除，请勿重复下发")
+            elif getattr(SVC, "_pending_reboot_audit", None):
+                message = "上次重启记录尚未保存，暂不下发新命令；请检查数据库或磁盘状态后重试"
+            else:
+                message = "重启执行结果未确认，请检查机器状态后再操作"
+            return JSONResponse({"ok": False, "error": message, "success": ok_n,
+                                 "results": results}, status_code=503)
         finally:
-            SVC._reboot_lock.release()
-        if err:
-            return JSONResponse({"ok": False, "error": err}, status_code=400)
+            if not background_owns_lock:
+                SVC._reboot_lock.release()
         all_results = skipped + results
-        _record_command(user, action, params, all_results)
+        _record_command(user, action, params, all_results, audited=True)
         ok_n = sum(1 for r in results if r["ok"])
         return {"ok": True, "action": action, "success": ok_n,
                 "failed": len(all_results) - ok_n, "results": all_results,
                 "skipped": len(skipped)}
+    log.info("命令 %s: %d 台, 发起人 %s", action, len(targets), user)
     results, err = control.run_batch(targets, action, params, CFG)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
