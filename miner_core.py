@@ -410,23 +410,27 @@ def fetch_pool(ip, timeout):
         pools = d.get("POOLS") or []
         if not isinstance(pools, list) or not all(isinstance(p, dict) for p in pools):
             return None
-        # 只统计活跃池(Status=Alive)：备用/失活池的历史拒绝份额会把拒绝率顶过阈值误报；
-        # worker 也取活跃池中优先级最高(Priority 最小)的主池，避免归属到备用池的异名 worker。
+        # 份额只统计可用池(Status=Alive)：备用/失活池的历史拒绝份额会误报。
+        # 客户归属独立按第一配置矿池读取，不能随主备池连通状态切换。
         active = [p for p in pools
                   if str(p.get("Status") or p.get("status") or "").lower() == "alive"]
         use = active or pools   # 无活跃池(全挂)则回退全部，至少still报点东西
 
         def _prio(p):
-            try:
-                return int(p.get("Priority", p.get("priority", 999)))
-            except (TypeError, ValueError):
-                return 999
+            value = _counter(p.get("Priority", p.get("priority")))
+            return value if value is not None else math.inf
 
-        worker = None
-        for p in sorted(use, key=_prio):
-            u = p.get("User") or p.get("user")
-            if isinstance(u, str) and u and worker is None:
-                worker = u.split(".", 1)[0].strip()   # 去掉 .25x146 后缀
+        # switchpool 会改变运行 Priority，POOL 配置槽位仍保持不变。
+        # 部分槽位缺失时，不能把唯一有编号的备用池误当成第一配置矿池。
+        slots = [_counter(p.get("POOL", p.get("pool"))) for p in pools]
+        primary = next((p for p, slot in zip(pools, slots) if slot == 0), None)
+        if primary is None and slots and all(slot is not None for slot in slots):
+            primary = pools[min(range(len(pools)), key=lambda i: slots[i])]
+        if primary is None:
+            primary = min(pools, key=_prio, default=None)  # 同优先级保持配置返回顺序
+        user = primary.get("User", primary.get("user")) if primary is not None else None
+        # 主池账户缺失就交给 service 按矿机身份回填，不能跳到备用池认出新客户。
+        worker = (user.split(".", 1)[0].strip() or None) if isinstance(user, str) else None
         totals = {key: [] for key in ("Accepted", "Rejected", "Stale")}
         samples = {}
         for p in use:
