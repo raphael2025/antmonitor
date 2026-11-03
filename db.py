@@ -836,8 +836,8 @@ def resolve_alerts_for(conn, ips, types=None, like=None):
                          f"AND ip IN ({qm}) AND type LIKE ?", (ts, *ips, like + "%"))
 
 
-def log_commands(conn, user, action, results):
-    ts = int(time.time())
+def log_commands(conn, user, action, results, ts=None):
+    ts = int(time.time()) if ts is None else int(ts)
     with _wlock, conn:
         conn.executemany(
             "INSERT INTO command_log(ts,user,action,ip,ok,msg) VALUES(?,?,?,?,?,?)",
