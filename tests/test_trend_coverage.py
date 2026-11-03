@@ -94,15 +94,21 @@ def test_persisted_coverage_preserves_original_validity_and_does_not_reread_snap
     assert not any("FROM snapshots" in q for q in queries)
 
 
-def test_old_partial_recovers_only_same_scan_evidence_without_rewriting_history(conn, monkeypatch):
+def test_old_partial_stays_unknown_without_reinterpreting_snapshots_or_rewriting_history(conn, monkeypatch):
     save(conn, monkeypatch, [rec("10.0.0.1", hr=999), rec("10.0.0.2", hr=999)])
     sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=None)], offset=300)
     clear_new_metadata(conn, sid)
     before = tuple(conn.execute("SELECT * FROM scans WHERE scan_id=?", (sid,)).fetchone())
     raw = [tuple(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?", (sid,))]
-    point = db.hashrate_trend(conn, 1)[0]
+    queries = []
+    conn.set_trace_callback(queries.append)
+    try:
+        point = db.hashrate_trend(conn, 1)[0]
+    finally:
+        conn.set_trace_callback(None)
     assert point["ts"] == BASE + 300 and point["total_hr"] is None
-    assert point["known_total_hr"] == 300 and point["hashrate_known_machines"] == 1
+    assert point["known_total_hr"] is point["hashrate_known_machines"] is None
+    assert not any("FROM snapshots" in q for q in queries)
     assert tuple(conn.execute("SELECT * FROM scans WHERE scan_id=?", (sid,)).fetchone()) == before
     assert [tuple(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?", (sid,))] == raw
 
@@ -115,6 +121,26 @@ def test_old_partial_with_contradictory_complete_recalculation_stays_unknown(con
     # missing total is evidence against treating this as a complete reading.
     point = db.hashrate_trend(conn)[0]
     assert point["total_hr"] is point["known_total_hr"] is point["hashrate_known_machines"] is None
+
+
+@pytest.mark.parametrize("invalid,stored_value", [("9000", 9000), (True, 1), (False, 0)])
+def test_old_partial_cannot_recover_converted_invalid_value_with_another_missing_reading(
+        conn, monkeypatch, invalid, stored_value):
+    # A third, missing reading keeps recalculation partial with unchanged
+    # online counts, so aggregate completeness/status checks cannot detect
+    # the lost source type. Only newly saved coverage is valid evidence.
+    sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=invalid),
+                                   rec("10.0.0.3", hr=None)])
+    new = db.hashrate_trend(conn)[0]
+    assert new["total_hr"] is None
+    assert new["known_total_hr"] == 300 and new["hashrate_known_machines"] == 1
+    stored = conn.execute("SELECT hr_rt,typeof(hr_rt) FROM snapshots WHERE scan_id=? AND ip=?",
+                          (sid, "10.0.0.2")).fetchone()
+    assert tuple(stored) == (stored_value, "real")
+    clear_new_metadata(conn, sid)
+    old = db.hashrate_trend(conn)[0]
+    assert old["online"] == old["total"] == 3 and old["unknown"] == 0
+    assert old["total_hr"] is old["known_total_hr"] is old["hashrate_known_machines"] is None
 
 
 def test_old_partial_with_changed_status_counts_stays_unknown(conn, monkeypatch):
@@ -142,13 +168,13 @@ def test_old_partial_without_complete_snapshot_set_remains_unknown(conn, monkeyp
     assert point["total"] == 2
 
 
-def test_old_partial_recovery_obeys_original_measurement_time(conn, monkeypatch):
+def test_old_partial_with_original_measurement_time_still_lacks_coverage_evidence(conn, monkeypatch):
     sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300),
                                    rec("10.0.0.2", hr=200, measured_ts=BASE-901)])
     clear_new_metadata(conn, sid)
     monkeypatch.setattr(db.time, "time", lambda: BASE + 86400)
     point = db.hashrate_trend(conn)[0]
-    assert point["known_total_hr"] == 300 and point["hashrate_known_machines"] == 1
+    assert point["known_total_hr"] is point["hashrate_known_machines"] is None
     assert point["ts"] == BASE and point["total_hr"] is None
 
 

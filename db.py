@@ -679,14 +679,12 @@ def hashrate_trend(conn, limit=288):
     # 完整手动扫描与库存事件都是有效状态边界，按真实时间显示而非等间隔样本。
     reader = _r(conn)
     rows = reader.execute(
-        "SELECT scan_id,ts,total,total_hr,online,offline,unknown,known_total_hr,hashrate_known_machines "
+        "SELECT ts,total,total_hr,online,unknown,known_total_hr,hashrate_known_machines "
         "FROM scans WHERE kind IN ('full','quick','manual','inventory') "
         "ORDER BY scan_id DESC LIMIT ?", (limit,)).fetchall()
     out = []
     for r in reversed(rows):
         d = dict(r)
-        scan_id = d.pop("scan_id")
-        offline = d.pop("offline")
         legacy = d["unknown"] is None
         d["legacy_total_hr"] = d["total_hr"] if legacy else None
         d["legacy_online"] = d["online"] if legacy else None
@@ -695,20 +693,12 @@ def hashrate_trend(conn, limit=288):
             d["total_hr"] = d["online"] = None
             d["known_total_hr"] = d["hashrate_known_machines"] = None
         elif d["hashrate_known_machines"] is None:
-            # 升级前已校验的完整总量可直接复用；部分读数仅从本轮原始快照恢复。
-            # 不在启动时全库回填，不写回旧账，也不借前后轮次或接收时间补造采样。
+            # 升级前已校验的完整总量可直接复用。旧部分缺测没有覆盖元数据，
+            # 且 REAL 快照已丢失源类型，不能证明数字串/bool 当时是有效读数。
+            # 因此保留空缺，不从快照重算小计，也不回填或改写历史。
+            d["known_total_hr"] = d["total_hr"]
             if d["total_hr"] is not None:
-                d["known_total_hr"] = d["total_hr"]
                 d["hashrate_known_machines"] = d["total"]
-            elif isinstance(d["total"], int) and d["total"] >= 0:
-                records = [dict(row) for row in reader.execute(
-                    "SELECT status,hr_rt,measured_ts FROM snapshots WHERE scan_id=?", (scan_id,))]
-                if len(records) == d["total"]:
-                    totals = _scan_totals(records, d["ts"])
-                    # REAL 亲和性可能把早先非法的 bool/数字串转成数值，源类型已丢失。
-                    # 原总量缺失但重算完整，或状态计数变化，都说明证据冲突；不能提级。
-                    if totals[4] is None and totals[1:4] == (d["online"], offline, d["unknown"]):
-                        d["known_total_hr"], d["hashrate_known_machines"] = totals[-2:]
         if not legacy and d["unknown"]:
             d["online"] = None  # 确认在线的部分计数不能冒充完整在线总数。
         d["data_quality"] = "legacy" if legacy else "incomplete" if d["total_hr"] is None else "complete"
