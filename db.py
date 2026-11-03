@@ -636,17 +636,37 @@ def remove_miners(conn, ips):
     with _wlock, conn:
         conn.executemany("DELETE FROM known_miners WHERE ip=?", [(ip,) for ip in ips])
         # 下架是此刻的库存事件，不能倒改几分钟前的原始采样或结算依据。
-        last = conn.execute("SELECT scan_id,ts FROM scans ORDER BY scan_id DESC LIMIT 1").fetchone()
+        last = conn.execute("SELECT * FROM scans ORDER BY scan_id DESC LIMIT 1").fetchone()
         if last:
+            source = [dict(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?",
+                                                   (last["scan_id"],)).fetchall()]
+            source_totals = _scan_totals(source, last["ts"])
+            source_complete = isinstance(last["total"], int) and len(source) == last["total"]
+            states_match = source_totals[:4] == tuple(last[k] for k in
+                                                     ("total", "online", "offline", "unknown"))
+            if last["hashrate_known_machines"] is None:
+                # 旧完整总量可作为证据；旧 partial/legacy 不能从 REAL 快照重建有效性。
+                hash_matches = (last["known_total_hr"] is None and last["total_hr"] is not None
+                                and source_totals[4] == last["total_hr"])
+            else:
+                # 必须在删除前、按原采样轮次核对，避免下架恰好隐藏矛盾的源记录。
+                hash_matches = source_totals[4:] == tuple(last[k] for k in
+                    ("total_hr", "known_total_hr", "hashrate_known_machines"))
+            source_trusted = source_complete and states_match and hash_matches
             removed = set(ips)
-            remaining = [dict(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?",
-                                                      (last["scan_id"],)).fetchall() if r["ip"] not in removed]
+            remaining = [r for r in source if r["ip"] not in removed]
             for r in remaining:
                 if r.get("measured_ts") is None:
                     r["measured_ts"] = last["ts"]  # 旧记录不能借库存事件刷新采样时间。
                 if not record_freshness(r, last["ts"], last["ts"]):
                     r["status"] = "unknown"  # 原轮次已不可信的时刻，不能经库存事件恢复为有效。
             totals = _scan_totals(remaining, ts)
+            if not source_complete:
+                # 缺快照不能把剩下的行数冒充完整库存；NULL 也阻止后续下架伪造空场。
+                totals = (None, *totals[1:4], None, None, None)
+            elif remaining and not source_trusted:
+                totals = (*totals[:4], None, None, None)
+            # 原集合完整且已全部移除，可证明空库存为 0/0，不依赖旧算力值。
             cur = conn.execute("INSERT INTO scans(ts,kind,total,online,offline,unknown,total_hr,known_total_hr,"
                                "hashrate_known_machines) VALUES(?,?,?,?,?,?,?,?,?)",
                                (ts, "inventory", *totals))

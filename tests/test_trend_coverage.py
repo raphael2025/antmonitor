@@ -195,7 +195,7 @@ def test_legacy_snapshot_is_not_promoted_to_verified_partial(conn):
     assert point["total_hr"] is point["known_total_hr"] is point["hashrate_known_machines"] is None
 
 
-@pytest.mark.parametrize("age", [300, 901])
+@pytest.mark.parametrize("age", [300, 900, 901])
 def test_inventory_event_keeps_timestamp_and_rechecks_coverage(conn, monkeypatch, age):
     save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=None)])
     monkeypatch.setattr(db.time, "time", lambda: BASE + age)
@@ -206,6 +206,112 @@ def test_inventory_event_keeps_timestamp_and_rechecks_coverage(conn, monkeypatch
     assert point["hashrate_known_machines"] == (1 if age <= 900 else 0)
     assert point["unknown"] == (0 if age <= 900 else 1)
     assert db.scan_records(conn, db.latest_scan(conn)["scan_id"])[0]["measured_ts"] == BASE
+
+
+@pytest.mark.parametrize("old_metadata", [False, True])
+@pytest.mark.parametrize("invalid", ["9000", True, False])
+def test_inventory_never_promotes_converted_invalid_readings(conn, monkeypatch, old_metadata, invalid):
+    sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=invalid),
+                                   rec("10.0.0.3", hr=None), rec("10.0.0.4", hr=200)])
+    if old_metadata:
+        clear_new_metadata(conn, sid)
+    original = tuple(conn.execute("SELECT * FROM scans WHERE scan_id=?", (sid,)).fetchone())
+    raw = [tuple(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?", (sid,))]
+    # Removing an unrelated valid miner must not turn the coerced source value
+    # into a measured subtotal. Later removals cannot restore lost provenance.
+    for offset, ip, total in [(10, "10.0.0.4", 3), (20, "10.0.0.2", 2), (30, "10.0.0.3", 1)]:
+        monkeypatch.setattr(db.time, "time", lambda: BASE + offset)
+        db.remove_miners(conn, [ip])
+        point = db.hashrate_trend(conn, 1)[0]
+        assert point["total"] == total
+        assert point["total_hr"] is point["known_total_hr"] is point["hashrate_known_machines"] is None
+        assert all(r["measured_ts"] == BASE for r in db.scan_records(conn, db.latest_scan(conn)["scan_id"]))
+    assert tuple(conn.execute("SELECT * FROM scans WHERE scan_id=?", (sid,)).fetchone()) == original
+    assert [tuple(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?", (sid,))] == raw
+
+
+def test_inventory_preserves_verified_partial_zero_offline_and_empty_readings(conn, monkeypatch):
+    save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=200),
+                            rec("10.0.0.3", hr=None), rec("10.0.0.4", status="offline")])
+    for offset, ip, total, full, subtotal, known in [
+            (10, "10.0.0.2", 3, None, 300, 2), (20, "10.0.0.3", 2, 300, 300, 2),
+            (30, "10.0.0.1", 1, 0, 0, 1), (40, "10.0.0.4", 0, 0, 0, 0)]:
+        monkeypatch.setattr(db.time, "time", lambda: BASE + offset)
+        db.remove_miners(conn, [ip])
+        point = db.hashrate_trend(conn, 1)[0]
+        assert (point["total"], point["total_hr"], point["known_total_hr"],
+                point["hashrate_known_machines"]) == (total, full, subtotal, known)
+
+
+def test_inventory_can_inherit_an_old_verified_complete_scan(conn, monkeypatch):
+    sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=200)])
+    clear_new_metadata(conn, sid)
+    monkeypatch.setattr(db.time, "time", lambda: BASE + 10)
+    db.remove_miners(conn, ["10.0.0.2"])
+    point = db.hashrate_trend(conn, 1)[0]
+    assert point["total_hr"] == point["known_total_hr"] == 300
+    assert point["hashrate_known_machines"] == point["total"] == 1
+
+
+def test_inventory_checks_the_entire_source_before_removing_rows(conn, monkeypatch):
+    sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=200)])
+    clear_new_metadata(conn, sid)
+    conn.execute("UPDATE snapshots SET hr_rt=9000 WHERE scan_id=? AND ip='10.0.0.2'", (sid,))
+    conn.commit()
+    monkeypatch.setattr(db.time, "time", lambda: BASE + 10)
+    db.remove_miners(conn, ["10.0.0.2"])
+    point = db.hashrate_trend(conn, 1)[0]
+    assert point["total"] == 1
+    assert point["total_hr"] is point["known_total_hr"] is point["hashrate_known_machines"] is None
+
+
+@pytest.mark.parametrize("source_kind", ["old_partial", "legacy_complete"])
+def test_inventory_without_hash_evidence_stays_unknown_until_proven_empty(conn, monkeypatch, source_kind):
+    sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300),
+                                   rec("10.0.0.2", hr=None if source_kind == "old_partial" else 200),
+                                   rec("10.0.0.3", hr=100)])
+    clear_new_metadata(conn, sid)
+    if source_kind == "legacy_complete":
+        conn.execute("UPDATE scans SET unknown=NULL WHERE scan_id=?", (sid,))
+        conn.commit()
+    monkeypatch.setattr(db.time, "time", lambda: BASE + 10)
+    db.remove_miners(conn, ["10.0.0.3"])
+    point = db.hashrate_trend(conn, 1)[0]
+    assert point["total"] == 2
+    assert point["total_hr"] is point["known_total_hr"] is point["hashrate_known_machines"] is None
+    # Inventory membership is complete even though source hash validity is not.
+    monkeypatch.setattr(db.time, "time", lambda: BASE + 20)
+    db.remove_miners(conn, ["10.0.0.1", "10.0.0.2"])
+    empty = db.hashrate_trend(conn, 1)[0]
+    assert empty["total_hr"] == empty["known_total_hr"] == 0
+    assert empty["hashrate_known_machines"] == empty["total"] == 0
+
+
+@pytest.mark.parametrize("first_removed", ["10.0.0.1", "10.0.0.99"])
+def test_inventory_missing_source_rows_cannot_become_empty_after_repeated_removals(conn, monkeypatch, first_removed):
+    sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=200)])
+    conn.execute("DELETE FROM snapshots WHERE scan_id=? AND ip='10.0.0.2'", (sid,))
+    conn.commit()
+    for offset, ips in [(10, [first_removed]), (20, ["10.0.0.1", "10.0.0.2"])]:
+        monkeypatch.setattr(db.time, "time", lambda: BASE + offset)
+        db.remove_miners(conn, ips)
+        point = db.hashrate_trend(conn, 1)[0]
+        assert point["total"] is None
+        assert point["total_hr"] is point["known_total_hr"] is point["hashrate_known_machines"] is None
+    # A subsequent actual scan supplies new, independently verified evidence.
+    save(conn, monkeypatch, [rec("10.0.0.1", hr=300)], offset=30)
+    restored = db.hashrate_trend(conn, 1)[0]
+    assert restored["total_hr"] == restored["known_total_hr"] == 300
+    assert restored["hashrate_known_machines"] == restored["total"] == 1
+
+
+def test_inventory_of_an_already_empty_scan_remains_verified_zero(conn, monkeypatch):
+    save(conn, monkeypatch, [])
+    monkeypatch.setattr(db.time, "time", lambda: BASE + 10)
+    db.remove_miners(conn, ["10.0.0.99"])
+    point = db.hashrate_trend(conn, 1)[0]
+    assert point["total_hr"] == point["known_total_hr"] == 0
+    assert point["hashrate_known_machines"] == point["total"] == 0
 
 
 def test_upgrade_adds_nullable_columns_without_backfilling_history(tmp_path):
