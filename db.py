@@ -118,7 +118,9 @@ CREATE TABLE IF NOT EXISTS scans (
     online  INTEGER,
     offline INTEGER,
     unknown INTEGER,
-    total_hr REAL
+    total_hr REAL,
+    known_total_hr REAL,
+    hashrate_known_machines INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_scans_ts ON scans(ts);
 CREATE INDEX IF NOT EXISTS idx_scans_kind_ts ON scans(kind, ts);
@@ -276,6 +278,8 @@ def init_db(path):
         _try(conn, "ALTER TABLE snapshots ADD COLUMN mac TEXT")
         _try(conn, "ALTER TABLE snapshots ADD COLUMN measured_ts REAL")
         _try(conn, "ALTER TABLE scans ADD COLUMN unknown INTEGER")
+        _try(conn, "ALTER TABLE scans ADD COLUMN known_total_hr REAL")
+        _try(conn, "ALTER TABLE scans ADD COLUMN hashrate_known_machines INTEGER")
         _try(conn, "ALTER TABLE known_miners ADD COLUMN state TEXT DEFAULT 'active'")
         _try(conn, "ALTER TABLE known_miners ADD COLUMN mac TEXT DEFAULT ''")
         for col in ("model TEXT DEFAULT ''", "sn TEXT DEFAULT ''",
@@ -329,8 +333,10 @@ def _scan_totals(records, ts):
     unknown = len(records) - online - offline
     rates = [0.0 if state == "offline" else _measurement(r.get("hr_rt"))
              if state == "online" else None for r, state in zip(records, states)]
-    total_hr = round(sum(rates), 2) if all(v is not None for v in rates) else None
-    return len(records), online, offline, unknown, total_hr
+    known_rates = [v for v in rates if v is not None]
+    known_total_hr = round(sum(known_rates), 2) if known_rates or not records else None
+    total_hr = known_total_hr if len(known_rates) == len(records) else None
+    return len(records), online, offline, unknown, total_hr, known_total_hr, len(known_rates)
 
 
 def save_scan(conn, kind, records, keep_ips=None):
@@ -349,7 +355,8 @@ def save_scan(conn, kind, records, keep_ips=None):
     totals = _scan_totals(kept_src, ts)
     with _wlock, conn:
         cur = conn.execute(
-            "INSERT INTO scans(ts,kind,total,online,offline,unknown,total_hr) VALUES(?,?,?,?,?,?,?)",
+            "INSERT INTO scans(ts,kind,total,online,offline,unknown,total_hr,known_total_hr,"
+            "hashrate_known_machines) VALUES(?,?,?,?,?,?,?,?,?)",
             (ts, kind, *totals),
         )
         sid = cur.lastrowid
@@ -629,18 +636,39 @@ def remove_miners(conn, ips):
     with _wlock, conn:
         conn.executemany("DELETE FROM known_miners WHERE ip=?", [(ip,) for ip in ips])
         # 下架是此刻的库存事件，不能倒改几分钟前的原始采样或结算依据。
-        last = conn.execute("SELECT scan_id,ts FROM scans ORDER BY scan_id DESC LIMIT 1").fetchone()
+        last = conn.execute("SELECT * FROM scans ORDER BY scan_id DESC LIMIT 1").fetchone()
         if last:
+            source = [dict(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?",
+                                                   (last["scan_id"],)).fetchall()]
+            source_totals = _scan_totals(source, last["ts"])
+            source_complete = isinstance(last["total"], int) and len(source) == last["total"]
+            states_match = source_totals[:4] == tuple(last[k] for k in
+                                                     ("total", "online", "offline", "unknown"))
+            if last["hashrate_known_machines"] is None:
+                # 旧完整总量可作为证据；旧 partial/legacy 不能从 REAL 快照重建有效性。
+                hash_matches = (last["known_total_hr"] is None and last["total_hr"] is not None
+                                and source_totals[4] == last["total_hr"])
+            else:
+                # 必须在删除前、按原采样轮次核对，避免下架恰好隐藏矛盾的源记录。
+                hash_matches = source_totals[4:] == tuple(last[k] for k in
+                    ("total_hr", "known_total_hr", "hashrate_known_machines"))
+            source_trusted = source_complete and states_match and hash_matches
             removed = set(ips)
-            remaining = [dict(r) for r in conn.execute("SELECT * FROM snapshots WHERE scan_id=?",
-                                                      (last["scan_id"],)).fetchall() if r["ip"] not in removed]
+            remaining = [r for r in source if r["ip"] not in removed]
             for r in remaining:
                 if r.get("measured_ts") is None:
                     r["measured_ts"] = last["ts"]  # 旧记录不能借库存事件刷新采样时间。
                 if not record_freshness(r, last["ts"], last["ts"]):
                     r["status"] = "unknown"  # 原轮次已不可信的时刻，不能经库存事件恢复为有效。
             totals = _scan_totals(remaining, ts)
-            cur = conn.execute("INSERT INTO scans(ts,kind,total,online,offline,unknown,total_hr) VALUES(?,?,?,?,?,?,?)",
+            if not source_complete:
+                # 缺快照不能把剩下的行数冒充完整库存；NULL 也阻止后续下架伪造空场。
+                totals = (None, *totals[1:4], None, None, None)
+            elif remaining and not source_trusted:
+                totals = (*totals[:4], None, None, None)
+            # 原集合完整且已全部移除，可证明空库存为 0/0，不依赖旧算力值。
+            cur = conn.execute("INSERT INTO scans(ts,kind,total,online,offline,unknown,total_hr,known_total_hr,"
+                               "hashrate_known_machines) VALUES(?,?,?,?,?,?,?,?,?)",
                                (ts, "inventory", *totals))
             conn.executemany(
                 "INSERT INTO snapshots(scan_id," + ",".join(SNAP_COLS) + ") VALUES(" +
@@ -669,8 +697,11 @@ def ip_history(conn, ip, limit=200):
 
 def hashrate_trend(conn, limit=288):
     # 完整手动扫描与库存事件都是有效状态边界，按真实时间显示而非等间隔样本。
-    rows = _r(conn).execute("SELECT ts,total_hr,online,unknown FROM scans WHERE kind IN ('full','quick','manual','inventory') "
-                            "ORDER BY scan_id DESC LIMIT ?", (limit,)).fetchall()
+    reader = _r(conn)
+    rows = reader.execute(
+        "SELECT ts,total,total_hr,online,unknown,known_total_hr,hashrate_known_machines "
+        "FROM scans WHERE kind IN ('full','quick','manual','inventory') "
+        "ORDER BY scan_id DESC LIMIT ?", (limit,)).fetchall()
     out = []
     for r in reversed(rows):
         d = dict(r)
@@ -680,7 +711,15 @@ def hashrate_trend(conn, limit=288):
         d["known_online"] = d["online"] if not legacy else None
         if legacy:
             d["total_hr"] = d["online"] = None
-        elif d["unknown"]:
+            d["known_total_hr"] = d["hashrate_known_machines"] = None
+        elif d["hashrate_known_machines"] is None:
+            # 升级前已校验的完整总量可直接复用。旧部分缺测没有覆盖元数据，
+            # 且 REAL 快照已丢失源类型，不能证明数字串/bool 当时是有效读数。
+            # 因此保留空缺，不从快照重算小计，也不回填或改写历史。
+            d["known_total_hr"] = d["total_hr"]
+            if d["total_hr"] is not None:
+                d["hashrate_known_machines"] = d["total"]
+        if not legacy and d["unknown"]:
             d["online"] = None  # 确认在线的部分计数不能冒充完整在线总数。
         d["data_quality"] = "legacy" if legacy else "incomplete" if d["total_hr"] is None else "complete"
         out.append(d)

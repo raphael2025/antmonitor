@@ -413,8 +413,8 @@ function trendYScale(data) {
   data = data.filter(v => v != null && Number.isFinite(v));
   if (!data.length) return {};
   const lo = Math.min(...data), hi = Math.max(...data);
-  const mid = (lo + hi) / 2 || 1;
-  const span = Math.max(hi - lo, Math.abs(mid) * 0.08);
+  const mid = (lo + hi) / 2;
+  const span = Math.max(hi - lo, (Math.abs(mid) || 1) * 0.08);
   const pad = span * 0.15;
   return { min: Math.max(0, mid - span / 2 - pad), max: mid + span / 2 + pad };
 }
@@ -422,32 +422,63 @@ function trendYScale(data) {
 async function refreshTrend() {
   const d = await jget("/api/trend?points=288");
   const pts = d.trend || [];
-  const values = pts.flatMap(p => [p.total_hr, p.legacy_total_hr]).filter(v => AntDataQuality.number(v) != null);
+  const measurements = pts.map(p => {
+    const full = AntDataQuality.number(p.total_hr), known = AntDataQuality.number(p.known_total_hr);
+    const count = AntDataQuality.number(p.hashrate_known_machines), total = AntDataQuality.number(p.total);
+    const partial = p.data_quality !== "legacy" && full == null && known != null &&
+      Number.isInteger(count) && Number.isInteger(total) && count > 0 && count < total;
+    return { x: p.ts, y: full ?? (partial ? known : null), partial,
+      known: count, total, legacy: AntDataQuality.number(p.legacy_total_hr) };
+  });
+  const values = measurements.flatMap(p => [p.y, p.legacy]).filter(v => v != null);
   const { div, unit } = hashUnit(values.length ? Math.max(...values) : 0);
-  const line = key => {
-    const points = AntDataQuality.points(pts, "ts", key, div), out = [];
-    points.forEach((p, i) => {
-      if (i && p.x - points[i - 1].x > 900) out.push({ x: points[i - 1].x + 900, y: null });
-      out.push(p);
-    });
-    return out;
-  };
-  const data = line("total_hr"), legacy = line("legacy_total_hr");
+  const observed = [];
+  let hasGap = measurements.some(p => p.y == null && p.legacy == null);
+  measurements.forEach((p, i) => {
+    if (i && p.x - measurements[i - 1].x > 900) {
+      observed.push({ x: measurements[i - 1].x + 900, y: null, legacy: null, partial: false });
+      hasGap = true;
+    }
+    observed.push({ ...p, y: p.y == null ? null : p.y / div });
+  });
+  const data = observed.map(p => ({ ...p, y: p.partial ? null : p.y }));
+  const legacy = observed.map(p => ({ x: p.x, y: p.legacy == null ? null : p.legacy / div }));
+  const hasPartial = observed.some(p => p.partial);
   const hasLegacy = legacy.some(p => p.y != null);
-  const datasets = [{ label: t("card.total_hr"), data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: 0, pointRadius: 0, borderWidth: 2 }];
-  if (hasLegacy) datasets.push({ label: t("quality.legacy"), data: legacy, borderColor: "#8b949e", borderDash: [5, 4], pointRadius: 0, borderWidth: 2, tension: 0 });
-  const yScale = trendYScale([...data, ...legacy].map(p => p.y));
+  const isolatedRadius = points => c => points[c.dataIndex]?.y != null &&
+    points[c.dataIndex - 1]?.y == null && points[c.dataIndex + 1]?.y == null ? 2 : 0;
+  const datasets = [{ label: t("card.total_hr"), data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: 0, pointRadius: isolatedRadius(data), borderWidth: 2 }];
+  if (hasPartial) datasets.push({ label: t("trend.partial"), data: observed, trendPartial: true,
+    borderColor: "#d97706", backgroundColor: "#d97706", borderDash: [5, 4], fill: false,
+    tension: 0, borderWidth: 2, pointRadius: c => c.raw?.partial ? 2 : 0,
+    pointHoverRadius: c => c.raw?.partial ? 4 : 0,
+    // Complete samples anchor adjacent partial segments. Their own segments stay
+    // transparent and their tooltip rows are filtered, so totals are drawn once.
+    segment: { borderColor: c => observed[c.p0DataIndex]?.partial || observed[c.p1DataIndex]?.partial
+      ? "#d97706" : "transparent" } });
+  if (hasLegacy) datasets.push({ label: t("quality.legacy"), data: legacy, borderColor: "#8b949e", borderDash: [5, 4], pointRadius: isolatedRadius(legacy), borderWidth: 2, tension: 0 });
+  const yScale = trendYScale([...observed, ...legacy].map(p => p.y));
   const tt = $("trendTitle"); if (tt) tt.textContent = t("trend.title_u", { unit: unit + "/s" });
+  const notice = $("trendQuality");
+  if (notice) {
+    notice.textContent = [hasPartial ? t("trend.partial_note") : "", hasGap ? t("trend.gap_note") : ""].filter(Boolean).join(" ");
+    notice.classList.toggle("hidden", !notice.textContent);
+  }
   if (!window.Chart || !$("trendChart")) return;
   const tick = ts => new Date(ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false });
-  const tooltip = c => c.parsed.y == null ? "—" : AntDataQuality.short(c.parsed.y) + " " + unit + "/s";
+  const tooltipFilter = c => !c.dataset.trendPartial || c.raw?.partial === true;
+  const tooltip = c => {
+    const value = c.parsed.y == null ? "—" : AntDataQuality.short(c.parsed.y) + " " + unit + "/s";
+    return c.dataset.trendPartial ? [t("trend.partial") + ": " + value,
+      t("power.coverage", { known: c.raw.known, total: c.raw.total }), t("trend.partial_tooltip")] : value;
+  };
   if (!trendChart) {
     trendChart = new Chart($("trendChart"), {
       type: "line", data: { datasets },
       options: {
         spanGaps: false, animation: false,
         interaction: { mode: "nearest", axis: "x", intersect: false },
-        plugins: { legend: { display: hasLegacy }, tooltip: { callbacks: {
+        plugins: { legend: { display: hasLegacy || hasPartial }, tooltip: { filter: tooltipFilter, callbacks: {
           title: items => items.length ? new Date(items[0].parsed.x * 1000).toLocaleString(uiLocale()) : "",
           label: tooltip } } },
         scales: {
@@ -458,7 +489,8 @@ async function refreshTrend() {
     });
   } else {
     trendChart.data.datasets = datasets;
-    trendChart.options.plugins.legend.display = hasLegacy;
+    trendChart.options.plugins.legend.display = hasLegacy || hasPartial;
+    trendChart.options.plugins.tooltip.filter = tooltipFilter;
     trendChart.options.plugins.tooltip.callbacks.label = tooltip;
     trendChart.options.scales.x.ticks.callback = tick;
     trendChart.options.scales.y.min = yScale.min;

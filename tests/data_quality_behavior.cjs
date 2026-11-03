@@ -90,7 +90,7 @@ test("partial totals and plotting never manufacture measured zero",()=>{
 test("all six locales cover quality and unit statements and preserve placeholders",()=>{
   const powerKeys = ["card.power", "th.power", "worker.kwh", "worker.hint", "miner.detail_hr",
     "seg.stat", "cbox.power_detail", "cbox.detail_power", "kpi.power", "chart.power", "th.kwh", "th.kwh24"];
-  const keys=Object.keys(dicts.zh).filter(k=>k.startsWith("quality.") || k.startsWith("power.") ||
+  const keys=Object.keys(dicts.zh).filter(k=>k.startsWith("quality.") || k.startsWith("power.") || k.startsWith("trend.") ||
     powerKeys.includes(k) || k==="kind.inventory");
   for (const [lang,values] of Object.entries(dicts)) for (const key of keys){
     assert.ok(values[key],lang+": "+key);
@@ -297,4 +297,150 @@ test("current power stays prominent and paired efficiency keeps its own short co
     assert.equal(h.el(id).textContent,"");
     assert.equal(h.el(id).classList.contains("hidden"),true);
   }
+});
+
+const completeTrend = (ts, rate = 161700) => ({ts, total:539, total_hr:rate,
+  known_total_hr:rate, hashrate_known_machines:539, data_quality:"complete"});
+const partialTrend = (ts, rate = 161400) => ({...completeTrend(ts), total_hr:null,
+  known_total_hr:rate, hashrate_known_machines:538, data_quality:"incomplete"});
+
+// Use the shipped Chart.js parser/controllers/segment resolver. Canvas methods
+// are inert here; visual checks use a real canvas separately, not this adapter.
+function realTrendChart(config) {
+  const ActualChart = require("../web/vendor/chart.umd.min.js");
+  // The UI harness runs in a VM. Chart.js expects plain option objects from
+  // its own realm, as in the real browser; keep callbacks while normalizing them.
+  const plain = value => Array.isArray(value) ? Array.from(value, plain) :
+    value && typeof value === "object" ? Object.fromEntries(
+      Object.entries(value).map(([key,item])=>[key,plain(item)])) : value;
+  config=plain(config);
+  const canvas = {width:800, height:300};
+  const context = new Proxy({canvas, measureText:s=>({width:String(s).length*7}), getLineDash:()=>[]}, {
+    get:(target,key)=>key in target ? target[key] : ()=>{},
+    set:(target,key,value)=>(target[key]=value,true)
+  });
+  canvas.getContext=()=>context;
+  return new ActualChart(canvas, {...config, options:{...config.options, responsive:false,
+    plugins:{...config.options.plugins, legend:{display:false}, tooltip:{enabled:false}}}});
+}
+
+test("partial trend readings are visible and cannot masquerade as complete totals",async()=>{
+  const h=setup();
+  h.respond({trend:[completeTrend(1000),partialTrend(1300),completeTrend(1600),completeTrend(1900)]});
+  await h.ctx.refreshTrend();
+  const c=h.configs.trendChart, full=c.data.datasets[0], partial=c.data.datasets[1];
+  assert.equal(full.data[1].y,null);
+  assert.equal(partial.trendPartial,true);
+  assert.equal(partial.data[1].y,161.4);
+  assert.equal(partial.fill,false);
+  assert.equal(c.options.spanGaps,false);
+  assert.equal(c.options.plugins.legend.display,true);
+  const tooltip=c.options.plugins.tooltip;
+  const item={dataset:partial,raw:partial.data[1],parsed:{y:161.4}};
+  assert.equal(tooltip.filter(item),true);
+  assert.match(tooltip.callbacks.label(item).join("\n"),/部分实测: 161.4 PH\/s\n已统计 538\/539 台/);
+  assert.match(tooltip.callbacks.label(item).join("\n"),/不是完整场地总量/);
+  assert.equal(tooltip.filter({dataset:partial,raw:partial.data[0]}),false);
+  assert.equal(tooltip.filter({dataset:full,raw:full.data[0]}),true);
+  assert.match(h.el("trendQuality").textContent,/橙色虚线.*非完整总量/);
+  assert.doesNotMatch(h.el("trendQuality").textContent,/空档/);
+
+  const chart=realTrendChart(c);
+  try {
+    const blue=chart.getDatasetMeta(0), orange=chart.getDatasetMeta(1);
+    assert.equal(blue.data[1].skip,true);
+    assert.equal(orange.data[1].skip,false);
+    assert.equal(orange.data[1].options.radius,2);
+    assert.equal(orange.data[0].options.radius,0);
+    const painted=orange.dataset.segments.filter(s=>s.style.borderColor!=="transparent");
+    assert.deepEqual(painted.map(s=>[s.start,s.end]),[[0,2]]);
+    assert.deepEqual([...orange.dataset.options.borderDash],[5,4]);
+    assert.equal(painted[0].style.borderColor,"#d97706");
+    assert.ok(orange.dataset.segments.some(s=>s.start===2&&s.end===3&&s.style.borderColor==="transparent"));
+  } finally {chart.destroy();}
+
+  // A later complete response removes the partial legend and explanatory note.
+  h.respond({trend:[completeTrend(2000),completeTrend(2300)]});
+  await h.ctx.refreshTrend();
+  assert.equal(h.configs.trendChart.data.datasets.length,1);
+  assert.equal(h.configs.trendChart.options.plugins.legend.display,false);
+  assert.equal(h.el("trendQuality").textContent,"");
+  assert.equal(h.el("trendQuality").classList.contains("hidden"),true);
+});
+
+test("real missing scans and long gaps break both complete and partial trend lines",async()=>{
+  const h=setup();
+  h.respond({trend:[completeTrend(1000),partialTrend(1300),completeTrend(2601),completeTrend(2901)]});
+  await h.ctx.refreshTrend();
+  const c=h.configs.trendChart;
+  for(const dataset of c.data.datasets){
+    assert.equal(dataset.data[2].x,2200);
+    assert.equal(dataset.data[2].y,null);
+  }
+  assert.match(h.el("trendQuality").textContent,/空档表示缺少有效采样，不代表零算力/);
+  const chart=realTrendChart(c);
+  try {
+    for(let i=0;i<2;i++){
+      const meta=chart.getDatasetMeta(i);
+      assert.equal(meta.data[2].skip,true);
+      assert.ok(meta.dataset.segments.every(s=>s.end<2||s.start>2));
+    }
+  } finally {chart.destroy();}
+
+  h.respond({trend:[completeTrend(3000),{ts:3300,total:539,total_hr:null,
+    known_total_hr:null,hashrate_known_machines:0,data_quality:"incomplete"},completeTrend(3600)]});
+  await h.ctx.refreshTrend();
+  assert.equal(h.configs.trendChart.data.datasets.length,1);
+  assert.equal(h.configs.trendChart.data.datasets[0].data[1].y,null);
+  assert.match(h.el("trendQuality").textContent,/不代表零算力/);
+});
+
+test("confirmed zero, partial zero and isolated samples remain visible on the real chart",async()=>{
+  const h=setup();
+  h.respond({trend:[completeTrend(1000,0),completeTrend(1300,0)]});
+  await h.ctx.refreshTrend();
+  const c=h.configs.trendChart;
+  assert.equal(c.options.scales.y.min,0);
+  assert.ok(c.options.scales.y.max>0);
+  const chart=realTrendChart(c);
+  try {
+    const meta=chart.getDatasetMeta(0);
+    assert.equal(meta.dataset.segments.length,1);
+    assert.ok(meta.data.every(p=>!p.skip&&p.y>=chart.chartArea.top&&p.y<=chart.chartArea.bottom));
+  } finally {chart.destroy();}
+
+  h.respond({trend:[partialTrend(2000,0)]});
+  await h.ctx.refreshTrend();
+  const partial=h.configs.trendChart.data.datasets[1];
+  assert.equal(partial.data[0].y,0);
+  const zeroChart=realTrendChart(h.configs.trendChart);
+  try {
+    const point=zeroChart.getDatasetMeta(1).data[0];
+    assert.equal(point.skip,false);
+    assert.equal(point.options.radius,2);
+    assert.ok(point.y<=zeroChart.chartArea.bottom);
+  } finally {zeroChart.destroy();}
+
+  h.respond({trend:[completeTrend(3000)]});
+  await h.ctx.refreshTrend();
+  const single=realTrendChart(h.configs.trendChart);
+  try {assert.equal(single.getDatasetMeta(0).data[0].options.radius,2);}
+  finally {single.destroy();}
+});
+
+test("legacy, invalid and unverified partial readings are not promoted to complete trend data",async()=>{
+  const h=setup();
+  h.respond({trend:[{...partialTrend(1000),data_quality:"legacy",legacy_total_hr:161700},
+    {...completeTrend(1300),total_hr:-1,known_total_hr:-1},
+    {...partialTrend(1600),hashrate_known_machines:null},
+    {...partialTrend(1900),hashrate_known_machines:0}]});
+  await h.ctx.refreshTrend();
+  const c=h.configs.trendChart;
+  assert.equal(c.data.datasets.length,2);
+  assert.ok(c.data.datasets[0].data.every(p=>p.y===null));
+  assert.equal(c.data.datasets[1].label,t("quality.legacy"));
+  assert.equal(c.data.datasets[1].data[0].y,161.7);
+  assert.ok(c.data.datasets[1].borderDash);
+  assert.match(h.el("trendQuality").textContent,/空档/);
+  assert.doesNotMatch(h.el("trendQuality").textContent,/橙色/);
 });
