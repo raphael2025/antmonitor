@@ -1,4 +1,8 @@
 I18N.register('de', {
+  "trend.partial": "Teilweise Messwerte",
+  "trend.partial_note": "Orange gestrichelte Linien zeigen teilweise Messwerte, keine vollständigen Summen.",
+  "trend.partial_tooltip": "Summe der verfügbaren Miner-Messwerte, nicht die vollständige Standortsumme.",
+  "trend.gap_note": "Lücken bedeuten fehlende gültige Messwerte, keine Hashrate von null.",
   "power.coverage": "{known}/{total} Miner erfasst",
   "power.partial": "Teilweise Messwerte",
   "cloud.token_only": "Ein Token allein enthält keine Meldeadresse und reicht nicht zur Verbindung. Die vollständigen AMC1-Verbindungsdaten aus der Cloud kopieren.",

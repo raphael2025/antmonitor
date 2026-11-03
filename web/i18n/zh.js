@@ -1,4 +1,8 @@
 I18N.register('zh', {
+  "trend.partial": "部分实测",
+  "trend.partial_note": "橙色虚线为部分实测，非完整总量。",
+  "trend.partial_tooltip": "仅为有效读数合计，不是完整场地总量。",
+  "trend.gap_note": "空档表示缺少有效采样，不代表零算力。",
   "power.coverage": "已统计 {known}/{total} 台",
   "power.partial": "部分读数",
   "cloud.token_only": "单独密钥不含上报地址，无法一键绑定。请复制云端「完整接入信息」（AMC1-…）。",

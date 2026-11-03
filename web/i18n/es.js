@@ -1,4 +1,8 @@
 I18N.register('es', {
+  "trend.partial": "Lecturas parciales",
+  "trend.partial_note": "Las líneas discontinuas naranjas muestran lecturas parciales, no totales completos.",
+  "trend.partial_tooltip": "Suma de las lecturas disponibles, no el total completo del centro.",
+  "trend.gap_note": "Los huecos indican muestras válidas ausentes, no un hashrate de cero.",
   "power.coverage": "Calculado con {known}/{total} mineros",
   "power.partial": "Lecturas parciales",
   "cloud.token_only": "Un token por sí solo no contiene la URL de envío y no permite vincular el sitio. Copia la información AMC1- completa de la nube.",

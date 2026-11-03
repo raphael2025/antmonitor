@@ -1,4 +1,8 @@
 I18N.register('en', {
+  "trend.partial": "Partial readings",
+  "trend.partial_note": "Orange dashed lines show partial readings, not full totals.",
+  "trend.partial_tooltip": "Sum of available miner readings, not the complete site total.",
+  "trend.gap_note": "Gaps indicate missing valid samples, not zero hashrate.",
   "power.coverage": "Based on {known}/{total} miners",
   "power.partial": "Partial readings",
   "cloud.token_only": "A token alone has no reporting URL and cannot bind the site. Copy the complete AMC1- connection information from the cloud.",
