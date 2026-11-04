@@ -444,9 +444,11 @@ def test_rollup_ignores_dead_addresses_from_first_scan(conn):
         [rec(f"10.3.0.{i}", status="offline") for i in range(2, 50)]
     insert_scan(conn, h + 60, "full", recs)
     db.rollup_hours(conn)
-    workers = {r["worker"]: r for r in conn.execute("SELECT * FROM worker_hourly WHERE hour=?",
+    workers = {r["worker"]: r for r in conn.execute("SELECT * FROM worker_metrics_hourly WHERE hour=?",
                                                     (h,)).fetchall()}
     assert set(workers) == {"A"}
+    assert workers["A"]["machines"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM worker_hourly").fetchone()[0] == 0
 
 
 def test_machine_unknown_last_round_still_gets_reconfirmed(svc, monkeypatch):

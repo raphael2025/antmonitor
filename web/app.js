@@ -96,6 +96,7 @@ let lastScanTs = 0;          // 服务器最近一次完成扫描的时间戳
 let staleAfter = 900;        // 多久没有新扫描算过期：取服务端看门狗阈值(随巡检间隔变)
 let _staleOn = false;
 let _staleTimer = null;
+let _scanRunning = false, _scanProgressTs = 0;
 
 async function jget(u) {
   const r = await fetch(u);
@@ -135,7 +136,8 @@ function checkStale() {
   let cls = "", msg = "";
   if (noContact > 90) {
     cls = "lost"; msg = t("stale.disconnected", { n: noContact });
-  } else if (lastScanTs && scanAge > staleAfter) {
+  } else if (lastScanTs && scanAge > staleAfter &&
+      !(_scanRunning && _scanProgressTs > 0 && now / 1000 - _scanProgressTs <= staleAfter)) {
     cls = "stale"; msg = t("stale.scan_old", { n: Math.round(scanAge / 60) });
   }
   if (cls) {
@@ -199,18 +201,20 @@ function fmtUptime(sec) {
 }
 const KIND_LABEL = { get full(){return t("kind.full");}, get quick(){return t("kind.quick");}, get manual(){return t("kind.manual");}, get inventory(){return t("kind.inventory");} };
 
-function currentMetric(id, noteId, full, known, complete, count, total) {
+function currentMetric(id, full, known, complete, count, total) {
   const value = AntDataQuality.number(full) ?? AntDataQuality.number(known);
   $(id).textContent = value == null ? "—" : AntDataQuality.short(value);
   const measured = AntDataQuality.number(count), machines = AntDataQuality.number(total);
-  const partial = complete === false && value != null;
-  $(noteId).textContent = partial ? (measured != null && machines != null
+  $(id).title = complete === false && value != null ? (measured != null && machines != null
     ? t("power.coverage", { known: measured, total: machines }) : t("power.partial")) : "";
-  $(noteId).classList.toggle("hidden", !partial);
 }
 
+let _summarySeq = 0;
+
 async function refreshSummary() {
+  const seq = ++_summarySeq;
   const s = await jget("/api/summary");
+  if (seq !== _summarySeq) return;
   updateProgress(s.progress);
   if (s.scan_ts) lastScanTs = s.scan_ts;   // 记录服务器最近完成扫描时间(失联自检用)
   if (s.stale_after) staleAfter = s.stale_after;
@@ -218,12 +222,11 @@ async function refreshSummary() {
     lastScanTs = 0;
     $("lastScan").textContent = t("scan.none_wait");
     ["cOnline", "cTotalHr", "cAvgHr", "cOffline", "cAlerts", "cFw", "cPower", "cEff", "cContainers"].forEach(id => { $(id).textContent = "—"; });
-    ["cPowerNote", "cEffNote"].forEach(id => { $(id).textContent = ""; $(id).classList.add("hidden"); });
-    $("summaryQuality").textContent = t("quality.missing");
-    $("summaryQuality").classList.remove("hidden");
+    ["cOnline", "cPower", "cEff"].forEach(id => { $(id).title = ""; });
     return;
   }
   $("cOnline").textContent = `${s.online} / ${s.total}`;
+  $("cOnline").title = s.unknown ? t("quality.unknown_count", { n: s.unknown }) : "";
   $("cTotalHr").innerHTML = AntDataQuality.partial(s.total_hashrate_th, s.known_hashrate_ths, s.hashrate_complete, t, n => fmtHash(n, "/s"));
   $("cAvgHr").textContent = fmtHash(s.avg_hashrate_th);
   $("cAvgHr").title = t("quality.avg_machine_help");
@@ -231,14 +234,10 @@ async function refreshSummary() {
   $("cAlerts").textContent = s.active_alerts;
   const fw = s.by_firmware || {};
   $("cFw").textContent = `${fw.stock || 0} / ${fw.uniplus || 0}`;
-  currentMetric("cPower", "cPowerNote", s.total_power_kw, s.known_power_kw,
+  currentMetric("cPower", s.total_power_kw, s.known_power_kw,
     s.power_complete, s.power_known_machines, s.total);
-  currentMetric("cEff", "cEffNote", s.avg_efficiency, s.known_efficiency,
+  currentMetric("cEff", s.avg_efficiency, s.known_efficiency,
     s.efficiency_complete, s.efficiency_known_machines, s.total);
-  $("cEff").title = t("quality.eff_help");
-  const quality = $("summaryQuality");
-  quality.textContent = s.unknown ? t("quality.local_help", { n: s.unknown }) : "";
-  quality.classList.toggle("hidden", !s.unknown);
   $("cContainers").innerHTML = `${s.containers || 0}`
     + ((s.containers_faulty || s.containers_offline) ? ` (${(s.containers_faulty || 0) + (s.containers_offline || 0)})` : "")
     + (s.containers_unknown ? AntDataQuality.note(t("quality.unknown_count", { n: s.containers_unknown }), true) : "");
@@ -423,28 +422,25 @@ async function refreshTrend() {
   const d = await jget("/api/trend?points=288");
   const pts = d.trend || [];
   const measurements = pts.map(p => {
-    const full = AntDataQuality.number(p.total_hr), known = AntDataQuality.number(p.known_total_hr);
+    const full = p.data_quality === "legacy" ? null : AntDataQuality.number(p.total_hr);
+    const known = AntDataQuality.number(p.known_total_hr);
     const count = AntDataQuality.number(p.hashrate_known_machines), total = AntDataQuality.number(p.total);
     const partial = p.data_quality !== "legacy" && full == null && known != null &&
       Number.isInteger(count) && Number.isInteger(total) && count > 0 && count < total;
     return { x: p.ts, y: full ?? (partial ? known : null), partial,
-      known: count, total, legacy: AntDataQuality.number(p.legacy_total_hr) };
+      known: count, total };
   });
-  const values = measurements.flatMap(p => [p.y, p.legacy]).filter(v => v != null);
+  const values = measurements.map(p => p.y).filter(v => v != null);
   const { div, unit } = hashUnit(values.length ? Math.max(...values) : 0);
   const observed = [];
-  let hasGap = measurements.some(p => p.y == null && p.legacy == null);
   measurements.forEach((p, i) => {
     if (i && p.x - measurements[i - 1].x > 900) {
-      observed.push({ x: measurements[i - 1].x + 900, y: null, legacy: null, partial: false });
-      hasGap = true;
+      observed.push({ x: measurements[i - 1].x + 900, y: null, partial: false });
     }
     observed.push({ ...p, y: p.y == null ? null : p.y / div });
   });
   const data = observed.map(p => ({ ...p, y: p.partial ? null : p.y }));
-  const legacy = observed.map(p => ({ x: p.x, y: p.legacy == null ? null : p.legacy / div }));
   const hasPartial = observed.some(p => p.partial);
-  const hasLegacy = legacy.some(p => p.y != null);
   const isolatedRadius = points => c => points[c.dataIndex]?.y != null &&
     points[c.dataIndex - 1]?.y == null && points[c.dataIndex + 1]?.y == null ? 2 : 0;
   const datasets = [{ label: t("card.total_hr"), data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: 0, pointRadius: isolatedRadius(data), borderWidth: 2 }];
@@ -456,14 +452,8 @@ async function refreshTrend() {
     // transparent and their tooltip rows are filtered, so totals are drawn once.
     segment: { borderColor: c => observed[c.p0DataIndex]?.partial || observed[c.p1DataIndex]?.partial
       ? "#d97706" : "transparent" } });
-  if (hasLegacy) datasets.push({ label: t("quality.legacy"), data: legacy, borderColor: "#8b949e", borderDash: [5, 4], pointRadius: isolatedRadius(legacy), borderWidth: 2, tension: 0 });
-  const yScale = trendYScale([...observed, ...legacy].map(p => p.y));
+  const yScale = trendYScale(observed.map(p => p.y));
   const tt = $("trendTitle"); if (tt) tt.textContent = t("trend.title_u", { unit: unit + "/s" });
-  const notice = $("trendQuality");
-  if (notice) {
-    notice.textContent = [hasPartial ? t("trend.partial_note") : "", hasGap ? t("trend.gap_note") : ""].filter(Boolean).join(" ");
-    notice.classList.toggle("hidden", !notice.textContent);
-  }
   if (!window.Chart || !$("trendChart")) return;
   const tick = ts => new Date(ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false });
   const tooltipFilter = c => !c.dataset.trendPartial || c.raw?.partial === true;
@@ -478,7 +468,7 @@ async function refreshTrend() {
       options: {
         spanGaps: false, animation: false,
         interaction: { mode: "nearest", axis: "x", intersect: false },
-        plugins: { legend: { display: hasLegacy || hasPartial }, tooltip: { filter: tooltipFilter, callbacks: {
+        plugins: { legend: { display: hasPartial }, tooltip: { filter: tooltipFilter, callbacks: {
           title: items => items.length ? new Date(items[0].parsed.x * 1000).toLocaleString(uiLocale()) : "",
           label: tooltip } } },
         scales: {
@@ -489,7 +479,7 @@ async function refreshTrend() {
     });
   } else {
     trendChart.data.datasets = datasets;
-    trendChart.options.plugins.legend.display = hasLegacy || hasPartial;
+    trendChart.options.plugins.legend.display = hasPartial;
     trendChart.options.plugins.tooltip.filter = tooltipFilter;
     trendChart.options.plugins.tooltip.callbacks.label = tooltip;
     trendChart.options.scales.x.ticks.callback = tick;
@@ -547,11 +537,12 @@ async function refreshMiners() {
   }
   $("minerCount").textContent = d.count != null ? d.count : lastMiners.length;
   const a = d.agg || {};
-  let power = fmtPower(a.total_power ?? a.known_power);
+  const power = fmtPower(a.total_power ?? a.known_power);
+  $("segStat").title = "";
   if (a.power_complete === false && AntDataQuality.number(a.known_power) != null) {
     const known = AntDataQuality.number(a.power_known_machines);
-    power += " · " + (known == null ? t("power.partial")
-      : t("power.coverage", { known, total: d.count ?? lastMiners.length }));
+    $("segStat").title = known == null ? t("power.partial")
+      : t("power.coverage", { known, total: d.count ?? lastMiners.length });
   }
   $("segStat").textContent = t("seg.stat", { seg: seg ? seg + ".x ｜ " : "", online: a.online || 0, hr: fmtHash(a.total_hr), pw: power });
 
@@ -688,6 +679,8 @@ function setView(v) {
 
 function updateProgress(p) {
   if (!p) return;
+  _scanRunning = p.running === true;
+  _scanProgressTs = Number(p.progress_ts || p.started) || 0;
   const bar = $("progressBar"), btnF = $("btnFull"), btnQ = $("btnQuick");
   if (p.running) {
     bar.classList.remove("hidden");

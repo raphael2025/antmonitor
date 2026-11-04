@@ -68,8 +68,8 @@ def test_confirmed_offline_contributes_known_zero_without_hiding_current_total(c
     assert point["hashrate_known_machines"] == point["total"] == 2
 
 
-@pytest.mark.parametrize("age,known", [(899.9, 2), (900, 2), (900.1, 1), (-61, 1)])
-def test_only_readings_fresh_at_scan_completion_enter_subtotal(conn, monkeypatch, age, known):
+@pytest.mark.parametrize("age,known", [(899.9, 2), (900, 2), (900.1, 2), (-61, 1)])
+def test_completed_result_keeps_long_scan_readings_but_rejects_future_clocks(conn, monkeypatch, age, known):
     save(conn, monkeypatch, [rec("10.0.0.1", hr=300),
                             rec("10.0.0.2", hr=200, measured_ts=BASE-age)])
     point = db.hashrate_trend(conn)[0]
@@ -148,9 +148,8 @@ def test_old_partial_with_changed_status_counts_stays_unknown(conn, monkeypatch)
                                    rec("10.0.0.2", hr=200, measured_ts=str(BASE)),
                                    rec("10.0.0.3", hr=None)])
     clear_new_metadata(conn, sid)
-    # SQLite converted an untrusted source timestamp to REAL. One missing
-    # hashrate still makes the recalculation partial, but its status counts
-    # contradict the saved scan and must not establish a usable subtotal.
+    # An untrusted source timestamp cannot become valid through SQLite's REAL
+    # affinity. Missing original subtotal evidence must also stay missing.
     point = db.hashrate_trend(conn)[0]
     assert point["unknown"] == 1
     assert point["total_hr"] is point["known_total_hr"] is point["hashrate_known_machines"] is None
@@ -168,14 +167,17 @@ def test_old_partial_without_complete_snapshot_set_remains_unknown(conn, monkeyp
     assert point["total"] == 2
 
 
-def test_old_partial_with_original_measurement_time_still_lacks_coverage_evidence(conn, monkeypatch):
+def test_completed_long_scan_keeps_verified_total_and_original_measurement_time(conn, monkeypatch):
     sid = save(conn, monkeypatch, [rec("10.0.0.1", hr=300),
                                    rec("10.0.0.2", hr=200, measured_ts=BASE-901)])
     clear_new_metadata(conn, sid)
     monkeypatch.setattr(db.time, "time", lambda: BASE + 86400)
     point = db.hashrate_trend(conn)[0]
-    assert point["known_total_hr"] is point["hashrate_known_machines"] is None
-    assert point["ts"] == BASE and point["total_hr"] is None
+    assert point["known_total_hr"] == 500 and point["hashrate_known_machines"] == 2
+    assert point["ts"] == BASE and point["total_hr"] == 500
+    rows = db.scan_records(conn, sid)
+    assert rows[1]["measured_ts"] == BASE - 901
+    assert not db.record_freshness(rows[1], BASE, BASE + 86400)
 
 
 def test_old_complete_scan_reuses_verified_total_without_raw_data(conn, monkeypatch):
@@ -190,22 +192,21 @@ def test_old_complete_scan_reuses_verified_total_without_raw_data(conn, monkeypa
 
 def test_legacy_snapshot_is_not_promoted_to_verified_partial(conn):
     insert_scan(conn, BASE, "quick", [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=None)])
-    point = db.hashrate_trend(conn)[0]
-    assert point["data_quality"] == "legacy" and point["legacy_total_hr"] == 300
-    assert point["total_hr"] is point["known_total_hr"] is point["hashrate_known_machines"] is None
+    assert db.hashrate_trend(conn) == []
 
 
 @pytest.mark.parametrize("age", [300, 900, 901])
-def test_inventory_event_keeps_timestamp_and_rechecks_coverage(conn, monkeypatch, age):
+def test_inventory_event_keeps_completed_result_and_does_not_renew_timestamp(conn, monkeypatch, age):
     save(conn, monkeypatch, [rec("10.0.0.1", hr=300), rec("10.0.0.2", hr=None)])
     monkeypatch.setattr(db.time, "time", lambda: BASE + age)
     db.remove_miners(conn, ["10.0.0.2"])
     point = db.hashrate_trend(conn, 1)[0]
     assert point["ts"] == BASE + age and point["total"] == 1
-    assert point["total_hr"] == point["known_total_hr"] == (300 if age <= 900 else None)
-    assert point["hashrate_known_machines"] == (1 if age <= 900 else 0)
-    assert point["unknown"] == (0 if age <= 900 else 1)
-    assert db.scan_records(conn, db.latest_scan(conn)["scan_id"])[0]["measured_ts"] == BASE
+    assert point["total_hr"] == point["known_total_hr"] == 300
+    assert point["hashrate_known_machines"] == 1 and point["unknown"] == 0
+    original = db.scan_records(conn, db.latest_scan(conn)["scan_id"])[0]
+    assert original["measured_ts"] == BASE
+    assert db.record_freshness(original, point["ts"], BASE + age) is (age <= 900)
 
 
 @pytest.mark.parametrize("old_metadata", [False, True])

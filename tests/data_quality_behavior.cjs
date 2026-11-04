@@ -17,72 +17,69 @@ for (const lang of ["zh", "en", "ru", "es", "de", "ar"])
     {I18N:{register:(name,values)=>{dicts[name]=values;}}});
 const t = (key,args={}) => (dicts.zh[key] || key).replace(/\{(\w+)\}/g,(_,k)=>args[k] ?? "");
 const format = n => n + " kWh";
+const visibleText = html => html.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
 const observed = {billing_method:"time_weighted_v2",billing_source:"observed",billing_hours:24,
   power_kwh:3, power_observed_hours:1,power_coverage_pct:100/24,
   delivered_th_h:293,delivery_observed_hours:1,delivery_coverage_pct:100/24,
   uptime_pct:100,uptime_observed_hours:1,uptime_coverage_pct:100/24};
 
-test("unknown, explicit zero and archived estimates remain different", () => {
+test("unknown and measured zero stay different; discarded estimates are not rendered", () => {
   for (const n of [null,undefined,true,false,-1,Infinity,NaN,"", " ", [], {}, "bad"])
     assert.equal(q.number(n),null);
   assert.equal(q.number(0),0);
   assert.equal(q.number("293"),293);
-  const empty=q.billing({},"power",t,format);
-  assert.match(empty,/rate-value">—/);
-  assert.doesNotMatch(empty,/0 kWh/);
-  const zero=q.billing({...observed,power_kwh:0},"power",t,format);
-  assert.match(zero,/rate-value">0 kWh/);
+  assert.equal(visibleText(q.billing({},"power",t,format)),"—");
+  assert.equal(visibleText(q.billing({...observed,power_kwh:0},"power",t,format)),"0 kWh");
   const old=q.billing({power_kwh:99},"power",t,format);
-  assert.match(old,/rate-value">—/);
-  assert.match(old,/<details.*旧口径记录/);
-  assert.match(old,/99 kWh.*完整性未验证/);
+  assert.equal(visibleText(old),"—");
+  assert.doesNotMatch(old,/99|旧口径|完整性未验证|<details/);
 });
 
-test("energy and availability use their own measured coverage", () => {
+test("energy and availability keep their own coverage only in hover context", () => {
   const row={...observed,power_observed_hours:6,power_coverage_pct:25,observed_hours:24,coverage_pct:100};
   const cell=q.billing(row,"power",t,format);
-  assert.match(cell,/rate-value">3 kWh/);
-  assert.match(cell,/仅累计有效时段/);
-  assert.match(cell,/6\/24h/);
+  assert.equal(visibleText(cell),"3 kWh");
+  assert.match(cell,/title="[^"]*6\/24h/);
   const up=q.billing({...row,uptime_observed_hours:12,uptime_coverage_pct:50},"uptime",t,n=>n+"%");
-  assert.match(up,/12\/24h/);
+  assert.equal(visibleText(up),"100%");
+  assert.match(up,/title="[^"]*12\/24h/);
   assert.doesNotMatch(up,/6\/24h/);
-  assert.match(q.billing({...observed,power_observed_hours:24-5/3600,power_coverage_pct:99.9942},"power",t,format),/仅累计有效时段/);
+  assert.doesNotMatch(cell+up,/rate-note|<details/);
 });
 
-test("different site windows and stale reports cannot look like a full common window", () => {
+test("incompatible site windows stay unavailable without extra table rows", () => {
   for (const alignment of ["unaligned","unverified"]){
     const r={...observed,sites:2,billing_window_alignment:alignment,power_unavailable_reason:alignment+"_windows"};
     const cell=q.billing(r,"power",t,format);
-    assert.match(cell,/rate-value">—/);
-    assert.match(cell,/时间未对齐/);
-    assert.doesNotMatch(cell,/rate-value">3 kWh/);
+    assert.equal(visibleText(cell),"—");
+    assert.match(cell,/title="[^"]*时间未对齐/);
+    assert.doesNotMatch(cell,/3 kWh/);
     const avg=rates.cell({avg_hashrate_ths:586,hashrate_hours:24,observed_hours:24,coverage_pct:100,sites:2,window_alignment:alignment},"average",t,n=>n+" TH/s",n=>n+"s");
-    assert.match(avg,/rate-value">—/);
+    assert.equal(visibleText(avg),"—");
     assert.doesNotMatch(avg,/586 TH/);
   }
   const stale=q.billing({...observed,report_stale:true},"power",t,format);
-  assert.match(stale,/报表已过期/);
+  assert.equal(visibleText(stale),"3 kWh");
+  assert.match(stale,/title="报表已过期"/);
 });
 
-test("today's coverage uses elapsed hours; old daily values stay explicitly legacy",()=>{
+test("daily cells show valid measurements and never fall back to discarded records",()=>{
   const d={method:"time_weighted_v2",elapsed_hours:6,power_kwh:12,
     metric_observed_hours:{power_kw:3},metric_coverage_pct:{power_kw:50},legacy_power_kwh:36};
   const cell=q.daily(d,"power_kwh","power_kw",t,format);
-  assert.match(cell,/rate-value">12 kWh/);
-  assert.match(cell,/3\/6h/);
-  assert.doesNotMatch(cell,/3\/24h/);
-  assert.match(cell,/36 kWh/);
+  assert.equal(visibleText(cell),"12 kWh");
+  assert.match(cell,/title="[^"]*3\/6h/);
+  assert.doesNotMatch(cell,/3\/24h|36 kWh|旧口径|<details/);
   const old=q.daily({method:"legacy_sample_mean",power_kwh:36},"power_kwh","power_kw",t,format);
-  assert.match(old,/rate-value">36 kWh/);
-  assert.match(old,/完整性未验证/);
+  assert.equal(visibleText(old),"—");
+  assert.doesNotMatch(old,/36|完整性未验证/);
 });
 
 test("partial totals and plotting never manufacture measured zero",()=>{
   const cell=q.total({totals:{sites:2,power_kw:null},observed_totals:{power_kw:3},
     metric_known_sites:{power_kw:1},metrics_complete:{power_kw:false}},"power_kw",t,format);
-  assert.match(cell,/rate-value">—/);
-  assert.match(cell,/已知部分：3 kWh（1\/2 个场地）/);
+  assert.equal(visibleText(cell),isCloud ? "3 kWh" : "—");
+  assert.match(cell,/title="已知部分：3 kWh（1\/2 个场地）"/);
   assert.deepEqual(q.points([[1,null],[2,0],[3,293],[4,true]],0,1),[
     {x:1,y:null},{x:2,y:0},{x:3,y:293},{x:4,y:null}]);
 });
@@ -134,7 +131,7 @@ function setup(){
     vm.runInContext(app.slice(app.indexOf("const CBOX_PUMP_KEYS"),app.indexOf("function refreshAll()")),ctx);
     vm.runInContext(app.slice(app.indexOf("let _workerSeq = 0"),app.indexOf('let view = "list"')),ctx);
     vm.runInContext("let rackMode=false;",ctx);
-    vm.runInContext(app.slice(app.indexOf("function setView(v)"),app.indexOf("function updateProgress(p)")),ctx);
+    vm.runInContext(app.slice(app.indexOf("function setView(v)"),app.indexOf("async function openMiner")),ctx);
   }
   return {ctx,el,configs,respond:r=>{response=r;}};
 }
@@ -268,10 +265,10 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
       metrics_complete:{hashrate_ths:false,power_kw:false,machines_total:false},metric_known_sites:{hashrate_ths:1,power_kw:1,machines_total:1},
       sites:[{id:"a",name:"<旧场地>",type:"air",state:"stalled",data_quality:"stale",online:100,total:100,hashrate_ths:29300}]});
     assert.equal(h.el("kMachines").textContent,"–/–");
-    assert.match(h.el("kMachinesNote").textContent,/1\/1.*1\/2/);
-    assert.match(h.el("kHashrate").innerHTML,/rate-value">—/);
+    assert.match(h.el("kMachines").title,/1\/1.*1\/2/);
+    assert.match(h.el("kHashrate").innerHTML,/rate-value"[^>]*>—/);
     assert.match(h.el("kHashrate").innerHTML,/已知部分：293 TH\/s/);
-    assert.match(h.el("gridAir").innerHTML,/最后记录已过期/);
+    assert.match(h.el("gridAir").innerHTML,/site s-stalled/);
     assert.doesNotMatch(h.el("gridAir").innerHTML,/<旧场地>/);
     h.ctx.renderCustomers({rows:[{worker:"A",site_id:"a",...observed,power_kwh:null,uptime_pct:null}],by_worker:[]});
     assert.doesNotMatch(h.el("tblCustomers").querySelector().innerHTML,/null%|0 kWh/);
@@ -279,8 +276,7 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
     await h.ctx.loadTrend();
     assert.equal(h.configs.trendChart.data.datasets[0].data[1].y,null);
     assert.equal(h.configs.trendChart.data.datasets[0].data[2].y,0);
-    assert.equal(h.configs.trendChart.data.datasets[1].data[1].y,300);
-    assert.ok(h.configs.trendChart.data.datasets[1].borderDash);
+    assert.equal(h.configs.trendChart.data.datasets.length,1);
   }else{
     h.respond({scanned:true,scan_ts:1800000000,scan_kind:"inventory",online:1,total:2,unknown:1,offline:0,
       total_hashrate_th:null,known_hashrate_ths:293,hashrate_complete:false,avg_hashrate_th:null,
@@ -291,9 +287,9 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
     assert.match(h.el("cTotalHr").innerHTML,/已知部分：293 TH\/s/);
     assert.equal(h.el("cPower").textContent,"3");
     assert.equal(h.el("cEff").textContent,"10.24");
-    assert.equal(h.el("cPowerNote").textContent,"已统计 1/2 台");
-    assert.equal(h.el("cEffNote").textContent,"已统计 1/2 台");
-    assert.match(h.el("summaryQuality").textContent,/未知\/过期状态 1 台/);
+    assert.equal(h.el("cPower").title,"已统计 1/2 台");
+    assert.equal(h.el("cEff").title,"已统计 1/2 台");
+    assert.equal(h.el("cOnline").title,"未知：1");
     assert.equal(h.ctx.boxPower({power1:1000,power2:null}),null);
     assert.equal(h.ctx.boxPower({power1:1000,power2:500}),1500);
     assert.equal(h.ctx.rejCell({accepted:100,rejected:null}),"<td>-</td>");
@@ -304,7 +300,7 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
     await h.ctx.refreshTrend();
     assert.equal(h.configs.trendChart.data.datasets[0].data[1].y,null);
     assert.equal(h.configs.trendChart.data.datasets[0].data[2].y,0);
-    assert.ok(h.configs.trendChart.data.datasets[1].borderDash);
+    assert.equal(h.configs.trendChart.data.datasets.length,1);
     assert.equal(h.configs.trendChart.options.scales.x.type,"linear");
     h.respond({current:{online:1,data_status:"unknown",data_complete:0,faults:[]},stale_after:60,
       history:[{ts:100,supply_temp:-1},{ts:110,supply_temp:0},{ts:3700,supply_temp:3}]});
@@ -322,7 +318,7 @@ test("actual dashboard handlers handle incomplete APIs without null crashes or i
   }
 });
 
-test("current power stays prominent and paired efficiency keeps its own short coverage",async()=>{
+test("power and efficiency keep their own hover context without extra card lines",async()=>{
   const h=setup();
   const partial={scanned:true,scan_ts:1800000000,total:3,online:3,offline:0,
     total_power_kw:null,known_power_kw:3,power_complete:false,power_known_machines:2,
@@ -331,22 +327,22 @@ test("current power stays prominent and paired efficiency keeps its own short co
   await h.ctx.refreshSummary();
   assert.equal(h.el("cPower").textContent,"3");
   assert.equal(h.el("cEff").textContent,"20");
-  assert.equal(h.el("cPowerNote").textContent,"已统计 2/3 台");
-  assert.equal(h.el("cEffNote").textContent,"已统计 1/3 台");
-  assert.equal(h.el("cPowerNote").classList.contains("hidden"),false);
-  assert.equal(h.el("cEffNote").classList.contains("hidden"),false);
+  assert.equal(h.el("cPower").title,"已统计 2/3 台");
+  assert.equal(h.el("cEff").title,"已统计 1/3 台");
+  assert.equal(ids.has("cPowerNote"),false);
+  assert.equal(ids.has("cEffNote"),false);
+  assert.equal(ids.has("summaryQuality"),false);
 
   h.respond({miners:[],count:3,agg:{total_power:null,known_power:3000,
     power_complete:false,power_known_machines:2}});
   await h.ctx.refreshMiners();
-  assert.match(h.el("segStat").textContent,/3 kW · 已统计 2\/3 台/);
+  assert.match(h.el("segStat").textContent,/3 kW/);
+  assert.doesNotMatch(h.el("segStat").textContent,/已统计/);
+  assert.equal(h.el("segStat").title,"已统计 2/3 台");
 
   h.respond({...partial,total_power_kw:3,avg_efficiency:20,power_complete:true,efficiency_complete:true});
   await h.ctx.refreshSummary();
-  for (const id of ["cPowerNote","cEffNote"]){
-    assert.equal(h.el(id).textContent,"");
-    assert.equal(h.el(id).classList.contains("hidden"),true);
-  }
+  for (const id of ["cPower","cEff"]) assert.equal(h.el(id).title,"");
   h.respond({...partial,known_power_kw:0,known_efficiency:0});
   await h.ctx.refreshSummary();
   assert.equal(h.el("cPower").textContent,"0");
@@ -355,16 +351,15 @@ test("current power stays prominent and paired efficiency keeps its own short co
   await h.ctx.refreshSummary();
   assert.equal(h.el("cPower").textContent,"—");
   assert.equal(h.el("cEff").textContent,"—");
-  assert.equal(h.el("cPowerNote").textContent,"");
-  assert.equal(h.el("cEffNote").textContent,"");
+  for (const id of ["cPower","cEff"]) assert.equal(h.el(id).title,"");
 
   h.respond(partial);
   await h.ctx.refreshSummary();
   h.respond({scanned:false});
   await h.ctx.refreshSummary();
-  for (const id of ["cPowerNote","cEffNote"]){
-    assert.equal(h.el(id).textContent,"");
-    assert.equal(h.el(id).classList.contains("hidden"),true);
+  for (const id of ["cPower","cEff"]){
+    assert.equal(h.el(id).textContent,"—");
+    assert.equal(h.el(id).title,"");
   }
 });
 
@@ -411,8 +406,8 @@ test("partial trend readings are visible and cannot masquerade as complete total
   assert.match(tooltip.callbacks.label(item).join("\n"),/不是完整场地总量/);
   assert.equal(tooltip.filter({dataset:partial,raw:partial.data[0]}),false);
   assert.equal(tooltip.filter({dataset:full,raw:full.data[0]}),true);
-  assert.match(h.el("trendQuality").textContent,/橙色虚线.*非完整总量/);
-  assert.doesNotMatch(h.el("trendQuality").textContent,/空档/);
+
+
 
   const chart=realTrendChart(c);
   try {
@@ -433,8 +428,8 @@ test("partial trend readings are visible and cannot masquerade as complete total
   await h.ctx.refreshTrend();
   assert.equal(h.configs.trendChart.data.datasets.length,1);
   assert.equal(h.configs.trendChart.options.plugins.legend.display,false);
-  assert.equal(h.el("trendQuality").textContent,"");
-  assert.equal(h.el("trendQuality").classList.contains("hidden"),true);
+
+
 });
 
 test("real missing scans and long gaps break both complete and partial trend lines",async()=>{
@@ -446,7 +441,7 @@ test("real missing scans and long gaps break both complete and partial trend lin
     assert.equal(dataset.data[2].x,2200);
     assert.equal(dataset.data[2].y,null);
   }
-  assert.match(h.el("trendQuality").textContent,/空档表示缺少有效采样，不代表零算力/);
+
   const chart=realTrendChart(c);
   try {
     for(let i=0;i<2;i++){
@@ -461,7 +456,7 @@ test("real missing scans and long gaps break both complete and partial trend lin
   await h.ctx.refreshTrend();
   assert.equal(h.configs.trendChart.data.datasets.length,1);
   assert.equal(h.configs.trendChart.data.datasets[0].data[1].y,null);
-  assert.match(h.el("trendQuality").textContent,/不代表零算力/);
+
 });
 
 test("confirmed zero, partial zero and isolated samples remain visible on the real chart",async()=>{
@@ -505,11 +500,90 @@ test("legacy, invalid and unverified partial readings are not promoted to comple
     {...partialTrend(1900),hashrate_known_machines:0}]});
   await h.ctx.refreshTrend();
   const c=h.configs.trendChart;
-  assert.equal(c.data.datasets.length,2);
+  assert.equal(c.data.datasets.length,1);
   assert.ok(c.data.datasets[0].data.every(p=>p.y===null));
-  assert.equal(c.data.datasets[1].label,t("quality.legacy"));
-  assert.equal(c.data.datasets[1].data[0].y,161.7);
-  assert.ok(c.data.datasets[1].borderDash);
-  assert.match(h.el("trendQuality").textContent,/空档/);
-  assert.doesNotMatch(h.el("trendQuality").textContent,/橙色/);
+  assert.equal(ids.has("trendQuality"),false);
+
+
+});
+
+
+
+test("normal report cells stay concise and exclude discarded legacy statistics", () => {
+  const row={...observed,hashrate_ths:293,avg_hashrate_ths:292,hashrate_hours:24,
+    observed_hours:23,coverage_pct:95.8,legacy_power_kwh:9999,current_machines:1,
+    hashrate_age_s:10,report_age_s:30,period_end_ts:1800000000};
+  assert.equal(visibleText(q.billing(row,"power",t,format)),"3 kWh");
+  assert.equal(visibleText(q.billing(row,"uptime",t,n=>n+"%")),"100%");
+  assert.equal(visibleText(rates.cell(row,"current",t,n=>n+" TH/s",n=>n+"s")),"293 TH/s");
+  assert.equal(visibleText(rates.cell(row,"average",t,n=>n+" TH/s",n=>n+"s")),"292 TH/s");
+  assert.equal(visibleText(q.daily({method:"legacy_sample_mean",power_kwh:9999},"power_kwh","power_kw",t,format)),"—");
+  assert.doesNotMatch(q.billing(row,"power",t,format),/9999|旧口径|完整性未验证|<details/);
+});
+
+
+test("active long scans keep the last complete summary; only completed results change the numbers",async()=>{
+  const h=setup();
+  h.ctx.Date=class extends Date { static now(){ return 1800000000*1000; } };
+  h.ctx._wsStop=false;
+  vm.runInContext("lastOkMs=Date.now();",h.ctx);
+  const scan={scanned:true,scan_ts:1799998000,scan_kind:"full",stale_after:900,
+    online:538,total:538,offline:0,unknown:0,total_hashrate_th:161700,known_hashrate_ths:161700,
+    hashrate_complete:true,avg_hashrate_th:300.56,total_power_kw:2870,power_complete:true,
+    avg_efficiency:17.75,efficiency_complete:true,active_alerts:0,
+    by_firmware:{stock:538},containers:4};
+  h.respond({...scan,progress:{running:true,kind:"manual",done:2938,total:8200,progress_ts:1799999995}});
+  await h.ctx.refreshSummary();
+  assert.equal(h.el("cOnline").textContent,"538 / 538");
+  assert.match(visibleText(h.el("cTotalHr").innerHTML),/^161\.7 PH\/s$/);
+  assert.equal(h.el("cPower").textContent,"2,870");
+  assert.equal(h.el("progFill").style.width,"35%");
+  assert.equal(h.el("progressBar").classList.contains("hidden"),false);
+  h.ctx.checkStale();
+  assert.equal(h.el("staleBanner").className,"stale-banner hidden");
+  // A fresh page needs no browser-side cache to render that same snapshot midscan.
+  const reopened=setup();
+  reopened.respond({...scan,progress:{running:true,done:6000,total:8200,kind:"manual",progress_ts:1799999998}});
+  await reopened.ctx.refreshSummary();
+  assert.equal(reopened.el("cOnline").textContent,"538 / 538");
+  assert.equal(reopened.el("cPower").textContent,"2,870");
+  assert.equal(reopened.el("progFill").style.width,"73%");
+  // A completed real zero remains zero and an actual offline machine is visible.
+  h.respond({...scan,scan_ts:1800000000,online:537,offline:1,total_hashrate_th:0,
+    known_hashrate_ths:0,avg_hashrate_th:0,total_power_kw:0,avg_efficiency:null,
+    progress:{running:false,last_finished:1800000000}});
+  await h.ctx.refreshSummary();
+  assert.equal(h.el("cOnline").textContent,"537 / 538");
+  assert.equal(h.el("cOffline").textContent,1);
+  assert.equal(visibleText(h.el("cTotalHr").innerHTML),"0 TH/s");
+  assert.equal(h.el("cPower").textContent,"0");
+  assert.equal(h.el("progressBar").classList.contains("hidden"),true);
+});
+
+test("recent scan progress never suppresses real lost contact or frozen progress",()=>{
+  const h=setup();
+  h.ctx.Date=class extends Date { static now(){ return 1800000000*1000; } };
+  h.ctx._wsStop=false;
+  vm.runInContext("lastOkMs=Date.now();lastScanTs=1799998000;staleAfter=900;",h.ctx);
+  h.ctx.updateProgress({running:true,done:100,total:8200,progress_ts:1799998001});
+  h.ctx.checkStale();
+  assert.equal(h.el("staleBanner").className,"stale-banner stale");
+  h.ctx.updateProgress({running:true,done:200,total:8200,progress_ts:1799999999});
+  vm.runInContext("lastOkMs=Date.now()-91000;",h.ctx);
+  h.ctx.checkStale();
+  assert.equal(h.el("staleBanner").className,"stale-banner lost");
+});
+
+test("an older summary response cannot replace a newly completed scan",async()=>{
+  const h=setup(),pending=deferredRequests(h,"jget");
+  const old=h.ctx.refreshSummary(), current=h.ctx.refreshSummary();
+  pending[1].resolve({scanned:true,scan_ts:1800000000,online:537,total:538,offline:1,
+    total_hashrate_th:160000,progress:{running:false,last_finished:1800000000}});
+  await current;
+  pending[0].resolve({scanned:true,scan_ts:1799999000,online:538,total:538,offline:0,
+    total_hashrate_th:161700,progress:{running:true,done:100,total:8200,progress_ts:1799999990}});
+  await old;
+  assert.equal(h.el("cOnline").textContent,"537 / 538");
+  assert.equal(visibleText(h.el("cTotalHr").innerHTML),"160 PH/s");
+  assert.equal(h.el("progressBar").classList.contains("hidden"),true);
 });

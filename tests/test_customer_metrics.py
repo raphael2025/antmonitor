@@ -1,4 +1,4 @@
-"""以可手算的时间区间检验交付、耗电、在线率和库存变更，保留旧账本证据。"""
+"""以可手算的时间区间检验交付、耗电、在线率和库存变更，不再混入旧估算账本。"""
 import math
 
 import pytest
@@ -32,8 +32,8 @@ def test_transfer_preserves_each_customers_delivery_and_electricity(conn, monkey
             assert rows[worker]["avg_hashrate_ths"] == 150
             assert rows[worker]["uptime_pct"] == 100
             assert rows[worker]["billing_method"] == "time_weighted_v2"
-        assert rows["B"]["legacy_delivered_th_h"] >= 300
-        assert rows["B"]["legacy_power_kwh"] == 3
+        assert rows["B"]["legacy_delivered_th_h"] is None
+        assert rows["B"]["legacy_power_kwh"] is None
 
 
 def test_unknown_does_not_synthesize_hours_of_delivery(conn, monkeypatch):
@@ -46,7 +46,7 @@ def test_unknown_does_not_synthesize_hours_of_delivery(conn, monkeypatch):
     for metric in ("delivery", "power", "uptime"):
         assert r[metric + "_observed_hours"] == pytest.approx(1 / 12, abs=1e-6)
         assert r[metric + "_coverage_pct"] == pytest.approx(100 / 12, abs=1e-4)
-    assert r["legacy_delivered_th_h"] >= 300
+    assert r["legacy_delivered_th_h"] is None
 
 
 def test_all_unknown_is_not_a_measured_zero(conn, monkeypatch):
@@ -66,7 +66,7 @@ def test_uptime_is_weighted_by_machine_seconds_not_sample_count(conn, monkeypatc
     assert r["uptime_coverage_pct"] == 100
     assert r["power_kwh"] == .05
     assert r["delivered_th_h"] == 5
-    assert r["legacy_uptime_pct"] == 20
+    assert r["legacy_uptime_pct"] is None
 
 
 def test_machine_count_changes_use_machine_time_denominator(conn, monkeypatch):
@@ -85,7 +85,7 @@ def test_rolling_boundary_does_not_import_consumption_from_outside_window(conn, 
     after = report(conn, monkeypatch, 5400)["A"]
     assert before["delivered_th_h"] == after["delivered_th_h"] == 0
     assert before["power_kwh"] == after["power_kwh"] == 0
-    assert after["legacy_delivered_th_h"] == 75  # 保存旧摊分值供核对，不再作为当前实测值。
+    assert after["legacy_delivered_th_h"] is None  # 不再混入旧摊分值。
 
 
 def test_first_observation_is_not_backfilled(conn, monkeypatch):
@@ -130,24 +130,24 @@ def test_peak_machines_does_not_union_successive_ips(conn, monkeypatch):
     assert r["delivered_th_h"] == 300
 
 
-def test_expiry_uses_actual_measurement_time_not_completion_time(conn, monkeypatch):
+def test_display_keeps_completed_value_while_history_keeps_actual_sample_limit(conn, monkeypatch):
     insert_scan(conn, BASE + 600, "full", [rec("10.0.0.1", worker="A", hr=300, measured_ts=BASE)])
     r = report(conn, monkeypatch, 1000)["A"]
-    assert r["hashrate_ths"] is None and r["hashrate_stale"] is True
+    assert r["hashrate_ths"] == 300 and r["hashrate_stale"] is True
     assert r["hashrate_ts"] == BASE and r["hashrate_age_s"] == 1000
     assert r["delivered_th_h"] == 25  # 完成600s到原采样900s，只能再代表300s。
     assert r["power_kwh"] == .25
     assert r["delivery_observed_hours"] == pytest.approx(300 / 3600, abs=1e-6)
 
 
-def test_scan_keeps_raw_evidence_but_does_not_count_old_values_as_current(conn, monkeypatch):
+def test_completed_scan_totals_keep_successful_results_and_raw_timestamps(conn, monkeypatch):
     monkeypatch.setattr(db.time, "time", lambda: BASE + 1000)
     rows = [rec("10.0.0.1", worker="A", hr=300, measured_ts=BASE),
             rec("10.0.0.2", worker="A", hr=290, measured_ts=BASE + 999)]
     sid, ts, kept = db.save_scan(conn, "full", rows)
     head = db.latest_scan(conn)
-    assert (head["total"], head["online"], head["offline"], head["unknown"]) == (2, 1, 0, 1)
-    assert head["total_hr"] is None
+    assert (head["total"], head["online"], head["offline"], head["unknown"]) == (2, 2, 0, 0)
+    assert head["total_hr"] == 590
     assert kept[0]["hr_rt"] == 300 and kept[0]["status"] == "online"
     assert db.scan_records(conn, sid)[0]["measured_ts"] == BASE
 
@@ -176,7 +176,7 @@ def test_v2_archive_survives_pruning_without_rewriting_old_ledger(conn, monkeypa
     assert before["delivered_th_h"] == after["delivered_th_h"] == 300
     assert before["power_kwh"] == after["power_kwh"] == 3
     assert before["uptime_pct"] == after["uptime_pct"] == 100
-    assert after["legacy_delivered_th_h"] == 999
+    assert after["legacy_delivered_th_h"] is None
     assert [tuple(r) for r in conn.execute("SELECT * FROM worker_hourly")] == before_ledger
 
 
@@ -242,15 +242,13 @@ def test_rollup_work_limit_counts_empty_hours(conn, monkeypatch):
     assert int(db.meta_get(conn, "customer_metrics_rollup_hour")) == BASE + 2 * 3600
 
 
-def test_trend_separates_legacy_values_and_unknown_current_totals(conn, monkeypatch):
+def test_trend_excludes_legacy_values_and_retains_true_unknown(conn, monkeypatch):
     insert_scan(conn, BASE, "quick", [rec("10.0.0.1", worker="A", hr=300)])
     monkeypatch.setattr(db.time, "time", lambda: BASE + 300)
     db.save_scan(conn, "quick", [rec("10.0.0.1", worker="A", hr=300)])
     monkeypatch.setattr(db.time, "time", lambda: BASE + 600)
     db.save_scan(conn, "quick", [rec("10.0.0.1", worker="A", status="unknown")])
-    old, valid, missing = db.hashrate_trend(conn)
-    assert old["total_hr"] is old["online"] is None
-    assert old["legacy_total_hr"] == 300 and old["legacy_online"] == 1
+    valid, missing = db.hashrate_trend(conn)
     assert valid["total_hr"] == 300 and valid["online"] == 1
     assert valid["legacy_total_hr"] is None
     assert missing["total_hr"] is missing["online"] is None

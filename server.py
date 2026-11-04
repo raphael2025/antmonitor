@@ -315,12 +315,8 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 def _latest_records():
-    """Current projection of immutable raw samples; stale measurements remain unknown."""
-    scan, records = SVC.latest()
-    now = time.time()
-    stamp = (scan or {}).get("ts")
-    return scan, [data_metrics.live_record(r, db.record_freshness(r, stamp, now))
-                  for r in records]
+    """Show the last completed round until its replacement is fully committed."""
+    return SVC.latest_display()
 
 
 # ---- 通用短缓存 + 每来源限流 ----
@@ -442,6 +438,7 @@ def _summary_stats(ls, recs):
     return {
         **stats,
         "scan_id": ls.get("scan_id"), "scan_ts": ls.get("ts"), "scan_kind": ls.get("kind"),
+        "scan_started_ts": ls.get("started_ts"),
         "measurement_ts": measured,
         "active_alerts": db.count_active(SVC.conn),
         "containers": len(cs),
@@ -497,7 +494,10 @@ def _build_public_summary():
     """与 api_summary 同一数据路径，另加一份精简全量矿机列表。包异常，绝不返回 500。"""
     try:
         ls, recs = _latest_records()
-        base = {"ok": True, "ts": int(time.time()), "progress": SVC.progress}
+        progress = dict(SVC.progress)
+        base = {"ok": True, "ts": int(time.time()), "progress": progress,
+                "scanning": bool(progress.get("running")),
+                "scan_progress_ts": progress.get("progress_ts") if progress.get("running") else None}
         if not ls:
             return {**base, "scanned": False,
                     "online": None, "offline": None, "total": None, "unknown": None,
@@ -515,6 +515,7 @@ def _build_public_summary():
         return {
             **base, "scanned": True,
             "scan_id": s["scan_id"], "scan_ts": s["scan_ts"], "scan_kind": s["scan_kind"],
+            "scan_started_ts": s["scan_started_ts"],
             "measurement_ts": s["measurement_ts"],
             "total": s["total"], "online": s["online"], "offline": s["offline"],
             "unknown": s["unknown"],
@@ -815,15 +816,10 @@ def api_report_customers(hours: int = 24, format: str = "", until_ts: float = No
         buf = io.StringIO()
         buf.write("﻿")
         w = _csv.writer(buf)
-        w.writerow([f"客户报表  请求 {hours} 小时，截止 Unix 秒 {end}；各指标有效覆盖见明细，耗电为监控估算"])
-        w.writerow(["客户(矿工名)", "报表机器数(口径见台数来源列)", "可用率%", "交付算力(TH·h)", "耗电(kWh)",
-                    "当前机器数", "实时算力(TH/s)", f"近{hours}小时观测平均算力(TH/s)",
-                    "有效观测(小时)", "观测覆盖率%", "实时采样时间(Unix秒)",
-                    "统计开始(Unix秒)", "统计截止(Unix秒)", "计费窗口(小时)", "计费数据来源",
-                    "交付有效时长(小时)", "交付覆盖率%", "功率有效时长(小时)", "功率覆盖率%",
-                    "在线状态有效时长(小时)", "在线状态覆盖率%",
-                    "旧口径交付(TH·h,未验证)", "旧口径耗电(kWh,未验证)", "旧口径可用率%(未验证)",
-                    "台数来源(observed=已观测同时峰值,legacy=旧报表计数)"])
+        w.writerow([f"客户报表：近 {hours} 小时，截止 Unix 秒 {end}"])
+        w.writerow(["客户(矿工名)", "台数", "可用率%", "交付算力(TH·h)", "耗电(kWh)",
+                    "当前机器数", "实时算力(TH/s)", "平均算力(TH/s)",
+                    "统计开始(Unix秒)", "统计截止(Unix秒)"])
         def cell(v):   # 矿工名来自矿机(可被篡改)：= + - @ 开头会被 Excel 当公式执行
             s = str(v or "")
             return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
@@ -832,14 +828,7 @@ def api_report_customers(hours: int = 24, format: str = "", until_ts: float = No
             w.writerow([cell(r["worker"]), r["machines"], r["uptime_pct"],
                         r["delivered_th_h"], r["power_kwh"], r.get("current_machines"),
                         r.get("hashrate_ths"), r.get("avg_hashrate_ths"),
-                        r.get("observed_hours"), r.get("coverage_pct"), r.get("hashrate_ts"),
-                        r.get("period_start_ts"), r.get("period_end_ts"),
-                        r.get("billing_hours"), r.get("billing_source"),
-                        r.get("delivery_observed_hours"), r.get("delivery_coverage_pct"),
-                        r.get("power_observed_hours"), r.get("power_coverage_pct"),
-                        r.get("uptime_observed_hours"), r.get("uptime_coverage_pct"),
-                        r.get("legacy_delivered_th_h"), r.get("legacy_power_kwh"), r.get("legacy_uptime_pct"),
-                        r.get("machines_source")])
+                        r.get("period_start_ts"), r.get("period_end_ts")])
         return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition":
                                  f'attachment; filename="customers_{hours}h.csv"'})

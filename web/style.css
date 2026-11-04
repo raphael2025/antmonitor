@@ -262,7 +262,7 @@ footer { text-align: center; padding: 20px; }
 [dir="rtl"] .tablewrap { direction: ltr; } /* keep IP columns LTR */
 [dir="rtl"] .lang-row { justify-content: flex-start; }
 
-/* Customer rates keep observation quality next to the measured value. */
+/* Keep report values compact; extra measurement context is available on hover. */
 .rate-value { display: block; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .rate-note { display: block; max-width: 230px; white-space: normal; line-height: 1.5; margin-top: 3px; }
 .rate-note.rate-warning { color: var(--theme-warning, #fab219); }
@@ -272,9 +272,6 @@ footer { text-align: center; padding: 20px; }
 .worker-billing { margin-top: 10px; }
 .worker-billing summary { cursor: pointer; margin-bottom: 6px; }
 
-/* Explicit quality notes also apply to cards, energy, availability and archived rows. */
+/* Short notes are reserved for operational state, such as unresolved faults. */
 .card .rate-note { font-size: 11px; font-weight: normal; }
-.legacy-data { margin-top: 4px; font-size: 11px; font-weight: normal; }
-.legacy-data summary { cursor: pointer; color: var(--theme-warning, #fab219); }
-.data-quality-notice { margin: 0 18px 14px; font-size: 12px; }
 .site .rate-note { font-size: 11px; }

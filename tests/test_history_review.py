@@ -58,15 +58,16 @@ def test_blank_worker_keeps_last_named_owner_across_hours(conn, monkeypatch):
 
 
 @pytest.mark.parametrize("end", [3600, 5400])
-def test_legacy_query_honors_both_fixed_window_endpoints_without_changing_ledger(conn, monkeypatch, end):
+def test_fixed_window_endpoints_keep_current_statistics_without_legacy_rows(conn, monkeypatch, end):
     for offset in range(0, 10801, 300):
         insert_scan(conn, BASE + offset, "quick", [rec(IP, worker="A", hr=300)])
     monkeypatch.setattr(db.time, "time", lambda: BASE + 10800)
     db.rollup_hours(conn, now=BASE + 10800)
     old = [tuple(r) for r in conn.execute("SELECT * FROM worker_hourly ORDER BY hour,worker")]
+    assert old == []
     row = db.customer_report(conn, 1, until_ts=BASE + end)[0]
-    assert row["delivered_th_h"] == row["legacy_delivered_th_h"] == 300
-    assert row["power_kwh"] == row["legacy_power_kwh"] == 3
+    assert row["delivered_th_h"] == 300 and row["legacy_delivered_th_h"] is None
+    assert row["power_kwh"] == 3 and row["legacy_power_kwh"] is None
     assert [tuple(r) for r in conn.execute("SELECT * FROM worker_hourly ORDER BY hour,worker")] == old
 
 
