@@ -381,7 +381,7 @@ I18N.register('zh', {
   "upd.windows_repair": "请先关闭监控程序窗口，再在 PowerShell 运行说明中的一键恢复命令。恢复后重新打开网页检查更新，现有配置和数据库会保留。",
   "upd.repair_docs": "Windows 更新恢复说明",
   "upd.check_fail": "检查失败：{msg}",
-  "upd.check_hint": "常见原因：服务器连不上 GitHub（外网/代理）、git 没装或不在 PATH。",
+  "upd.check_hint": "常见原因：连不上 GitHub/Gitee、git 不在 PATH；若提示 publickey，在监控机执行：curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/heal-update-remote.sh | sudo bash 后再点检查。",
   "upd.meta": "分支 <code>{b}</code> · 当前版本 <code>{l}</code> · 最新 <code>{r}</code>",
   "upd.checked_at": "检查时间 {when}",
   "upd.latest": "✓ 已是最新版本",

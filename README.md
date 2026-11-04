@@ -212,6 +212,13 @@ Ubuntu 显式传入 `--source github` / `--source gitee` 可在两个官方仓�
 默认自动模式下，官方来源网络失败时可尝试另一平台的同分支，只接受快进更新，不回退到旧镜像版本。
 自定义仓库不会被自动覆盖。自定义安装目录仍需追加 `--dir '/实际安装目录'`。
 Windows 日常从网页更新；GitHub / Gitee 仓库是否已有新版本，取决于发布者的同步情况。
+若网页更新报 `Permission denied (publickey)`（历史 SSH/deploy key 现场），先在监控机执行一次：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/heal-update-remote.sh | sudo bash
+```
+
+把官方 origin 改成匿名 HTTPS 后，再用面板更新即可切到新更新器；之后 GitHub/Gitee 能访问就能更新，不再需要 SSH key。
 更新并重启后，正常刷新网页即可加载新版脚本和语言文件；资源版本自动生成，ZIP 安装也适用。
 详细步骤见[中文指南 · Ubuntu 更新与选择下载源](docs/guide/zh.md#ubuntu-更新与选择下载源)。
 

@@ -283,33 +283,72 @@ def _normalize_public_update_remote(url):
     return raw
 
 
-def _update_fetch_sources():
-    """Official remotes always fetch anonymous HTTPS (GitHub ↔ Gitee fallback).
+def ensure_public_update_remote():
+    """Rewrite official SSH remotes to anonymous HTTPS.
 
-    Custom/private remotes keep using the configured origin credentials.
+    Must run before fetch so:
+      1) this process can update without a deploy key;
+      2) after one successful heal, even an *old* updater that only runs
+         `git fetch origin` can pull the next release (old → new handoff).
+    Custom/private remotes are left untouched.
+    Returns the HTTPS URL when an official remote was healed/confirmed, else "".
     """
-    origin = _git("remote", "get-url", "origin", timeout=15)
+    try:
+        origin = _git("remote", "get-url", "origin", timeout=15)
+    except Exception:  # noqa: BLE001
+        return ""
+    normalized = _normalize_public_update_remote(origin)
+    if normalized not in (GITHUB_HTTPS, GITEE_HTTPS):
+        return ""
+    if origin != normalized:
+        try:
+            _git("remote", "set-url", "origin", normalized, timeout=15)
+            log.info("官方仓库 origin 已改为匿名 HTTPS，网页更新不再依赖 SSH key")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("改写 origin 为 HTTPS 失败(不影响尝试其它更新源): %s", exc)
+            return normalized
+    # Belt-and-suspenders: if anything still passes an old SSH URL to git,
+    # rewrite it to the same HTTPS endpoint (helps mixed tooling / old scripts).
+    for ssh_prefix in (
+        "git@github.com:raphael2025/antmonitor",
+        "git@github.com:raphael2025/antmonitor.git",
+        "ssh://git@github.com/raphael2025/antmonitor",
+        "ssh://git@github.com/raphael2025/antmonitor.git",
+        "git@gitee.com:raphael01/antmonitor",
+        "git@gitee.com:raphael01/antmonitor.git",
+        "ssh://git@gitee.com/raphael01/antmonitor",
+        "ssh://git@gitee.com/raphael01/antmonitor.git",
+    ):
+        target = GITHUB_HTTPS if "github.com" in ssh_prefix else GITEE_HTTPS
+        try:
+            _git("config", f"url.{target}.insteadOf", ssh_prefix, timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+    # Host-alias forms used by historical Ubuntu deploy keys.
+    if normalized == GITHUB_HTTPS:
+        try:
+            _git("config", f"url.{GITHUB_HTTPS}.insteadOf",
+                 "git@github.com-miner-monitor:raphael2025/antmonitor.git", timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+    return normalized
+
+
+def _update_fetch_sources():
+    """Prefer healed `origin` (old-updater compatible), then the other public mirror."""
+    ensure_public_update_remote()
+    try:
+        origin = _git("remote", "get-url", "origin", timeout=15)
+    except Exception:  # noqa: BLE001
+        origin = ""
     normalized = _normalize_public_update_remote(origin)
     if normalized == GITHUB_HTTPS:
-        return [GITHUB_HTTPS, GITEE_HTTPS]
+        # origin first: after ensure(), this is anonymous HTTPS and matches what
+        # legacy updater.py did (`git fetch origin`).
+        return ["origin", GITEE_HTTPS]
     if normalized == GITEE_HTTPS:
-        return [GITEE_HTTPS, GITHUB_HTTPS]
+        return ["origin", GITHUB_HTTPS]
     return ["origin"]
-
-
-def _heal_official_ssh_origin(origin, https_url):
-    """Rewrite official SSH remotes to HTTPS so later git/CLI paths need no key."""
-    if https_url not in (GITHUB_HTTPS, GITEE_HTTPS):
-        return
-    if not (origin.startswith("git@") or origin.startswith("ssh://")):
-        return
-    if origin == https_url:
-        return
-    try:
-        _git("remote", "set-url", "origin", https_url, timeout=15)
-        log.info("官方仓库 origin 已改为匿名 HTTPS，网页更新不再依赖 SSH key")
-    except Exception as exc:  # noqa: BLE001
-        log.warning("改写 origin 为 HTTPS 失败(不影响本次更新): %s", exc)
 
 
 def _fetch_update_refs():
@@ -317,14 +356,9 @@ def _fetch_update_refs():
     # Match the normal origin refspec behavior because legacy dev -> main
     # migration needs origin/main to be available after the fetch.
     refspec = "+refs/heads/*:refs/remotes/origin/*"
-    origin = _git("remote", "get-url", "origin", timeout=15)
     for source in _update_fetch_sources():
         try:
             _git("fetch", "--quiet", source, refspec, timeout=120)
-            # After a successful public HTTPS fetch, rewrite leftover official SSH
-            # origins so install.sh / manual git also stop needing deploy keys.
-            if source in (GITHUB_HTTPS, GITEE_HTTPS):
-                _heal_official_ssh_origin(origin, source)
             return
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{source}: {str(exc)[-500:]}")
@@ -344,6 +378,7 @@ def check(branch=None):
                 "windows_repair": os.name == "nt",
                 "error": f"git 无法读取本目录: {str(e)[:200]}"}
     try:
+        ensure_public_update_remote()
         cur = _git("rev-parse", "--abbrev-ref", "HEAD")
         if branch and cur != "HEAD" and cur != branch:
             return {"git": True, "error": f"配置跟踪分支 {branch}，但本地当前在 {cur} 分支；"

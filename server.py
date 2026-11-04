@@ -11,6 +11,11 @@ if __name__ == "__main__":
     # 连续几次后在这里自动回滚到上一版(见 updater.boot_guard)
     import updater as _updater
     _updater.boot_guard()
+    # 官方 SSH origin → 匿名 HTTPS：启动时先改好，旧更新器下次也能 `git fetch origin`
+    try:
+        _updater.ensure_public_update_remote()
+    except Exception:  # noqa: BLE001
+        pass
 
 import asyncio
 import contextlib
@@ -80,6 +85,10 @@ async def lifespan(app_):
     if _start_cloud_report():
         log.info("云端上报已启动 → %s (场地: %s, ID: %s)", CFG["cloud"]["url"],
                  CFG["cloud"]["site_name"], cloud_report.site_id(CFG))
+    try:
+        updater.ensure_public_update_remote()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("启动时自愈更新源失败: %s", exc)
     updater.start_auto(CFG.get("update") or {})
     # 新版本稳定运行 60 秒 → 确认更新成功(清掉回滚标记)
     _h = threading.Timer(updater.HEALTHY_AFTER_SEC, updater.mark_healthy)

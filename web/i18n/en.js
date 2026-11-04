@@ -381,7 +381,7 @@ I18N.register('en', {
   "upd.windows_repair": "Close the monitor window, then run the one-command repair in PowerShell as described below. Reopen the web page and check for updates. Your configuration and database are preserved.",
   "upd.repair_docs": "Windows update recovery guide",
   "upd.check_fail": "Check failed: {msg}",
-  "upd.check_hint": "Common causes: no GitHub access, missing git/PATH.",
+  "upd.check_hint": "Common causes: no GitHub/Gitee access, missing git/PATH. If you see publickey, run on the monitor host: curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/heal-update-remote.sh | sudo bash — then check again.",
   "upd.meta": "Branch <code>{b}</code> · local <code>{l}</code> · remote <code>{r}</code>",
   "upd.checked_at": "Checked {when}",
   "upd.latest": "✓ Up to date",

@@ -236,25 +236,31 @@ def test_boot_guard_rolls_back_a_legacy_switch_to_dev(state, monkeypatch, tmp_pa
     assert _head(site) == ("dev", "v = 1\n")
 
 
-def test_official_ssh_alias_update_uses_public_https(monkeypatch):
+def test_official_ssh_alias_is_healed_before_origin_fetch(monkeypatch):
+    """Heal SSH → HTTPS first, then fetch `origin` (same as old updater)."""
     calls = []
-    origin = "git@github.com-miner-monitor:raphael2025/antmonitor.git"
+    state = {"origin": "git@github.com-miner-monitor:raphael2025/antmonitor.git"}
 
     def fake_git(*args, **kwargs):
         if args[:3] == ("remote", "get-url", "origin"):
-            return origin
+            return state["origin"]
+        if args[:3] == ("remote", "set-url", "origin"):
+            state["origin"] = args[3]
+            calls.append(args)
+            return ""
+        if args[0] == "config":
+            calls.append(args)
+            return ""
         calls.append(args)
         return ""
 
     monkeypatch.setattr(updater, "_git", fake_git)
-    assert updater._update_fetch_sources() == [
-        updater.GITHUB_HTTPS,
-        updater.GITEE_HTTPS,
-    ]
+    assert updater._update_fetch_sources() == ["origin", updater.GITEE_HTTPS]
+    assert state["origin"] == updater.GITHUB_HTTPS
     updater._fetch_update_refs()
-    assert calls[0][0:3] == ("fetch", "--quiet", updater.GITHUB_HTTPS)
-    assert calls[0][3] == "+refs/heads/*:refs/remotes/origin/*"
-    assert ("remote", "set-url", "origin", updater.GITHUB_HTTPS) in calls
+    fetch = [c for c in calls if c and c[0] == "fetch"][0]
+    assert fetch[0:3] == ("fetch", "--quiet", "origin")
+    assert fetch[3] == "+refs/heads/*:refs/remotes/origin/*"
 
 
 def test_official_github_https_falls_back_to_gitee(monkeypatch):
@@ -263,6 +269,8 @@ def test_official_github_https_falls_back_to_gitee(monkeypatch):
     def fake_git(*args, **kwargs):
         if args[:3] == ("remote", "get-url", "origin"):
             return updater.GITHUB_HTTPS
+        if args[0] == "config":
+            return ""
         if args[0] == "fetch":
             attempts.append(args[2])
             if len(attempts) == 1:
@@ -272,7 +280,7 @@ def test_official_github_https_falls_back_to_gitee(monkeypatch):
 
     monkeypatch.setattr(updater, "_git", fake_git)
     updater._fetch_update_refs()
-    assert attempts == [updater.GITHUB_HTTPS, updater.GITEE_HTTPS]
+    assert attempts == ["origin", updater.GITEE_HTTPS]
 
 
 def test_custom_origin_keeps_origin_credentials(monkeypatch):
@@ -283,6 +291,37 @@ def test_custom_origin_keeps_origin_credentials(monkeypatch):
 
     monkeypatch.setattr(updater, "_git", fake_git)
     assert updater._update_fetch_sources() == ["origin"]
+
+
+def test_ensure_heals_ssh_so_old_fetch_origin_would_work(tmp_path, monkeypatch):
+    """After ensure(), plain `git fetch origin` works — the old updater handoff."""
+    import subprocess
+
+    def g(*a, cwd):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                       cwd=cwd, check=True, capture_output=True)
+
+    bare, work, site = tmp_path / "bare.git", tmp_path / "work", tmp_path / "site"
+    g("init", "-q", "--bare", "-b", "main", str(bare), cwd=tmp_path)
+    g("clone", "-q", str(bare), str(work), cwd=tmp_path)
+    (work / "a.py").write_text("1\n")
+    g("add", "-A", cwd=work)
+    g("commit", "-q", "-m", "one", cwd=work)
+    g("push", "-q", "origin", "HEAD:main", cwd=work)
+    g("clone", "-q", str(bare), str(site), cwd=tmp_path)
+    # Pretend a broken historical SSH remote while the real objects stay on the bare repo.
+    subprocess.run(["git", "remote", "set-url", "origin",
+                    "git@github.com-miner-monitor:raphael2025/antmonitor.git"],
+                   cwd=site, check=True)
+    # Point insteadOf / set-url heal at the local bare repo by monkeypatching constants.
+    monkeypatch.setattr(updater, "BASE", str(site))
+    monkeypatch.setattr(updater, "GITHUB_HTTPS", str(bare))
+    monkeypatch.setattr(updater, "GITEE_HTTPS", str(bare))
+    assert updater.ensure_public_update_remote() == str(bare)
+    assert subprocess.run(["git", "remote", "get-url", "origin"], cwd=site,
+                          capture_output=True, text=True).stdout.strip() == str(bare)
+    # Old updater behavior: only fetch origin.
+    assert subprocess.run(["git", "fetch", "--quiet", "origin"], cwd=site).returncode == 0
 
 
 @pytest.mark.parametrize("origin", [
