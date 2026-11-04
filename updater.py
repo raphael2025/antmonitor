@@ -13,6 +13,8 @@
 约定：
 - 部署机以 git clone 方式部署，config.yaml/数据库等本机文件已被 .gitignore 排除，
   更新永远不会碰配置和数据。
+- 官方 GitHub/Gitee 仓库的网页更新走匿名 HTTPS（SSH deploy key 不是必需的）；
+  一端不可达时自动试另一端。自定义/私有 origin 仍用原凭证。
 - 生产建议跟踪专用 release 分支(update.branch)，开发分支随便推不影响线上。
 - Docker 部署不用本更新器（重建镜像），见 docs/DEPLOY.md。
 """
@@ -238,6 +240,131 @@ def _can_leave_legacy():
         return False
 
 
+GITHUB_HTTPS = "https://github.com/raphael2025/antmonitor.git"
+GITEE_HTTPS = "https://gitee.com/raphael01/antmonitor.git"
+
+
+def _normalize_public_update_remote(url):
+    """Official public mirrors must never require an SSH key for read-only updates."""
+    raw = str(url or "").strip()
+    comparable = raw.rstrip("/")
+    if comparable.endswith(".git"):
+        comparable = comparable[:-4]
+
+    # Standard official URLs.
+    official = {
+        "https://github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "http://github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "git@github.com:raphael2025/antmonitor": GITHUB_HTTPS,
+        "ssh://git@github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "https://gitee.com/raphael01/antmonitor": GITEE_HTTPS,
+        "http://gitee.com/raphael01/antmonitor": GITEE_HTTPS,
+        "git@gitee.com:raphael01/antmonitor": GITEE_HTTPS,
+        "ssh://git@gitee.com/raphael01/antmonitor": GITEE_HTTPS,
+    }
+    if comparable in official:
+        return official[comparable]
+
+    # Historical deployments used SSH Host aliases such as
+    # github.com-miner-monitor. They still point at the same public project but
+    # fail as soon as the corresponding deploy key disappears.
+    if comparable.startswith("git@github.com-") and comparable.endswith(
+            ":raphael2025/antmonitor"):
+        return GITHUB_HTTPS
+    if comparable.startswith("ssh://git@github.com-") and comparable.endswith(
+            "/raphael2025/antmonitor"):
+        return GITHUB_HTTPS
+    if comparable.startswith("git@gitee.com-") and comparable.endswith(
+            ":raphael01/antmonitor"):
+        return GITEE_HTTPS
+    if comparable.startswith("ssh://git@gitee.com-") and comparable.endswith(
+            "/raphael01/antmonitor"):
+        return GITEE_HTTPS
+    return raw
+
+
+def ensure_public_update_remote():
+    """Rewrite official SSH remotes to anonymous HTTPS.
+
+    Must run before fetch so:
+      1) this process can update without a deploy key;
+      2) after one successful heal, even an *old* updater that only runs
+         `git fetch origin` can pull the next release (old → new handoff).
+    Custom/private remotes are left untouched.
+    Returns the HTTPS URL when an official remote was healed/confirmed, else "".
+    """
+    try:
+        origin = _git("remote", "get-url", "origin", timeout=15)
+    except Exception:  # noqa: BLE001
+        return ""
+    normalized = _normalize_public_update_remote(origin)
+    if normalized not in (GITHUB_HTTPS, GITEE_HTTPS):
+        return ""
+    if origin != normalized:
+        try:
+            _git("remote", "set-url", "origin", normalized, timeout=15)
+            log.info("官方仓库 origin 已改为匿名 HTTPS，网页更新不再依赖 SSH key")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("改写 origin 为 HTTPS 失败(不影响尝试其它更新源): %s", exc)
+            return normalized
+    # Belt-and-suspenders: if anything still passes an old SSH URL to git,
+    # rewrite it to the same HTTPS endpoint (helps mixed tooling / old scripts).
+    for ssh_prefix in (
+        "git@github.com:raphael2025/antmonitor",
+        "git@github.com:raphael2025/antmonitor.git",
+        "ssh://git@github.com/raphael2025/antmonitor",
+        "ssh://git@github.com/raphael2025/antmonitor.git",
+        "git@gitee.com:raphael01/antmonitor",
+        "git@gitee.com:raphael01/antmonitor.git",
+        "ssh://git@gitee.com/raphael01/antmonitor",
+        "ssh://git@gitee.com/raphael01/antmonitor.git",
+    ):
+        target = GITHUB_HTTPS if "github.com" in ssh_prefix else GITEE_HTTPS
+        try:
+            _git("config", f"url.{target}.insteadOf", ssh_prefix, timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+    # Host-alias forms used by historical Ubuntu deploy keys.
+    if normalized == GITHUB_HTTPS:
+        try:
+            _git("config", f"url.{GITHUB_HTTPS}.insteadOf",
+                 "git@github.com-miner-monitor:raphael2025/antmonitor.git", timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+    return normalized
+
+
+def _update_fetch_sources():
+    """Prefer healed `origin` (old-updater compatible), then the other public mirror."""
+    ensure_public_update_remote()
+    try:
+        origin = _git("remote", "get-url", "origin", timeout=15)
+    except Exception:  # noqa: BLE001
+        origin = ""
+    normalized = _normalize_public_update_remote(origin)
+    if normalized == GITHUB_HTTPS:
+        # origin first: after ensure(), this is anonymous HTTPS and matches what
+        # legacy updater.py did (`git fetch origin`).
+        return ["origin", GITEE_HTTPS]
+    if normalized == GITEE_HTTPS:
+        return ["origin", GITHUB_HTTPS]
+    return ["origin"]
+
+
+def _fetch_update_refs():
+    errors = []
+    # Match the normal origin refspec behavior because legacy dev -> main
+    # migration needs origin/main to be available after the fetch.
+    refspec = "+refs/heads/*:refs/remotes/origin/*"
+    for source in _update_fetch_sources():
+        try:
+            _git("fetch", "--quiet", source, refspec, timeout=120)
+            return
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{source}: {str(exc)[-500:]}")
+    raise RuntimeError("公开更新源均不可达: " + " | ".join(errors)[-1200:])
+
+
 def check(branch=None):
     """返回 {git, branch, local, remote, behind, changes[], checked_ts} 或 {git:False/error}。"""
     try:
@@ -251,6 +378,7 @@ def check(branch=None):
                 "windows_repair": os.name == "nt",
                 "error": f"git 无法读取本目录: {str(e)[:200]}"}
     try:
+        ensure_public_update_remote()
         cur = _git("rev-parse", "--abbrev-ref", "HEAD")
         if branch and cur != "HEAD" and cur != branch:
             return {"git": True, "error": f"配置跟踪分支 {branch}，但本地当前在 {cur} 分支；"
@@ -260,7 +388,7 @@ def check(branch=None):
         if branch == "HEAD":   # detached HEAD(按 tag/提交部署)：别悄悄跟到远端默认分支
             return {"git": True, "error": "当前不在任何分支上(detached HEAD)，"
                                           "请在 config.yaml 配置 update.branch 或先 git checkout 分支"}
-        _git("fetch", "--quiet", "origin", timeout=120)
+        _fetch_update_refs()
         switch_from = ""
         if legacy and _can_leave_legacy():
             # 旧版 install.sh 默认装在 dev 分支，dev 早已不再更新：这些现场按当前分支跟踪

@@ -294,8 +294,31 @@ official_origin() {
     git@github.com:raphael2025/antmonitor|ssh://git@github.com/raphael2025/antmonitor|\
     https://gitee.com/raphael01/antmonitor|http://gitee.com/raphael01/antmonitor|\
     git@gitee.com:raphael01/antmonitor|ssh://git@gitee.com/raphael01/antmonitor) return 0 ;;
+    # 历史现场 SSH Host 别名(如 github.com-miner-monitor)，仍指向同一官方仓库
+    git@github.com-*:raphael2025/antmonitor|ssh://git@github.com-*/raphael2025/antmonitor|\
+    git@gitee.com-*:raphael01/antmonitor|ssh://git@gitee.com-*/raphael01/antmonitor) return 0 ;;
   esac
   [[ -n "$GH_PROXY" && "$url" == "${GH_PROXY}https://github.com/raphael2025/antmonitor" ]]
+}
+
+heal_official_ssh_origin() {
+  # 官方 SSH origin 改为匿名 HTTPS，避免网页/脚本更新依赖 deploy key
+  [[ -e "$INSTALL_DIR/.git" ]] || return 0
+  command -v git >/dev/null || return 0
+  local g=(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR")
+  local origin heal=""
+  origin="$("${g[@]}" remote get-url origin 2>/dev/null)" || return 0
+  official_origin "$origin" || return 0
+  case "$origin" in
+    git@github.com:*|git@github.com-*:*|ssh://git@github.com/*|ssh://git@github.com-*)
+      heal="${GH_PROXY}https://github.com/raphael2025/antmonitor.git" ;;
+    git@gitee.com:*|git@gitee.com-*:*|ssh://git@gitee.com/*|ssh://git@gitee.com-*)
+      heal="https://gitee.com/raphael01/antmonitor.git" ;;
+    *) return 0 ;;
+  esac
+  [[ "$origin" == "$heal" ]] && return 0
+  "${g[@]}" remote set-url origin "$heal"
+  info "官方仓库 origin 已改为匿名 HTTPS（不再需要 SSH key）"
 }
 
 sync_origin_source() {
@@ -378,6 +401,7 @@ sync_code() {
     # 沿用现场当前分支(网页更新也是跟它)；只有显式设了 ANTMONITOR_BRANCH 才切换分支
     local br
     local g=(git -c safe.directory="$INSTALL_DIR" -C "$INSTALL_DIR")
+    heal_official_ssh_origin
     br="$("${g[@]}" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
     if [[ -n "${ANTMONITOR_BRANCH:-}" || "$br" == "HEAD" ]]; then
       br="$BRANCH"
