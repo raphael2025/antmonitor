@@ -625,12 +625,15 @@ async function refreshRacks() {
   }).join("");
 }
 
+let _workerSeq = 0;
 async function refreshWorkers() {
   if (view !== "worker") return;
+  const seq = ++_workerSeq;
   const period = parseInt($("workerPeriod").value) || 0;
   $("btnExportCsv").classList.toggle("hidden", period === 0);   // 仅周期报表可导出CSV
+  const d = await jget(period === 0 ? "/api/workers" : `/api/reports/customers?hours=${period}`);
+  if (seq !== _workerSeq || view !== "worker" || period !== (parseInt($("workerPeriod").value) || 0)) return;
   if (period === 0) {
-    const d = await jget("/api/workers");
     $("workerList").innerHTML = (d.workers || []).map(w => {
       const models = Object.entries(w.models).sort((a, b) => b[1] - a[1])
         .map(([m, c]) => `<div class="wmodel">${esc(t("worker.models", { m, c }).replace(String(c), "") )}<b>${c}</b></div>`).join("");
@@ -641,7 +644,6 @@ async function refreshWorkers() {
         + `<div class="wmodels">${models}</div></div>`;
     }).join("") || `<div class="muted">${esc(t("worker.none"))}</div>`;
   } else {
-    const d = await jget(`/api/reports/customers?hours=${period}`);
     // 周期超过可用数据被截断时给出提示
     const note = d.truncated
       ? `<div class="muted" style="margin-bottom:8px">${esc(t("worker.cover_warn", { d: (d.covered_hours / 24).toFixed(1) }))}</div>`
@@ -670,6 +672,7 @@ function rateAgo(seconds) {
 
 let view = "list";   // list | rack | worker
 function setView(v) {
+  _workerSeq++;   // 离开视图也作废仍在途的报表请求。
   view = v;
   $("listView").classList.toggle("hidden", v !== "list");
   $("rackView").classList.toggle("hidden", v !== "rack");

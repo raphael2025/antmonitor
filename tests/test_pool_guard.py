@@ -113,8 +113,9 @@ def _set_pools(c, url):
 def test_set_pools_blocked_without_allowlist_and_outside_it(monkeypatch):
     server, c = _client(monkeypatch)
     sent = []
-    monkeypatch.setattr(server.control, "run_batch", lambda t, a, p, cfg, **k: (
-        sent.append(p) or [{"ip": ip, "ok": True, "msg": "pools updated"} for ip, _ in t], ""))
+    # Stub only the device boundary so real grouping and audit callbacks still run.
+    monkeypatch.setattr(server.control, "_run_group", lambda t, a, p, cfg: (
+        sent.append(p) or [{"ip": ip, "ok": True, "msg": "pools updated"} for ip, _ in t]))
     monkeypatch.setitem(server.CFG["control"], "pool_allowlist", [])
     r = _set_pools(c, "stratum+tcp://btc.f2pool.com:3333")
     assert r.status_code == 403 and "白名单" in r.json()["error"] and not sent

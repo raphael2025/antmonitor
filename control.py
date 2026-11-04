@@ -24,9 +24,20 @@ import miner_core
 ACTIONS = {"reboot", "locate", "set_pools"}
 
 
-def flush_reboot_audit(svc):
-    """共享重启锁内调用；未写入的执行记录补记成功前，不再允许新的重启。"""
+def flush_command_audit(svc):
+    """共享设备锁内补记换池/定位结果，保留原执行时间；失败则由调用方停止下发。"""
     import db
+    pending = getattr(svc, "_pending_command_audit", [])
+    while pending:
+        ts, user, action, results = pending[0]
+        db.log_commands(svc.conn, user, action, results, ts=ts)
+        pending.pop(0)
+
+
+def flush_reboot_audit(svc):
+    """手动/自动重启统一先补齐所有设备审计，失败时不能绕过换池的失败保护。"""
+    import db
+    flush_command_audit(svc)
     pending = getattr(svc, "_pending_reboot_audit", [])
     while pending:
         ts, user, results = pending[0]
@@ -431,11 +442,12 @@ def run_batch(targets, action, params, cfg, progress=None, before_group=None, af
         return [], "不支持的命令"
     ctl = cfg.get("control", {})
     targets = list(targets)
-    batch = int(ctl.get("reboot_concurrency", 0) or 0) if action == "reboot" else 0
-    delay = float(ctl.get("reboot_delay_sec", 0) or 0)
+    # 非重启命令也按线程池上限分组，让完成结果在下一批下发前持久化。
+    batch = int(ctl.get("reboot_concurrency", 0) or 0) if action == "reboot" else 64
+    delay = float(ctl.get("reboot_delay_sec", 0) or 0) if action == "reboot" else 0
 
     if batch and batch > 0 and len(targets) > batch:
-        if ctl.get("reboot_shuffle", True):
+        if action == "reboot" and ctl.get("reboot_shuffle", True):
             random.shuffle(targets)   # 打乱：把同变压器的连号机器分散到不同批次/时间
         groups = [targets[i:i + batch] for i in range(0, len(targets), batch)]
     else:

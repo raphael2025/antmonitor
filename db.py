@@ -17,17 +17,17 @@ import sqlite3
 import sys
 import threading
 import time
+import weakref
 
 import logs
 
 log = logs.get(__name__)
 
-_wlock = threading.RLock()   # 只保护写连接；读连接每线程独立，无需加锁
+_wlock = threading.RLock()   # 只保护写连接；读查询不取这把锁
 _DB_PATH = None
 _local = threading.local()
-_readers = []                # 所有读连接(仅用于进程退出时统一关闭)
+_readers = weakref.WeakSet()  # 线程结束即可释放，维护任务不会延长连接寿命
 _readers_lock = threading.Lock()
-_reader_gen = 0              # 代数：close_readers() 后 +1，使各线程缓存的旧句柄失效
 
 HOUR = 3600
 MAX_SAMPLE_GAP = 900   # 最后一次实际采样最多代表 15 分钟。
@@ -77,36 +77,107 @@ def connect(path, query_only=False):
     return conn
 
 
-def _r(conn):
-    """本线程只读连接；测试用内存库(或未 init_db)时回退到传入的写连接。
+class _ReadResult:
+    """已读取的查询结果，不再占用 SQLite 游标或读事务。"""
 
-    缓存键带上库路径和"代数"：close_readers() 之后线程本地那份句柄已经失效，
-    若还照旧复用就会抛 "Cannot operate on a closed database"。换库(测试)同理。"""
+    def __init__(self, rows):
+        self._rows = rows
+        self._index = 0
+
+    def fetchone(self):
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows if self._index == 0 else self._rows[self._index:]
+        self._rows, self._index = [], 0
+        return rows
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+
+class _Reader:
+    """线程自己的只读连接；维护仅关闭空闲连接，忙时延后到查询完成。
+
+    本模块的查询均一次性读取结果。execute 在连接锁内取完行，避免清理任务
+    关闭仍在 fetch 的游标；锁只保护本线程连接，不会串行化其他线程的读取。
+    调用方保留的句柄在清理后仍可使用，会按原路径重新打开只读连接。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._conn = None
+        self._lock = threading.Lock()
+        self._retire = threading.Event()
+
+    def _close(self):
+        if self._conn is None:
+            return 0
+        self._conn.close()
+        self._conn = None
+        return 1
+
+    def execute(self, sql, parameters=()):
+        with self._lock:
+            try:
+                if self._conn is None:
+                    self._conn = connect(self.path, query_only=True)
+                cursor = self._conn.execute(sql, parameters)
+                try:
+                    return _ReadResult(cursor.fetchall())
+                finally:
+                    cursor.close()
+            finally:
+                if self._retire.is_set():
+                    self._close()
+                    self._retire.clear()
+
+    def retire(self):
+        self._retire.set()
+        if not self._lock.acquire(blocking=False):
+            return 0
+        try:
+            closed = self._close()
+            self._retire.clear()
+            return closed
+        finally:
+            self._lock.release()
+
+    def __del__(self):
+        try:
+            self._close()
+        except Exception:  # 解释器退出时 SQLite 模块可能已释放。
+            pass
+
+
+def _r(conn):
+    """本线程只读句柄；测试用内存库(或未 init_db)时回退到写连接。"""
     if not _DB_PATH or _DB_PATH == ":memory:":
         return conn
-    st = getattr(_local, "reader", None)
-    if st is not None and st[0] == _DB_PATH and st[1] == _reader_gen:
-        return st[2]
-    c = connect(_DB_PATH, query_only=True)
-    _local.reader = (_DB_PATH, _reader_gen, c)
-    with _readers_lock:
-        _readers.append(c)
-    return c
+    reader = getattr(_local, "reader", None)
+    if reader is None or reader.path != _DB_PATH:
+        reader = _Reader(_DB_PATH)
+        _local.reader = reader
+        with _readers_lock:
+            _readers.add(reader)
+    return reader
 
 
 def close_readers():
-    """关闭所有只读连接并作废缓存(各线程下次访问时会自动重建)。返回关闭的连接数。"""
-    global _reader_gen
+    """回收空闲只读连接，活跃查询完成后再关闭；返回立即关闭的连接数。"""
     with _readers_lock:
-        _reader_gen += 1
-        n = len(_readers)
-        for c in _readers:
-            try:
-                c.close()
-            except Exception:  # noqa: BLE001
-                pass
-        _readers.clear()
-        return n
+        readers = list(_readers)
+    return sum(reader.retire() for reader in readers)
 
 
 SCHEMA = """
@@ -528,10 +599,10 @@ def prev_scan_id(conn, before_id, kind=None):
 
 def upsert_known_miners(conn, recs, ts):
     """在线矿机记入名册 + 记住身份(型号/SN/矿工名/固件)，供掉线后仍可识别/搜索。
-    不覆盖已有 state(维修标记保留)；身份字段仅在本次非空时更新。"""
+    不覆盖已有 state(维修标记保留)；缺测通常保留身份，可靠 MAC 换机则作废旧 SN。"""
     if not recs:
         return
-    from miner_core import sn_valid   # 延迟导入：db 不该在模块级依赖扫描层
+    from miner_core import normalize_mac, sn_valid   # 延迟导入：db 不该在模块级依赖扫描层
     rows = []
     for r in recs:
         if isinstance(r, str):
@@ -543,9 +614,23 @@ def upsert_known_miners(conn, recs, ts):
             if measured is None or measured > ts + 60:
                 continue
             rows.append((r["ip"], int(measured), r.get("model") or "", sn if sn_valid(sn) else "",
-                         r.get("mac") or "",
+                         normalize_mac(r.get("mac")),
                          r.get("worker") or "", r.get("firmware") or ""))
     with _wlock, conn:
+        # 与实际写入持同一把锁：新机没有 SN 时，不能让上一台的 SN 在掉线后被回填，
+        # 否则旧机换 IP 上线会把这台新机误标为 migrated。MAC 必须先校验、规范化。
+        identities = {r["ip"]: (r["sn"], normalize_mac(r["mac"])) for r in
+                      conn.execute("SELECT ip,sn,mac FROM known_miners").fetchall()}
+        updates = []
+        for row in rows:
+            ip, _ts, _model, sn, mac, _worker, _firmware = row
+            old_sn, old_mac = identities.get(ip, ("", ""))
+            new_mac = normalize_mac(mac)
+            clear_sn = bool(not sn and old_mac and new_mac and old_mac != new_mac)
+            updates.append((*row, clear_sn))
+            # 同批次若包含重复 IP，也按上一条更新后的身份继续比较。
+            identities[ip] = (sn or ("" if clear_sn else old_sn),
+                              new_mac if mac else ("" if sn and sn != old_sn else old_mac))
         conn.executemany(
             "INSERT INTO known_miners(ip,last_online,state,model,sn,mac,worker,firmware) "
             "VALUES(?,?,'active',?,?,?,?,?) "
@@ -553,7 +638,7 @@ def upsert_known_miners(conn, recs, ts):
             "state=CASE WHEN known_miners.state='migrated' THEN 'active' "
             "ELSE known_miners.state END, "
             "model=CASE WHEN excluded.model!='' THEN excluded.model ELSE known_miners.model END, "
-            "sn=CASE WHEN excluded.sn!='' THEN excluded.sn ELSE known_miners.sn END, "
+            "sn=CASE WHEN excluded.sn!='' THEN excluded.sn WHEN ? THEN '' ELSE known_miners.sn END, "
             # 同一 IP 换了一台机(SN 变了)：旧 MAC 属于上一台，作废，否则残影判定会张冠李戴
             "mac=CASE WHEN excluded.mac!='' THEN excluded.mac "
             "WHEN excluded.sn!='' AND excluded.sn!=known_miners.sn THEN '' "
@@ -561,7 +646,7 @@ def upsert_known_miners(conn, recs, ts):
             "worker=CASE WHEN excluded.worker!='' THEN excluded.worker ELSE known_miners.worker END, "
             "firmware=CASE WHEN excluded.firmware!='' THEN excluded.firmware "
             "ELSE known_miners.firmware END",
-            rows)
+            updates)
 
 
 def known_identity(conn):
