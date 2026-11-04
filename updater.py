@@ -13,6 +13,8 @@
 约定：
 - 部署机以 git clone 方式部署，config.yaml/数据库等本机文件已被 .gitignore 排除，
   更新永远不会碰配置和数据。
+- 官方 GitHub/Gitee 仓库的网页更新走匿名 HTTPS（SSH deploy key 不是必需的）；
+  一端不可达时自动试另一端。自定义/私有 origin 仍用原凭证。
 - 生产建议跟踪专用 release 分支(update.branch)，开发分支随便推不影响线上。
 - Docker 部署不用本更新器（重建镜像），见 docs/DEPLOY.md。
 """
@@ -238,6 +240,10 @@ def _can_leave_legacy():
         return False
 
 
+GITHUB_HTTPS = "https://github.com/raphael2025/antmonitor.git"
+GITEE_HTTPS = "https://gitee.com/raphael01/antmonitor.git"
+
+
 def _normalize_public_update_remote(url):
     """Official public mirrors must never require an SSH key for read-only updates."""
     raw = str(url or "").strip()
@@ -247,22 +253,14 @@ def _normalize_public_update_remote(url):
 
     # Standard official URLs.
     official = {
-        "https://github.com/raphael2025/antmonitor":
-            "https://github.com/raphael2025/antmonitor.git",
-        "http://github.com/raphael2025/antmonitor":
-            "https://github.com/raphael2025/antmonitor.git",
-        "git@github.com:raphael2025/antmonitor":
-            "https://github.com/raphael2025/antmonitor.git",
-        "ssh://git@github.com/raphael2025/antmonitor":
-            "https://github.com/raphael2025/antmonitor.git",
-        "https://gitee.com/raphael01/antmonitor":
-            "https://gitee.com/raphael01/antmonitor.git",
-        "http://gitee.com/raphael01/antmonitor":
-            "https://gitee.com/raphael01/antmonitor.git",
-        "git@gitee.com:raphael01/antmonitor":
-            "https://gitee.com/raphael01/antmonitor.git",
-        "ssh://git@gitee.com/raphael01/antmonitor":
-            "https://gitee.com/raphael01/antmonitor.git",
+        "https://github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "http://github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "git@github.com:raphael2025/antmonitor": GITHUB_HTTPS,
+        "ssh://git@github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "https://gitee.com/raphael01/antmonitor": GITEE_HTTPS,
+        "http://gitee.com/raphael01/antmonitor": GITEE_HTTPS,
+        "git@gitee.com:raphael01/antmonitor": GITEE_HTTPS,
+        "ssh://git@gitee.com/raphael01/antmonitor": GITEE_HTTPS,
     }
     if comparable in official:
         return official[comparable]
@@ -272,31 +270,46 @@ def _normalize_public_update_remote(url):
     # fail as soon as the corresponding deploy key disappears.
     if comparable.startswith("git@github.com-") and comparable.endswith(
             ":raphael2025/antmonitor"):
-        return "https://github.com/raphael2025/antmonitor.git"
+        return GITHUB_HTTPS
     if comparable.startswith("ssh://git@github.com-") and comparable.endswith(
             "/raphael2025/antmonitor"):
-        return "https://github.com/raphael2025/antmonitor.git"
+        return GITHUB_HTTPS
     if comparable.startswith("git@gitee.com-") and comparable.endswith(
             ":raphael01/antmonitor"):
-        return "https://gitee.com/raphael01/antmonitor.git"
+        return GITEE_HTTPS
     if comparable.startswith("ssh://git@gitee.com-") and comparable.endswith(
             "/raphael01/antmonitor"):
-        return "https://gitee.com/raphael01/antmonitor.git"
+        return GITEE_HTTPS
     return raw
 
 
 def _update_fetch_sources():
-    """Return update sources without rewriting the configured origin."""
+    """Official remotes always fetch anonymous HTTPS (GitHub ↔ Gitee fallback).
+
+    Custom/private remotes keep using the configured origin credentials.
+    """
     origin = _git("remote", "get-url", "origin", timeout=15)
     normalized = _normalize_public_update_remote(origin)
-    if normalized == origin:
-        return ["origin"]
-    sources = [normalized]
-    if normalized == "https://github.com/raphael2025/antmonitor.git":
-        sources.append("https://gitee.com/raphael01/antmonitor.git")
-    elif normalized == "https://gitee.com/raphael01/antmonitor.git":
-        sources.append("https://github.com/raphael2025/antmonitor.git")
-    return sources
+    if normalized == GITHUB_HTTPS:
+        return [GITHUB_HTTPS, GITEE_HTTPS]
+    if normalized == GITEE_HTTPS:
+        return [GITEE_HTTPS, GITHUB_HTTPS]
+    return ["origin"]
+
+
+def _heal_official_ssh_origin(origin, https_url):
+    """Rewrite official SSH remotes to HTTPS so later git/CLI paths need no key."""
+    if https_url not in (GITHUB_HTTPS, GITEE_HTTPS):
+        return
+    if not (origin.startswith("git@") or origin.startswith("ssh://")):
+        return
+    if origin == https_url:
+        return
+    try:
+        _git("remote", "set-url", "origin", https_url, timeout=15)
+        log.info("官方仓库 origin 已改为匿名 HTTPS，网页更新不再依赖 SSH key")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("改写 origin 为 HTTPS 失败(不影响本次更新): %s", exc)
 
 
 def _fetch_update_refs():
@@ -304,9 +317,14 @@ def _fetch_update_refs():
     # Match the normal origin refspec behavior because legacy dev -> main
     # migration needs origin/main to be available after the fetch.
     refspec = "+refs/heads/*:refs/remotes/origin/*"
+    origin = _git("remote", "get-url", "origin", timeout=15)
     for source in _update_fetch_sources():
         try:
             _git("fetch", "--quiet", source, refspec, timeout=120)
+            # After a successful public HTTPS fetch, rewrite leftover official SSH
+            # origins so install.sh / manual git also stop needing deploy keys.
+            if source in (GITHUB_HTTPS, GITEE_HTTPS):
+                _heal_official_ssh_origin(origin, source)
             return
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{source}: {str(exc)[-500:]}")

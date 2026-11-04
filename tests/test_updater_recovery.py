@@ -23,6 +23,9 @@ def _fake_git(calls, head="aaa", remote="bbb", fail_reset=False):
             return ".git"
         if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
             return "dev"
+        if args[:3] == ("remote", "get-url", "origin"):
+            # Non-official remote: keep using origin credentials in unit tests.
+            return "file:///tmp/antmonitor-test-origin.git"
         if args[0] == "fetch":
             return ""
         if args == ("rev-parse", "HEAD"):
@@ -235,40 +238,41 @@ def test_boot_guard_rolls_back_a_legacy_switch_to_dev(state, monkeypatch, tmp_pa
 
 def test_official_ssh_alias_update_uses_public_https(monkeypatch):
     calls = []
+    origin = "git@github.com-miner-monitor:raphael2025/antmonitor.git"
+
     def fake_git(*args, **kwargs):
         if args[:3] == ("remote", "get-url", "origin"):
-            return "git@github.com-miner-monitor:raphael2025/antmonitor.git"
+            return origin
         calls.append(args)
         return ""
+
     monkeypatch.setattr(updater, "_git", fake_git)
     assert updater._update_fetch_sources() == [
-        "https://github.com/raphael2025/antmonitor.git",
-        "https://gitee.com/raphael01/antmonitor.git",
+        updater.GITHUB_HTTPS,
+        updater.GITEE_HTTPS,
     ]
     updater._fetch_update_refs()
-    assert calls[0][0:3] == (
-        "fetch", "--quiet", "https://github.com/raphael2025/antmonitor.git"
-    )
+    assert calls[0][0:3] == ("fetch", "--quiet", updater.GITHUB_HTTPS)
     assert calls[0][3] == "+refs/heads/*:refs/remotes/origin/*"
+    assert ("remote", "set-url", "origin", updater.GITHUB_HTTPS) in calls
 
 
 def test_official_github_https_falls_back_to_gitee(monkeypatch):
     attempts = []
+
     def fake_git(*args, **kwargs):
         if args[:3] == ("remote", "get-url", "origin"):
-            return "https://github.com/raphael2025/antmonitor.git"
+            return updater.GITHUB_HTTPS
         if args[0] == "fetch":
             attempts.append(args[2])
             if len(attempts) == 1:
                 raise RuntimeError("github unavailable")
             return ""
         return ""
+
     monkeypatch.setattr(updater, "_git", fake_git)
     updater._fetch_update_refs()
-    assert attempts == [
-        "https://github.com/raphael2025/antmonitor.git",
-        "https://gitee.com/raphael01/antmonitor.git",
-    ]
+    assert attempts == [updater.GITHUB_HTTPS, updater.GITEE_HTTPS]
 
 
 def test_custom_origin_keeps_origin_credentials(monkeypatch):
@@ -276,6 +280,7 @@ def test_custom_origin_keeps_origin_credentials(monkeypatch):
         if args[:3] == ("remote", "get-url", "origin"):
             return "git@example.com:operator/private-monitor.git"
         return ""
+
     monkeypatch.setattr(updater, "_git", fake_git)
     assert updater._update_fetch_sources() == ["origin"]
 
@@ -284,8 +289,7 @@ def test_custom_origin_keeps_origin_credentials(monkeypatch):
     "git@github.com:raphael2025/antmonitor.git",
     "ssh://git@github.com/raphael2025/antmonitor.git",
     "git@github.com-miner-monitor:raphael2025/antmonitor.git",
+    "https://github.com/raphael2025/antmonitor.git",
 ])
 def test_github_public_remote_normalization(origin):
-    assert updater._normalize_public_update_remote(origin) == (
-        "https://github.com/raphael2025/antmonitor.git"
-    )
+    assert updater._normalize_public_update_remote(origin) == updater.GITHUB_HTTPS

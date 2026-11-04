@@ -287,6 +287,14 @@ sys.exit(1 if os.environ.get("TEST_APT_GIT_FAIL") and sys.argv[-1:] == ["git"] e
         self.assertEqual(self.origin(), GITEE)
         self.assertFalse(any("set-url" in row for row in self.calls("git")))
 
+    def test_existing_ssh_host_alias_is_healed_to_https(self):
+        alias = "git@github.com-miner-monitor:raphael2025/antmonitor.git"
+        self.existing(alias)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.origin(), GITHUB)
+        self.assertTrue(any("set-url" in row and GITHUB in row for row in self.calls("git")))
+
     def test_existing_archive_install_migrates_to_gitee_and_preserves_settings(self):
         self.install.mkdir()
         (self.install / "server.py").write_text("# old archive install\n")
