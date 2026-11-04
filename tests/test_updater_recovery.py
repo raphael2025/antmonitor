@@ -231,3 +231,61 @@ def test_boot_guard_rolls_back_a_legacy_switch_to_dev(state, monkeypatch, tmp_pa
         updater.boot_guard()
     assert restarted == [1]
     assert _head(site) == ("dev", "v = 1\n")
+
+
+def test_official_ssh_alias_update_uses_public_https(monkeypatch):
+    calls = []
+    def fake_git(*args, **kwargs):
+        if args[:3] == ("remote", "get-url", "origin"):
+            return "git@github.com-miner-monitor:raphael2025/antmonitor.git"
+        calls.append(args)
+        return ""
+    monkeypatch.setattr(updater, "_git", fake_git)
+    assert updater._update_fetch_sources() == [
+        "https://github.com/raphael2025/antmonitor.git",
+        "https://gitee.com/raphael01/antmonitor.git",
+    ]
+    updater._fetch_update_refs()
+    assert calls[0][0:3] == (
+        "fetch", "--quiet", "https://github.com/raphael2025/antmonitor.git"
+    )
+    assert calls[0][3] == "+refs/heads/*:refs/remotes/origin/*"
+
+
+def test_official_github_https_falls_back_to_gitee(monkeypatch):
+    attempts = []
+    def fake_git(*args, **kwargs):
+        if args[:3] == ("remote", "get-url", "origin"):
+            return "https://github.com/raphael2025/antmonitor.git"
+        if args[0] == "fetch":
+            attempts.append(args[2])
+            if len(attempts) == 1:
+                raise RuntimeError("github unavailable")
+            return ""
+        return ""
+    monkeypatch.setattr(updater, "_git", fake_git)
+    updater._fetch_update_refs()
+    assert attempts == [
+        "https://github.com/raphael2025/antmonitor.git",
+        "https://gitee.com/raphael01/antmonitor.git",
+    ]
+
+
+def test_custom_origin_keeps_origin_credentials(monkeypatch):
+    def fake_git(*args, **kwargs):
+        if args[:3] == ("remote", "get-url", "origin"):
+            return "git@example.com:operator/private-monitor.git"
+        return ""
+    monkeypatch.setattr(updater, "_git", fake_git)
+    assert updater._update_fetch_sources() == ["origin"]
+
+
+@pytest.mark.parametrize("origin", [
+    "git@github.com:raphael2025/antmonitor.git",
+    "ssh://git@github.com/raphael2025/antmonitor.git",
+    "git@github.com-miner-monitor:raphael2025/antmonitor.git",
+])
+def test_github_public_remote_normalization(origin):
+    assert updater._normalize_public_update_remote(origin) == (
+        "https://github.com/raphael2025/antmonitor.git"
+    )

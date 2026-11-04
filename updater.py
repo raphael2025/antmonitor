@@ -238,6 +238,81 @@ def _can_leave_legacy():
         return False
 
 
+def _normalize_public_update_remote(url):
+    """Official public mirrors must never require an SSH key for read-only updates."""
+    raw = str(url or "").strip()
+    comparable = raw.rstrip("/")
+    if comparable.endswith(".git"):
+        comparable = comparable[:-4]
+
+    # Standard official URLs.
+    official = {
+        "https://github.com/raphael2025/antmonitor":
+            "https://github.com/raphael2025/antmonitor.git",
+        "http://github.com/raphael2025/antmonitor":
+            "https://github.com/raphael2025/antmonitor.git",
+        "git@github.com:raphael2025/antmonitor":
+            "https://github.com/raphael2025/antmonitor.git",
+        "ssh://git@github.com/raphael2025/antmonitor":
+            "https://github.com/raphael2025/antmonitor.git",
+        "https://gitee.com/raphael01/antmonitor":
+            "https://gitee.com/raphael01/antmonitor.git",
+        "http://gitee.com/raphael01/antmonitor":
+            "https://gitee.com/raphael01/antmonitor.git",
+        "git@gitee.com:raphael01/antmonitor":
+            "https://gitee.com/raphael01/antmonitor.git",
+        "ssh://git@gitee.com/raphael01/antmonitor":
+            "https://gitee.com/raphael01/antmonitor.git",
+    }
+    if comparable in official:
+        return official[comparable]
+
+    # Historical deployments used SSH Host aliases such as
+    # github.com-miner-monitor. They still point at the same public project but
+    # fail as soon as the corresponding deploy key disappears.
+    if comparable.startswith("git@github.com-") and comparable.endswith(
+            ":raphael2025/antmonitor"):
+        return "https://github.com/raphael2025/antmonitor.git"
+    if comparable.startswith("ssh://git@github.com-") and comparable.endswith(
+            "/raphael2025/antmonitor"):
+        return "https://github.com/raphael2025/antmonitor.git"
+    if comparable.startswith("git@gitee.com-") and comparable.endswith(
+            ":raphael01/antmonitor"):
+        return "https://gitee.com/raphael01/antmonitor.git"
+    if comparable.startswith("ssh://git@gitee.com-") and comparable.endswith(
+            "/raphael01/antmonitor"):
+        return "https://gitee.com/raphael01/antmonitor.git"
+    return raw
+
+
+def _update_fetch_sources():
+    """Return update sources without rewriting the configured origin."""
+    origin = _git("remote", "get-url", "origin", timeout=15)
+    normalized = _normalize_public_update_remote(origin)
+    if normalized == origin:
+        return ["origin"]
+    sources = [normalized]
+    if normalized == "https://github.com/raphael2025/antmonitor.git":
+        sources.append("https://gitee.com/raphael01/antmonitor.git")
+    elif normalized == "https://gitee.com/raphael01/antmonitor.git":
+        sources.append("https://github.com/raphael2025/antmonitor.git")
+    return sources
+
+
+def _fetch_update_refs():
+    errors = []
+    # Match the normal origin refspec behavior because legacy dev -> main
+    # migration needs origin/main to be available after the fetch.
+    refspec = "+refs/heads/*:refs/remotes/origin/*"
+    for source in _update_fetch_sources():
+        try:
+            _git("fetch", "--quiet", source, refspec, timeout=120)
+            return
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{source}: {str(exc)[-500:]}")
+    raise RuntimeError("公开更新源均不可达: " + " | ".join(errors)[-1200:])
+
+
 def check(branch=None):
     """返回 {git, branch, local, remote, behind, changes[], checked_ts} 或 {git:False/error}。"""
     try:
@@ -260,7 +335,7 @@ def check(branch=None):
         if branch == "HEAD":   # detached HEAD(按 tag/提交部署)：别悄悄跟到远端默认分支
             return {"git": True, "error": "当前不在任何分支上(detached HEAD)，"
                                           "请在 config.yaml 配置 update.branch 或先 git checkout 分支"}
-        _git("fetch", "--quiet", "origin", timeout=120)
+        _fetch_update_refs()
         switch_from = ""
         if legacy and _can_leave_legacy():
             # 旧版 install.sh 默认装在 dev 分支，dev 早已不再更新：这些现场按当前分支跟踪
