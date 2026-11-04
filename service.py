@@ -138,17 +138,52 @@ class MonitorService:
         for ip in ips:
             rb.pop(ip, None)
 
+    def _zero_reboot_thermal_blocks(self, records):
+        """自动重启须确认已降温；告警关闭不等于允许绕过温度保护。"""
+        acfg = self.cfg.get("alerts") or {}
+        defaults = appconfig.DEFAULTS["alerts"]
+        hot = data_metrics.measurement(acfg.get("overheat_c"))
+        if not hot:
+            hot = defaults["overheat_c"]
+            clear = defaults["overheat_clear_c"]
+        else:
+            clear = data_metrics.measurement(acfg.get("overheat_clear_c"))
+            if clear is None or clear >= hot:
+                clear = max(0, hot - 5)
+        active = {a["ip"] for a in db.active_alerts_by_type(self.conn, "overheat")}
+        blocked = {}
+        for r in records:
+            ip = r["ip"]
+            temp = data_metrics.measurement(r.get("temp"))
+            if ip in active:
+                blocked[ip] = "高温告警尚未解除，自动重启已暂停"
+            elif temp is None or not miner_core.TEMP_MIN_C <= temp <= miner_core.TEMP_MAX_C:
+                blocked[ip] = "芯片温度缺失或无效，无法确认已降温，自动重启已暂停"
+            elif temp >= hot:
+                blocked[ip] = f"芯片温度 {temp:g}℃ ≥ {hot:g}℃，自动重启已暂停"
+            elif temp >= clear:
+                # Always require a measurement below the recovery threshold. This
+                # also preserves the thermal interlock across a service restart,
+                # without relying on an in-memory high-temperature latch.
+                blocked[ip] = f"芯片温度尚未低于 {clear:g}℃ 回落阈值，自动重启已暂停"
+        return blocked
+
     def zero_reboot_candidates(self, records, now=None):
         """持续零算力重启：首个合格零算力样本起等15分钟，每次尝试后等15分钟，最多4次。"""
         now = int(time.time()) if now is None else int(now)
         ctl = self.cfg.get("control") or {}
         acfg = self.cfg.get("alerts") or {}
         states = db.zero_reboot_states(self.conn)
+        thermal = self._zero_reboot_thermal_blocks(records)
         repair = db.repair_ips(self.conn)
         active_segments = {a["ip"][:-2] for a in db.active_alerts_by_type(self.conn, "segment_down")
                            if a["ip"].endswith(".x")}
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         clear = set(repair) | (set(states) - roster)
+        # 缺温/高温期间不能累计首次自动重启的等候时间；确认降温且告警解除后重新等满15分钟。
+        # 已尝试的次数和真实下发时间保留，不能靠温度变化绕过4次上限。
+        clear.update(ip for ip, st in states.items()
+                     if ip in thermal and int(st.get("attempts") or 0) == 0)
         rebooting = self._alert_state.get("rebooting") or {}
         rb_grace = int(ctl.get("reboot_grace_sec", 600))
         # 旧版可能在离线期间保留了零算力计时。未下发过自动重启的机器，
@@ -247,7 +282,7 @@ class MonitorService:
             if r.get("status") != "online" or r.get("hr_rt") != 0:
                 continue
             seg = ".".join(ip.split(".")[:3])
-            if ip in repair or seg in active_segments or seg in paused:
+            if ip in repair or ip in thermal or seg in active_segments or seg in paused:
                 continue
             # Start the 15-minute timer on the first zero sample. Startup grace is
             # checked separately before sending, so it never delays the timer itself.
@@ -272,7 +307,7 @@ class MonitorService:
                 if grace and isinstance(uptime, (int, float)) and uptime < grace:
                     continue
                 seg = ".".join(ip.split(".")[:3])
-                if ip in repair or seg in active_segments or seg in paused:
+                if ip in repair or ip in thermal or seg in active_segments or seg in paused:
                     continue
             else:
                 # 自动重启只处理在线且明确读到 0 算力的机器。
@@ -337,6 +372,12 @@ class MonitorService:
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         repair = db.repair_ips(self.conn)
         states = db.zero_reboot_states(self.conn)
+        thermal = self._zero_reboot_thermal_blocks(records)
+        # A later batch may see heat that was absent at candidate selection. Do
+        # not retain an unattempted due timer through that safety interruption.
+        db.clear_zero_reboot_states(self.conn, [ip for ip, _fw in targets
+                                    if ip in thermal and ip in states
+                                    and int(states[ip].get("attempts") or 0) == 0])
         active_segments = {a["ip"][:-2] for a in db.active_alerts_by_type(self.conn, "segment_down")
                            if a["ip"].endswith(".x")}
         paused = self._alert_state.get("zero_mass_segs") or set()
@@ -356,6 +397,8 @@ class MonitorService:
                 reason = "最新采样缺失或已过期"
             elif row.get("status") != "online" or data_metrics.measurement(row.get("hr_rt")) != 0:
                 reason = "最新采样已不是在线零算力"
+            elif ip in thermal:
+                reason = thermal[ip]
             elif seg in active_segments or seg in paused:
                 reason = "网段故障或成片零算力事件，自动重启已暂停"
             elif now - int(rebooting.get(ip, 0) or 0) < rb_grace:
@@ -634,9 +677,10 @@ class MonitorService:
         cc["liveness_gate"] = False    # 不走判活闸门，给慢响应机器充分时间
         cc["alive_probe"] = True       # 接口都没应答时补测 80/4028：连得上就不算离线
         cc["max_pps"] = sc.get("max_pps", 100)   # 保留限速，护住三层 ARP/CoPP
-        def rank(r):   # 在线且有算力 > 在线 > 未探测 > 离线
+        def rank(r):   # 在线正算力 > 在线实测零 > 在线缺测 > 未探测 > 离线
             if r["status"] == "online":
-                return 3 if r.get("hr_rt") else 2
+                hr = data_metrics.measurement(r.get("hr_rt"))
+                return (4 if hr > 0 else 3) if hr is not None else 2
             return 1 if r["status"] == "unknown" else 0
 
         # 各轮结果只升不降：任一轮确认在线就算在线。直接覆盖会让后一轮的瞬时丢包
@@ -657,6 +701,9 @@ class MonitorService:
             amap = {r["ip"]: r for r in again if r.get("device") != "container"}
             for ip, r in amap.items():
                 if ip not in fixed or rank(r) > rank(fixed[ip]):
+                    # Keep the complete chosen sample, including measured_ts.
+                    # Mixing old fields into a newer timestamp would falsely
+                    # extend their freshness and historical coverage.
                     fixed[ip] = r
             remaining = [ip for ip, r in amap.items()
                          if r["status"] == "offline" or r.get("hr_rt") in (None, 0)]
@@ -771,11 +818,18 @@ class MonitorService:
             for r in miners:
                 info = ident.get(r["ip"])
                 # 把本轮可用的归属上下文随快照保存，避免旧命名样本被清理后客户归属丢失。
-                # 明确换了 SN 的在线机不能继承这个 IP 上一台矿机的客户名。
+                # 有效 SN 优先；SN 不能可靠对比时，用两次实测的有效 MAC 识别同 IP 换机。
+                # 缺测/无效 MAC 不能作为换机证据，但已证实换机不能继承旧客户。
                 if not r.get("worker") and (r["status"] == "online" or
                         (info and info.get("state") != "migrated")):
-                    changed = bool(info and miner_core.sn_valid(r.get("sn"))
-                                   and miner_core.sn_valid(info.get("sn")) and r["sn"] != info["sn"])
+                    changed = False
+                    if info:
+                        if miner_core.sn_valid(r.get("sn")) and miner_core.sn_valid(info.get("sn")):
+                            changed = r["sn"] != info["sn"]
+                        else:
+                            old_mac = miner_core.normalize_mac(info.get("mac"))
+                            new_mac = miner_core.normalize_mac(r.get("mac"))
+                            changed = bool(old_mac and new_mac and old_mac != new_mac)
                     owner = info.get("worker") if info and info.get("state") != "migrated" and not changed else None
                     r["worker"] = owner or "(未知)"
                 # 只回填离线机：在线机的 MAC 必须是本轮实测值——有合法 SN 的原厂机不读 MAC，
@@ -1145,18 +1199,15 @@ class MonitorService:
     def _maintenance_tick(self, now=None):
         now = now or time.monotonic()
         dbc = self.cfg["db"]
-        # 只读连接是"每个碰过DB的线程各开一个、用到进程退出才关"(db._r())，FastAPI的
-        # sync路由跑在会动态开关线程的线程池里，线程一多、活得越久就攒得越多——
-        # 面板被人盯着看、上报/告警轮询越频繁，攒的速度越快，攒够 1024 就把服务打
-        # 到句柄耗尽、连上报的新 socket 都开不出来(生产上实测复现过)。定期强制关闭
-        # 重来，跟写连接完全独立。扫描进行中先不清：扫描线程的读操作撞上被关掉的连接会让
-        # 整轮扫描作废；一轮只要一两分钟，推迟到扫描空闲再清，句柄不会因此攒爆。
+        # 定期回收常驻线程的只读连接；退出线程的读句柄由弱引用释放。
+        # close_readers 立即关闭空闲连接，活跃查询完成后再关闭；缓存句柄下次读取时重开。
+        # 仍选扫描空闲时清理，以减少同一轮扫描反复重开连接；并发读取由读句柄自身保护。
         sweep_iv = max(60, int(dbc.get("reader_sweep_minutes", 15)) * 60)
         if now - self._last_reader_sweep >= sweep_iv and not self.progress.get("running"):
             self._last_reader_sweep = now
             n = db.close_readers()
             if n:
-                log.info("已关闭 %d 个只读连接句柄(定期清理，防句柄泄漏)", n)
+                log.info("已回收 %d 个空闲只读连接(活跃查询结束后再回收，下次读取自动重开)", n)
         if now - self._last_rollup >= 300:          # 每5分钟归档一次已结束的小时
             self._last_rollup = now
             db.rollup_hours(self.conn)

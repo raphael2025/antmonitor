@@ -132,10 +132,79 @@ function setup(){
     vm.runInContext(app.slice(app.indexOf("async function openMiner"),app.indexOf("async function triggerScan")),ctx);
     vm.runInContext("let view='worker';",ctx);
     vm.runInContext(app.slice(app.indexOf("const CBOX_PUMP_KEYS"),app.indexOf("function refreshAll()")),ctx);
-    vm.runInContext(app.slice(app.indexOf("async function refreshWorkers()"),app.indexOf('let view = "list"')),ctx);
+    vm.runInContext(app.slice(app.indexOf("let _workerSeq = 0"),app.indexOf('let view = "list"')),ctx);
+    vm.runInContext("let rackMode=false;",ctx);
+    vm.runInContext(app.slice(app.indexOf("function setView(v)"),app.indexOf("function updateProgress(p)")),ctx);
   }
   return {ctx,el,configs,respond:r=>{response=r;}};
 }
+
+function deferredRequests(h, method) {
+  const pending = [];
+  h.ctx[method] = url => new Promise((resolve, reject) => pending.push({url, resolve, reject}));
+  return pending;
+}
+
+test("customer periods keep the newest selection when responses arrive out of order", async()=>{
+  const h=setup(), pending=deferredRequests(h,"jget");
+  const old=h.ctx.refreshWorkers();
+  h.el("workerPeriod").value="72";
+  const current=h.ctx.refreshWorkers();
+  assert.match(pending[0].url,/hours=24$/);
+  assert.match(pending[1].url,/hours=72$/);
+  pending[1].resolve({customers:[{...observed,worker:"NEW_72_HOURS"}]});
+  await current;
+  pending[0].resolve({customers:[{...observed,worker:"OLD_24_HOURS"}]});
+  await old;
+  assert.match(h.el("workerList").innerHTML,/NEW_72_HOURS/);
+  assert.doesNotMatch(h.el("workerList").innerHTML,/OLD_24_HOURS/);
+});
+
+test("same-period refresh and real-time switch cannot revive an older customer report", async()=>{
+  const h=setup(), pending=deferredRequests(h,"jget");
+  const oldest=h.ctx.refreshWorkers();
+  h.el("workerPeriod").value="0";
+  const realtime=h.ctx.refreshWorkers();
+  h.el("workerPeriod").value="24";
+  const current=h.ctx.refreshWorkers();
+  pending[2].resolve({customers:[{...observed,worker:"CURRENT_REPORT"}]});
+  await current;
+  pending[0].resolve({customers:[{...observed,worker:"STALE_SAME_PERIOD"}]});
+  pending[1].resolve({workers:[{worker:"STALE_REALTIME",models:{},total:1,hashrate:1}]});
+  await Promise.all([oldest,realtime]);
+  assert.match(h.el("workerList").innerHTML,/CURRENT_REPORT/);
+  assert.doesNotMatch(h.el("workerList").innerHTML,/STALE_/);
+});
+
+test("leaving the customer view prevents an in-flight report from rendering", async()=>{
+  const h=setup(), pending=deferredRequests(h,"jget");
+  h.el("workerList").innerHTML="KEEP_CURRENT_VIEW";
+  const request=h.ctx.refreshWorkers();
+  vm.runInContext("view='list'",h.ctx);
+  pending[0].resolve({customers:[{...observed,worker:"OLD_VIEW"}]});
+  await request;
+  assert.equal(h.el("workerList").innerHTML,"KEEP_CURRENT_VIEW");
+});
+
+test("closing and reopening the customer view at the same period invalidates its old request", async()=>{
+  const h=setup(), pending=deferredRequests(h,"jget");
+  h.ctx.refreshMiners=()=>{};
+  const old=h.ctx.refreshWorkers();
+  h.ctx.setView("list");
+  assert.equal(h.el("workerView").classList.contains("hidden"),true);
+  const refreshWorkers=h.ctx.refreshWorkers;
+  let current;
+  h.ctx.refreshWorkers=()=>current=refreshWorkers();
+  h.ctx.setView("worker");
+  assert.equal(h.el("workerView").classList.contains("hidden"),false);
+  assert.equal(pending[0].url,pending[1].url);
+  pending[1].resolve({customers:[{...observed,worker:"REOPENED_CUSTOMER_REPORT"}]});
+  await current;
+  pending[0].resolve({customers:[{...observed,worker:"CLOSED_CUSTOMER_REPORT"}]});
+  await old;
+  assert.match(h.el("workerList").innerHTML,/REOPENED_CUSTOMER_REPORT/);
+  assert.doesNotMatch(h.el("workerList").innerHTML,/CLOSED_CUSTOMER_REPORT/);
+});
 
 test("real power and energy renderers keep kW distinct from period kWh at site scale",async()=>{
   const h=setup();

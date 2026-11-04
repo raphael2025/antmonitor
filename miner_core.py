@@ -201,8 +201,10 @@ def _counter(v):
 
 
 def normalize_mac(value):
-    """Return a canonical MAC address or an empty string for malformed payloads."""
+    """Return a canonical MAC or an empty string for malformed/placeholder values."""
     raw = str(value or "").strip().upper().replace("-", ":")
+    if raw in {"00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF"}:
+        return ""   # 占位值不能用于换机或 IP 迁移判断。
     return raw if re.fullmatch(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}", raw) else ""
 
 

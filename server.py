@@ -1253,9 +1253,16 @@ CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
 
 
 def _update_busy():
-    """更新会重启进程：重启/批量命令执行中时推迟更新(手动和自动更新都走这里)。"""
-    if SVC._reboot_lock.locked() or CMD_PROGRESS.get("running"):
-        return "正在执行重启/批量命令"
+    """更新已占用更新锁；再检查设备锁，避免更新和设备命令互相穿过闸门。"""
+    if CMD_PROGRESS.get("running") or not SVC._reboot_lock.acquire(blocking=False):
+        return "正在执行设备命令"
+    try:
+        control.flush_reboot_audit(SVC)
+    except Exception:
+        log.exception("设备命令审计尚未保存，推迟更新")
+        return "设备命令执行记录尚未保存，请检查数据库或磁盘后重试"
+    finally:
+        SVC._reboot_lock.release()
     return ""
 
 
@@ -1277,7 +1284,13 @@ def _audit_command(user, action, params, results):
     if action == "reboot":
         control.audit_reboot_results(SVC, user, results)
     else:
-        db.log_commands(SVC.conn, user, action, results)
+        if not results:
+            return
+        if not hasattr(SVC, "_pending_command_audit"):
+            SVC._pending_command_audit = []
+        SVC._pending_command_audit.append(
+            (int(time.time()), user, action, [dict(r) for r in results]))
+        control.flush_command_audit(SVC)
 
 
 def _record_command(user, action, params, results, audited=False):
@@ -1526,11 +1539,34 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
         return {"ok": True, "action": action, "success": ok_n,
                 "failed": len(all_results) - ok_n, "results": all_results,
                 "skipped": len(skipped)}
-    log.info("命令 %s: %d 台, 发起人 %s", action, len(targets), user)
-    results, err = control.run_batch(targets, action, params, CFG)
-    if err:
-        return JSONResponse({"ok": False, "error": err}, status_code=400)
-    _record_command(user, action, params, results)
+    # 换池/定位同样会改变设备状态，共用重启和更新的闸门。逐批审计落库后才继续下发。
+    if not SVC._reboot_lock.acquire(blocking=False):
+        return JSONResponse({"ok": False, "error": "已有设备命令在执行，请稍候"}, status_code=409)
+    results = []
+    try:
+        if updater.is_applying():
+            return JSONResponse({"ok": False, "error": "程序正在更新或等待重启，请更新完成后再执行设备命令"},
+                                status_code=409)
+        control.flush_reboot_audit(SVC)
+        log.info("命令 %s: %d 台, 发起人 %s", action, len(targets), user)
+
+        def after_group(_group, group_results):
+            results.extend(group_results)
+            _audit_command(user, action, params, group_results)
+
+        returned, err = control.run_batch(targets, action, params, CFG, after_group=after_group)
+        if err:
+            return JSONResponse({"ok": False, "error": err}, status_code=400)
+        # run_batch 的标准回调已逐批审计；保留完整排序结果供响应/通知使用。
+        results = returned
+    except Exception:
+        ok_n = sum(1 for r in results if r["ok"])
+        log.exception("设备命令或审计失败，已确认成功 %d 台", ok_n)
+        return JSONResponse({"ok": False, "error": "设备命令已中断，执行记录未保存时暂不下发新命令；请检查机器及数据库状态",
+                             "success": ok_n, "results": results}, status_code=503)
+    finally:
+        SVC._reboot_lock.release()
+    _record_command(user, action, params, results, audited=True)
     ok_n = sum(1 for r in results if r["ok"])
     return {"ok": True, "action": action, "success": ok_n,
             "failed": len(results) - ok_n, "results": results}

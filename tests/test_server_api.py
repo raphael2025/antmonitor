@@ -26,13 +26,12 @@ def test_server_auth_validation_and_read_endpoints(monkeypatch):
 
     called = []
 
-    def fake_run_batch(targets, action, params, cfg, progress=None, before_group=None):
-        if before_group:
-            before_group([ip for ip, _fw in targets])
+    def fake_run_group(targets, action, params, cfg):
         called.extend(targets)
-        return ([{"ip": ip, "ok": True, "msg": "ok"} for ip, _fw in targets], "")
+        return [{"ip": ip, "ok": True, "msg": "ok"} for ip, _fw in targets]
 
-    monkeypatch.setattr(server.control, "run_batch", fake_run_batch)
+    # Preserve real batching, command locks and per-group audit callbacks.
+    monkeypatch.setattr(server.control, "_run_group", fake_run_group)
     # 命令目标必须落在已配置网段内；固定成 10.0.0.x 让用例不依赖生产 segments.json
     monkeypatch.setattr(server.appconfig, "load_segments",
                         lambda cfg: (["10.0.0"], 1, 254))
@@ -67,17 +66,17 @@ def test_server_auth_validation_and_read_endpoints(monkeypatch):
     rebooting = server.SVC._alert_state["rebooting"]
     assert "10.0.0.1" in rebooting
 
-    def half_fail(targets, action, params, cfg, progress=None, before_group=None):
+    def half_fail(targets, action, params, cfg):
         # 下发时整批已标记(分批重启要跑几分钟，期间扫描不能报前几批掉线)
         assert all(ip in rebooting for ip, _fw in targets)
-        return ([{"ip": "10.0.0.3", "ok": True, "msg": "ok"},
-                 {"ip": "10.0.0.4", "ok": False, "msg": "连不上矿机"}], "")
+        return [{"ip": "10.0.0.3", "ok": True, "msg": "ok"},
+                {"ip": "10.0.0.4", "ok": False, "msg": "连不上矿机"}]
 
-    monkeypatch.setattr(server.control, "run_batch", half_fail)
+    monkeypatch.setattr(server.control, "_run_group", half_fail)
     assert client.post("/api/command", json={
         "ips": ["10.0.0.3", "10.0.0.4"], "action": "reboot", "confirm": True}).status_code == 200
     assert "10.0.0.3" in rebooting and "10.0.0.4" not in rebooting
-    monkeypatch.setattr(server.control, "run_batch", fake_run_batch)
+    monkeypatch.setattr(server.control, "_run_group", fake_run_group)
 
     # action 非字符串不应冒泡成 500
     assert client.post("/api/command", json={
