@@ -159,18 +159,18 @@ def test_long_full_scan_keeps_raw_time_but_never_acts_on_expired_reading(audit_s
     monkeypatch.setattr(audit_service, "_maybe_auto_reboot", lambda rows: actions.extend(copy.deepcopy(rows)))
     result = audit_service._do_scan("full", [IP], discover=["192.0.2.99"])
     meta, raw = audit_service.latest()
-    assert result["online"] == 0 and result["miners"] == 1
+    assert result["online"] == 1 and result["miners"] == 1
     assert raw[0]["status"] == "online" and raw[0]["hr_rt"] == rate
     assert raw[0]["measured_ts"] == BASE and meta["ts"] == BASE + 1800
-    assert db.latest_scan(audit_service.conn)["unknown"] == 1
-    assert db.latest_scan(audit_service.conn)["total_hr"] is None
+    assert db.latest_scan(audit_service.conn)["unknown"] == 0
+    assert db.latest_scan(audit_service.conn)["total_hr"] == rate
     assert evaluations[0]["status"] == actions[0]["status"] == "unknown"
     assert evaluations[0]["hr_rt"] is actions[0]["hr_rt"] is None
     known = db.known_identity(audit_service.conn)[IP]
     assert known["state"] == "repair"  # Old positive rate must not restore repair state.
     assert known["last_online"] == BASE
     current = db.customer_hashrates(meta, raw, now=clock[0])[0]
-    assert current["hashrate_ths"] is None and current["hashrate_ts"] == BASE
+    assert current["hashrate_ths"] == rate and current["hashrate_ts"] == BASE
 
 
 def test_new_machine_identity_survives_a_long_first_discovery(audit_service, monkeypatch):
@@ -183,7 +183,7 @@ def test_new_machine_identity_survives_a_long_first_discovery(audit_service, mon
         return [miner_core._blank(ip, "offline") for ip in ips]
     monkeypatch.setattr(miner_core, "scan", scan)
     result = audit_service._do_scan("full", [], discover=[IP, "192.0.2.99"])
-    assert result["miners"] == 1 and result["online"] == 0
+    assert result["miners"] == 1 and result["online"] == 1
     assert db.known_identity(audit_service.conn)[IP]["last_online"] == BASE
     assert audit_service.latest()[1][0]["measured_ts"] == BASE
 

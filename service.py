@@ -60,7 +60,7 @@ class MonitorService:
                          "loop_beat": 0, "pending": False}
         # 最近一次扫描结果的内存副本：API 直接读它，不必每个请求都从 SQLite
         # 重新拉 5000 行(一个浏览器每30秒会触发3~4次这样的全量查询)。
-        self.snapshot = {"scan_id": 0, "ts": 0, "kind": "", "records": []}
+        self.snapshot = {"scan_id": 0, "ts": 0, "started_ts": None, "kind": "", "records": []}
         self._snap_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -92,25 +92,40 @@ class MonitorService:
         self._wake.set()
 
     # ---- 内存快照 ----
-    def _publish(self, scan_id, ts, kind, records):
+    def _publish(self, scan_id, ts, kind, records, started_ts=None):
         with self._snap_lock:
             if scan_id < self.snapshot["scan_id"]:
                 return  # A concurrent inventory event/new scan already superseded this result.
-            self.snapshot = {"scan_id": scan_id, "ts": ts, "kind": kind, "records": records}
+            self.snapshot = {"scan_id": scan_id, "ts": ts, "started_ts": started_ts,
+                             "kind": kind, "records": records}
 
     def latest(self):
         """返回 (meta, records)。records 为共享只读列表，调用方不得原地修改。"""
         snap = self.snapshot
-        if snap["records"]:
+        if snap["scan_id"]:
             return snap, snap["records"]
         # 内存里还没有(刚重启)→ 回落到数据库
         ls = db.latest_scan(self.conn)
         if not ls:
             return None, []
         recs = db.scan_records(self.conn, ls["scan_id"])
-        self._publish(ls["scan_id"], ls["ts"], ls.get("kind") or "", recs)
+        self._publish(ls["scan_id"], ls["ts"], ls.get("kind") or "", recs,
+                      started_ts=ls.get("started_ts"))
         snap = self.snapshot
         return snap, snap["records"]
+
+    def latest_display(self):
+        """页面与上报使用最近一轮完整结果，下一轮完成前保持不变。
+
+        全网发现先探已知矿机，再花时间搜索空地址；逐台采样时间不能作为
+        显示倒计时，否则扫描途中会把上一轮在线机器逐台变成未知/零算力。
+        显示层只规范读数，不续写采样时间；告警和自动操作仍通过 latest()
+        的原始证据与 record_freshness() 单独检查是否允许执行。
+        """
+        scan, records = self.latest()
+        stamp = (scan or {}).get("ts")
+        return scan, [data_metrics.live_record(record, db.record_time_valid(record, stamp))
+                      for record in records]
 
     def mark_rebooting(self, ips):
         """记下刚下发重启的机器：静默期内掉线不报警(见 alerts.evaluate)。
@@ -469,7 +484,8 @@ class MonitorService:
         latest = db.latest_scan(self.conn)
         if latest:
             records = db.scan_records(self.conn, latest["scan_id"])
-            self._publish(latest["scan_id"], latest["ts"], latest.get("kind") or "", records)
+            self._publish(latest["scan_id"], latest["ts"], latest.get("kind") or "", records,
+                          started_ts=latest.get("started_ts"))
 
     # ---- 自愈 ----
     def _scheduling_on(self):
@@ -849,10 +865,10 @@ class MonitorService:
             miners = self._drop_migrated_ghosts(miners)
 
             # 首轮也只统计确认过的矿机：空地址不是离线矿机，陌生 HTTP 异常也不是已知矿机。
-            # db.save_scan 仍保留新发现的 online 记录，即使长扫描结束时其读数已过期，
-            # 机器身份仍需入名册；当前状态和历史有效区间另按 measured_ts 判断。
+            # db.save_scan 保留本轮确认的 online 记录，长时间搜索空地址不会改变
+            # 它们的显示状态；原始 measured_ts 继续供动作门禁与历史计算使用。
             roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
-            sid, ts, kept = db.save_scan(self.conn, kind, miners, keep_ips=roster)
+            sid, ts, kept = db.save_scan(self.conn, kind, miners, keep_ips=roster, started_ts=now)
             # 矿池地址不落库(列表且只用于本轮防篡改检查)，但 kept 是按库列重建的干净记录，
             # 要带回去，否则 alerts 永远看不到 pools、矿池篡改告警形同虚设
             pools_by_ip = {r["ip"]: r["pools"] for r in miners if r.get("pools") is not None}
@@ -866,7 +882,7 @@ class MonitorService:
             for r in kept:   # alive 同理不落库：告警层靠它区分"连得上但读不到"与扫描超时
                 if r["ip"] in alive_ips:
                     r["alive"] = True
-            self._publish(sid, ts, kind, kept)
+            self._publish(sid, ts, kind, kept, started_ts=now)
             online_recs = [r for r in miners if r["status"] == "online"]
             db.upsert_known_miners(self.conn, online_recs, ts)
             # 原始快照供历史审计；告警和自动动作只使用仍然新鲜的运行视图。
@@ -879,7 +895,9 @@ class MonitorService:
                 if not fresh:
                     row.pop("alive", None)
                 current.append(row)
-            online_ips = {r["ip"] for r in current if r["status"] == "online"}
+            # 完成日志/返回值描述本轮实际确认结果；过期动作证据不能把已确认
+            # 在线数量改成 0。告警/自动重启继续只接收上面的严格 current 视图。
+            online_ips = {r["ip"] for r in kept if r["status"] == "online"}
             # 扫描+落库已成功 → 立即更新 last_finished(看门狗据此判活)
             self.progress["last_finished"] = ts
 

@@ -188,14 +188,16 @@ def test_public_missing_sample_never_turns_into_zero(api, monkeypatch):
     assert summary["miners"][0]["hashrate_ths"] is None
 
 
-def test_long_discovery_does_not_make_old_sample_fresh(api, monkeypatch):
+def test_long_discovery_keeps_completed_result_without_renewing_sample_time(api, monkeypatch):
     raw = rec("10.0.0.1", hr=293, measured_ts=int(time.time()) - 1800)
     publish(api, monkeypatch, [raw])
     current = api.api_public_miners(None)["miners"][0]
     summary = api.api_summary()
-    assert current["hashrate_ths"] is None and current["status"] == "unknown"
-    assert current["data_stale"] and summary["unknown"] == 1
-    assert summary["total_hashrate_th"] is None and summary["known_hashrate_ths"] is None
+    assert current["hashrate_ths"] == 293 and current["status"] == "online"
+    assert summary["unknown"] == 0
+    assert summary["total_hashrate_th"] == summary["known_hashrate_ths"] == 293
+    assert current["measured_ts"] == raw["measured_ts"]
+    assert not db.record_freshness(raw, summary["scan_ts"])
     assert raw["hr_rt"] == 293 and raw["status"] == "online"
 
 
@@ -224,7 +226,7 @@ def test_public_local_and_push_reports_share_exact_window_without_flooring_histo
     assert row["delivered_th_h"] == pytest.approx(849.7)
     assert row["avg_hashrate_ths"] == 293
     csv = api.api_report_customers(hours=24, format="csv").body.decode("utf-8-sig")
-    assert "功率有效时长(小时)" in csv and "旧口径耗电(kWh,未验证)" in csv
+    assert "耗电(kWh)" in csv and "旧口径" not in csv
     assert "8.7" in csv and "849.7" in csv
 
 
@@ -261,6 +263,8 @@ def test_summary_time_uses_oldest_machine_and_unknown_has_no_trusted_time(api, m
                               rec("10.0.0.2", measured_ts=now - 10)])
     assert api._build_public_summary()["measurement_ts"] == now - 800
     publish(api, monkeypatch, [rec("10.0.0.1", measured_ts=now - 901)])
+    assert api._build_public_summary()["measurement_ts"] == now - 901
+    publish(api, monkeypatch, [rec("10.0.0.1", status="unknown")])
     assert api._build_public_summary()["measurement_ts"] is None
     publish(api, monkeypatch, [])
     assert api._build_public_summary()["measurement_ts"] == now

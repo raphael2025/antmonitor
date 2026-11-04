@@ -136,14 +136,15 @@ def test_segment_down_cleared_only_when_segment_emptied(conn):
     assert db.active_alert(conn, "10.5.0.x", "segment_down") is None
 
 
-def test_hourly_boundary_uses_full_hour(conn):
-    """一小时内首次扫描要回补到整点，避免每小时开头出现计费空洞。"""
+def test_hourly_archive_uses_observed_interval_and_never_regenerates_legacy(conn):
+    """首次采样前没有观测；只归档有效区间，不再生成旧摊分账本。"""
     h = now_hour(-2)
     insert_scan(conn, h + 1800, "quick", [rec("10.6.0.1", worker="F", hr=3600.0)])
     db.rollup_hours(conn)
-    row = conn.execute("SELECT th_h FROM worker_hourly WHERE hour=? AND worker='F'",
+    assert conn.execute("SELECT COUNT(*) FROM worker_hourly").fetchone()[0] == 0
+    row = conn.execute("SELECT th_h FROM worker_metrics_hourly WHERE hour=? AND worker='F'",
                        (h,)).fetchone()
-    assert row is not None and row["th_h"] > 0
+    assert row["th_h"] == 900
 
 
 def test_unknown_samples_are_not_billed_as_customer_downtime(conn, monkeypatch):

@@ -106,11 +106,11 @@ def test_unknown_current_machine_makes_realtime_unknown_not_zero(conn, monkeypat
     assert r["current_machines"] == 1
 
 
-def test_stale_realtime_is_unknown_even_if_old_reading_was_positive(conn, monkeypatch):
+def test_current_customer_keeps_last_completed_value_with_original_age(conn, monkeypatch):
     readings(conn, BASE, BASE + 300)
     r = report(conn, monkeypatch, BASE + 3600, 1)["A"]
-    assert r["hashrate_ths"] is None
-    assert r["current_machines"] is None
+    assert r["hashrate_ths"] == 293
+    assert r["current_machines"] == 1
     assert r["hashrate_ts"] == BASE + 300
 
 
@@ -177,13 +177,7 @@ def test_old_integral_without_raw_history_is_not_presented_as_measured_mean(conn
                  (BASE, "A", 1, 12, 12, 293, 3))
     conn.commit()
     db.meta_set(conn, "rollup_hour", BASE + 3600)
-    r = report(conn, monkeypatch, BASE + 3600, 1)["A"]
-    assert r["delivered_th_h"] is None
-    assert r["power_kwh"] is None and r["uptime_pct"] is None
-    assert r["legacy_delivered_th_h"] == 293 and r["legacy_power_kwh"] == 3
-    assert r["billing_source"] == "legacy_only"
-    assert r["avg_hashrate_ths"] is None
-    assert r["coverage_pct"] == r["observed_hours"] == 0
+    assert report(conn, monkeypatch, BASE + 3600, 1) == {}
 
 
 def test_pruned_partial_hour_is_not_invented_from_whole_hour_mean(conn, monkeypatch):

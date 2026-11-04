@@ -179,18 +179,15 @@
     <div class="card"><div class="num" id="cOffline">–</div><div class="lbl" data-i18n="card.offline">离线</div></div>
     <div class="card alert"><div class="num" id="cAlerts">–</div><div class="lbl" data-i18n="card.alerts">活跃告警</div></div>
     <div class="card"><div class="num" id="cFw">–</div><div class="lbl" data-i18n="card.fw">原厂 / 第三方</div></div>
-    <div class="card" data-i18n-title="power.total_help" title="矿机当前功率按有效读数相加；集装箱配电读数单独展示，不重复加总。此数值不是全场电表读数。"><div class="num" id="cPower">–</div><div class="lbl" data-i18n="card.power">总功耗 (kW)</div><span id="cPowerNote" class="rate-note muted hidden"></span></div>
-    <div class="card" data-i18n-title="quality.eff_help"><div class="num" id="cEff">–</div><div class="lbl" data-i18n="card.eff">能耗比 (J/TH)</div><span id="cEffNote" class="rate-note muted hidden"></span></div>
+    <div class="card" data-i18n-title="power.total_help" title="矿机当前功率按有效读数相加；集装箱配电读数单独展示，不重复加总。此数值不是全场电表读数。"><div class="num" id="cPower">–</div><div class="lbl" data-i18n="card.power">总功耗 (kW)</div></div>
+    <div class="card" data-i18n-title="quality.eff_help"><div class="num" id="cEff">–</div><div class="lbl" data-i18n="card.eff">能耗比 (J/TH)</div></div>
     <div class="card alert"><div class="num" id="cContainers">–</div><div class="lbl" data-i18n="card.containers">集装箱(故障)</div></div>
   </section>
-
-  <p id="summaryQuality" class="data-quality-notice muted hidden" role="status"></p>
 
   <section class="grid2">
     <div class="panel">
       <h2 id="trendTitle" data-i18n="trend.title">总算力趋势</h2>
       <canvas id="trendChart" height="90"></canvas>
-      <p id="trendQuality" class="muted hidden" role="status"></p>
     </div>
     <div class="panel">
       <h2><span data-i18n="alerts.title">活跃告警</span> <span id="alertCount" class="badge">0</span></h2>
@@ -226,7 +223,6 @@
         <button id="btnExportCsv" class="hidden" data-i18n="worker.export">⬇ 导出CSV</button>
         <span class="muted" data-i18n="worker.hint">实时算力 / 周期平均算力 / 可用率 / 统计期耗电 (kWh)；累计交付可展开或导出</span>
       </div>
-      <p class="muted" data-i18n="power.energy_help">统计期耗电按有效功率随时间累计，单位 kWh（度），为监控估算；缺失时段不视为零耗电。</p>
       <div id="workerList"></div>
     </div>
     <div id="rackView" class="hidden">
