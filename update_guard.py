@@ -2,6 +2,7 @@
 import os
 import io
 import json
+from contextlib import closing
 import tarfile
 from pathlib import Path
 import sqlite3
@@ -100,8 +101,8 @@ def database_preflight(base, candidate, interpreter, kind, recovery_dir):
     fd, backup = tempfile.mkstemp(prefix='before-update-', suffix='.sqlite3', dir=recovery_dir)
     os.close(fd)
     try:
-        with sqlite3.connect(source.as_uri() + '?mode=ro', uri=True, timeout=10) as live:
-            with sqlite3.connect(backup) as saved:
+        with closing(sqlite3.connect(source.as_uri() + '?mode=ro', uri=True, timeout=10)) as live:
+            with closing(sqlite3.connect(backup)) as saved:
                 live.backup(saved)
                 if saved.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                     raise RuntimeError('已有数据库完整性检查失败')
@@ -109,7 +110,7 @@ def database_preflight(base, candidate, interpreter, kind, recovery_dir):
             os.fsync(stream.fileno())
         with tempfile.TemporaryDirectory(prefix='migration-check-') as sandbox:
             copied = os.path.join(sandbox, 'check.db')
-            with sqlite3.connect(backup) as saved, sqlite3.connect(copied) as check:
+            with closing(sqlite3.connect(backup)) as saved, closing(sqlite3.connect(copied)) as check:
                 saved.backup(check)
             script = (
                 'import sys; sys.path.insert(0, sys.argv[1]); import db; '
