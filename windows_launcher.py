@@ -146,7 +146,9 @@ def supervise(base):
     enable_web_updates(base, env)
     first_launch = True
     while True:
-        python = prepare_environment(base)
+        import updater
+        active = updater._load_state().get("active_python")
+        python = Path(updater.runtime_python()) if active else prepare_environment(base)
         if first_launch:
             prepare_config(python, base)
             first_launch = False

@@ -335,6 +335,14 @@ sync_origin_source() {
   fi
 }
 
+copy_release() {
+  tar -C "$1" --exclude=./config.yaml --exclude=./settings.json --exclude=./cloud_settings.json \
+    --exclude=./segments.json --exclude=./cloud_site_id.txt --exclude=./.update_state.json \
+    --exclude=./.update_state.json.lock --exclude='./*.db*' --exclude='./*.sqlite*' \
+    --exclude=./certs --exclude=./backups --exclude=./logs --exclude=./data \
+    --exclude=./venv --exclude=./.venv --exclude=./offline -cf - . | tar -C "$INSTALL_DIR" -xf -
+}
+
 sync_code() {
   mkdir -p "$INSTALL_DIR"
   sync_origin_source
@@ -376,7 +384,7 @@ sync_code() {
     if ! command -v rsync >/dev/null; then
       # 最小化系统可能没有 rsync：用 tar 覆盖复制(不删除安装目录里多出的旧文件)
       tar -C "$LOCAL_SRC" --exclude=./.venv --exclude=./__pycache__ --exclude=./.git \
-        --exclude='./miner_monitor.db*' --exclude=./logs --exclude=./settings.json \
+        --exclude='./*.db*' --exclude='./*.sqlite*' --exclude=./logs --exclude=./settings.json \
         --exclude=./segments.json --exclude=./config.yaml --exclude=./config.yaml.bak \
         --exclude=./cloud_site_id.txt --exclude=./backups --exclude=./certs \
         --exclude=./.update_state.json -cf - . | tar -C "$INSTALL_DIR" -xf -
@@ -386,7 +394,7 @@ sync_code() {
     # 无法靠固定排除列表判断哪些额外文件属于用户数据。
     rsync -a \
       --exclude '.venv' --exclude '__pycache__' --exclude '.git' \
-      --exclude 'miner_monitor.db*' --exclude 'logs/' \
+      --exclude '*.db*' --exclude '*.sqlite*' --exclude 'logs/' \
       --exclude 'settings.json' --exclude 'segments.json' \
       --exclude 'config.yaml' --exclude 'config.yaml.bak' \
       --exclude 'cloud_site_id.txt' --exclude 'backups/' --exclude 'certs/' \
@@ -447,7 +455,7 @@ sync_code() {
       info "git clone $REPO_URL"
       if git clone -q --branch "$BRANCH" "$REPO_URL" "$tmpc/src"; then
         mkdir -p "$INSTALL_DIR"
-        cp -a "$tmpc/src"/. "$INSTALL_DIR"/
+        copy_release "$tmpc/src"
         rm -rf "$tmpc"
         return
       fi
@@ -456,7 +464,7 @@ sync_code() {
         tmpc="$(mktemp -d)"
         info "GitHub 不可达，尝试 Gitee"
         if git clone -q --branch "$BRANCH" https://gitee.com/raphael01/antmonitor.git "$tmpc/src"; then
-          cp -a "$tmpc/src"/. "$INSTALL_DIR"/
+          copy_release "$tmpc/src"
           rm -rf "$tmpc"
           return
         fi
@@ -482,7 +490,7 @@ fetch_tarball() {
   [[ -f "$tmp/server.py" && -f "$tmp/requirements.txt" ]] || { rm -rf "$tmp"; die "下载的源码包不完整，现有文件未修改"; }
   mkdir -p "$INSTALL_DIR"
   # config.yaml / 数据库 / settings.json 等本机文件不在源码包里，不会被覆盖
-  cp -a "$tmp"/. "$INSTALL_DIR"/
+  copy_release "$tmp"
   rm -rf "$tmp"
 }
 
@@ -936,14 +944,39 @@ do_update() {
   [[ -d "$INSTALL_DIR" ]] || die "未安装: $INSTALL_DIR"
   # 先在服务运行中拉代码、装依赖，全部成功后再重启：以前先 stop，断网等任一步失败
   # (set -e 立即退出) 服务就一直停着，监控停摆没人知道
-  sync_code
-  setup_venv
-  local cloud_rc=0
-  apply_connect_code || cloud_rc=$?
-  write_systemd
+  if [[ -e "$INSTALL_DIR/.git" && -f "$INSTALL_DIR/updater.py" ]]; then
+    sync_origin_source
+    heal_official_ssh_origin
+    local svc_user py service_env environment_files
+    svc_user="$(systemctl show -p User --value "${SERVICE_NAME}.service")"
+    svc_user="${svc_user:-root}"
+    environment_files="$(systemctl show -p EnvironmentFiles --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+    [[ -z "$environment_files" ]] || die "服务使用自定义 EnvironmentFile，请从运行中的网页更新，以便使用实际配置；现有配置保持不变"
+    service_env="$(systemctl show -p Environment --value "${SERVICE_NAME}.service" 2>/dev/null || true)"
+    py="$(py_bin)"
+    (cd "$INSTALL_DIR" && runuser -u "$svc_user" -- env AM_SERVICE_ENV="$service_env" "$py" - <<'PY_UPDATE'
+import os, sys, shlex
+for entry in shlex.split(os.environ.pop('AM_SERVICE_ENV', '')):
+    key, separator, value = entry.partition('=')
+    if separator and (key.startswith(('MINER_', 'ANTMONITOR_')) or key in ('HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY')):
+        os.environ[key] = value
+import appconfig, updater
+cfg = appconfig.load_config()
+appconfig.apply_settings(cfg, appconfig.load_settings())
+branch = os.environ.get('ANTMONITOR_BRANCH') or (cfg.get('update') or {}).get('branch') or None
+result = updater.apply(branch=branch, restart=False, force=True)
+print(result.get('msg') or '更新已准备，重启后确认健康')
+sys.exit(0 if result.get('ok') or result.get('unchanged') or result.get('pending') else 1)
+PY_UPDATE
+    ) || die "更新检查失败，未重启服务；请检查上方原因"
+  else
+    sync_code
+    setup_venv
+  fi
+  # 更新不重绑云端、不重设密码、不重写已有服务单元或其自定义环境。
+  if ! systemctl cat "${SERVICE_NAME}.service" >/dev/null 2>&1; then write_systemd; fi
   start_svc
   ok "更新完成"
-  return "$cloud_rc"
 }
 
 do_repair() {
