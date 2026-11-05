@@ -69,6 +69,7 @@ def test_zip_folder_is_adopted_at_its_own_version_and_can_update(origin, tmp_pat
     st = updater.check()
     assert st["branch"] == "main" and st["behind"] == 1
     monkeypatch.setattr(updater, "_selfcheck", lambda: "")
+    monkeypatch.setattr(updater, "_validate_release", lambda target: None)  # minimal ZIP fixture has no DB
     assert updater.apply(restart=False)["ok"]
     assert (site / "server.py").read_bytes() == b"VERSION = 3\n"
 

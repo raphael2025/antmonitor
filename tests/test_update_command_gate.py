@@ -13,7 +13,8 @@ import updater
 
 
 @pytest.fixture
-def panel(monkeypatch, conn, cfg):
+def panel(monkeypatch, conn, cfg, tmp_path):
+    monkeypatch.setattr(updater, "STATE_FILE", str(tmp_path / "update-state.json"))
     monkeypatch.setenv("MINER_CONFIG", str(Path(__file__).with_name("server_config.yaml")))
     server = importlib.import_module("server")
     svc = object.__new__(service.MonitorService)
@@ -112,6 +113,7 @@ def test_pending_process_restart_keeps_new_reboots_blocked(panel, monkeypatch):
     assert reboot(panel).status_code == 409
     panel.SVC._maybe_auto_reboot_zero([("10.0.0.1", "stock")])
     assert not panel.SVC._reboot_lock.locked()
+    updater._restart_file_lock.close()  # simulated exit releases the OS lock too
 
 
 def command(server, action="set_pools", ips=None):
