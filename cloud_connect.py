@@ -118,7 +118,7 @@ def validate_url(value):
 
 
 def read_state():
-    # load_settings() 会容忍损坏文件并回退为空；绑定必须严格读，避免丢失原配置。
+    # 绑定与更新均严格读取已有配置，避免丢失云端凭据和其它覆盖项。
     try:
         with open(appconfig.SETTINGS_FILE, encoding="utf-8") as source:
             saved = json.load(source)

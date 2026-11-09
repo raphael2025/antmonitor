@@ -433,8 +433,11 @@ def _cleanup_legacy_statistics(conn, path):
 def _try(conn, sql):
     try:
         conn.execute(sql)
-    except sqlite3.OperationalError:
-        pass
+    except sqlite3.OperationalError as exc:
+        # Only an already-applied ADD COLUMN is harmless. Full disks, locked DBs
+        # and invalid SQL must abort startup instead of leaving a partial schema.
+        if not str(exc).lower().startswith("duplicate column name:"):
+            raise
 
 
 # ---- meta ----

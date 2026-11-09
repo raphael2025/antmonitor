@@ -10,6 +10,7 @@ if __name__ == "__main__":
     # 刚网页/自动更新过：先于其它业务模块 import 记一次启动尝试。新版本若在模块级就崩，
     # 连续几次后在这里自动回滚到上一版(见 updater.boot_guard)
     import updater as _updater
+    _updater.select_runtime()
     _updater.boot_guard()
     # 官方 SSH origin → 匿名 HTTPS：启动时先改好，旧更新器下次也能 `git fetch origin`
     try:
@@ -91,7 +92,12 @@ async def lifespan(app_):
         log.warning("启动时自愈更新源失败: %s", exc)
     updater.start_auto(CFG.get("update") or {})
     # 新版本稳定运行 60 秒 → 确认更新成功(清掉回滚标记)
-    _h = threading.Timer(updater.HEALTHY_AFTER_SEC, updater.mark_healthy)
+    try:
+        _running_sha = updater._git("rev-parse", "HEAD")
+    except Exception:
+        _running_sha = None
+    _h = threading.Timer(updater.HEALTHY_AFTER_SEC, updater.mark_healthy,
+                         kwargs={"expected_sha": _running_sha})
     _h.daemon = True
     _h.start()
     _startup_selfcheck()
