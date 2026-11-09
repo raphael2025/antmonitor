@@ -1419,6 +1419,11 @@ def api_command_progress(_: dict = Depends(require_ops)):
     return out
 
 
+@app.get("/api/command/jobs")
+def api_command_jobs(limit: int = 50, _: dict = Depends(require_ops)):
+    return {"jobs": db.list_command_jobs(SVC.conn, max(1, min(200, limit)))}
+
+
 @app.get("/api/command/job/{job_id}")
 def api_command_job(job_id: str, _: dict = Depends(require_ops)):
     if not re.fullmatch(r"[0-9a-f]{32}", str(job_id)):
@@ -1569,7 +1574,7 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
                 background_owns_lock = True
                 return {"ok": True, "async": True, "action": action, "count": len(targets),
                         "skipped": len(skipped), "batch": rb,
-                        "delay": ctl.get("reboot_delay_sec", 0)}
+                        "delay": ctl.get("reboot_delay_sec", 0), "job_id": job_id}
             SVC.mark_rebooting(ips)
             if targets:
                 results, err = control.run_batch(targets, action, params, CFG,
