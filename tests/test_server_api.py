@@ -85,6 +85,9 @@ def test_server_auth_validation_and_read_endpoints(monkeypatch):
     assert client.get("/api/public/health").status_code == 401
     assert client.get("/api/public/health", headers={
         "Authorization": "Bearer test-public-token"}).status_code == 200
+    # Tokens in query strings leak into access logs and browser history; reject them.
+    assert client.get("/api/public/health", params={
+        "token": "test-public-token"}).status_code == 401
     # 参数越界不得先于鉴权被 FastAPI 拦成 422（那等于确认端点存在）
     assert client.get("/api/public/miners", params={"limit": 0}).status_code == 401
     assert client.get("/api/public/miners", params={"limit": 0}, headers={
