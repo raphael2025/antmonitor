@@ -286,6 +286,35 @@ CREATE TABLE IF NOT EXISTS command_log (
     ok     INTEGER,
     msg    TEXT
 );
+-- Durable batch-command ledger. Per-target states distinguish not sent from uncertain.
+CREATE TABLE IF NOT EXISTS command_jobs (
+    id TEXT PRIMARY KEY,
+    created_ts INTEGER NOT NULL,
+    updated_ts INTEGER NOT NULL,
+    user TEXT,
+    action TEXT NOT NULL,
+    params_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL,
+    total INTEGER NOT NULL DEFAULT 0,
+    done INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL DEFAULT 0,
+    failed INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_command_jobs_updated ON command_jobs(updated_ts DESC);
+CREATE TABLE IF NOT EXISTS command_job_targets (
+    job_id TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    firmware TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'CREATED',
+    ok INTEGER,
+    uncertain INTEGER NOT NULL DEFAULT 0,
+    msg TEXT NOT NULL DEFAULT '',
+    updated_ts INTEGER NOT NULL,
+    PRIMARY KEY(job_id, ip),
+    FOREIGN KEY(job_id) REFERENCES command_jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_command_job_targets_state ON command_job_targets(job_id, state);
 CREATE TABLE IF NOT EXISTS zero_reboot_state (
     ip              TEXT PRIMARY KEY,
     started_at      INTEGER NOT NULL,
@@ -1023,6 +1052,95 @@ def resolve_alerts_for(conn, ips, types=None, like=None):
         if like:
             conn.execute(f"UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 "
                          f"AND ip IN ({qm}) AND type LIKE ?", (ts, *ips, like + "%"))
+
+
+def create_command_job(conn, job_id, user, action, params, targets, skipped=None):
+    """Persist the complete target list before any destructive request is dispatched."""
+    now = int(time.time())
+    rows = [(job_id, ip, str(fw or ""), "CREATED", None, 0, "", now)
+            for ip, fw in targets]
+    for result in skipped or []:
+        rows.append((job_id, result["ip"], "", "FAILED", 0, 0,
+                     str(result.get("msg") or "skipped")[:500], now))
+    total = len(rows)
+    success = 0
+    failed = len(skipped or [])
+    with _wlock, conn:
+        conn.execute(
+            "INSERT INTO command_jobs(id,created_ts,updated_ts,user,action,params_json,state,total,done,success,failed) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (job_id, now, now, user, action, json.dumps(params or {}, ensure_ascii=False),
+             "CREATED", total, failed, success, failed))
+        conn.executemany(
+            "INSERT INTO command_job_targets(job_id,ip,firmware,state,ok,uncertain,msg,updated_ts) "
+            "VALUES(?,?,?,?,?,?,?,?)", rows)
+    return job_id
+
+
+def update_command_job_targets(conn, job_id, targets, state):
+    """Update a batch of target rows atomically; state is DISPATCHING or a terminal state."""
+    now = int(time.time())
+    with _wlock, conn:
+        for item in targets:
+            if isinstance(item, dict):
+                ip = item["ip"]
+                terminal = item.get("state") or state
+                ok = item.get("ok")
+                uncertain = 1 if item.get("uncertain") else 0
+                msg = str(item.get("msg") or "")[:500]
+            else:
+                ip = str(item)
+                terminal, ok, uncertain, msg = state, None, 0, ""
+            conn.execute(
+                "UPDATE command_job_targets SET state=?,ok=?,uncertain=?,msg=?,updated_ts=? "
+                "WHERE job_id=? AND ip=?",
+                (terminal, None if ok is None else int(bool(ok)), uncertain, msg, now, job_id, ip))
+
+
+def update_command_job(conn, job_id, state, error=""):
+    now = int(time.time())
+    with _wlock, conn:
+        row = conn.execute(
+            "SELECT COUNT(*) total, SUM(state IN ('SUCCEEDED','FAILED','UNCERTAIN','CANCELLED')) done, "
+            "SUM(state='SUCCEEDED') success, SUM(state IN ('FAILED','UNCERTAIN','CANCELLED')) failed "
+            "FROM command_job_targets WHERE job_id=?", (job_id,)).fetchone()
+        conn.execute(
+            "UPDATE command_jobs SET updated_ts=?,state=?,done=?,success=?,failed=?,error=? WHERE id=?",
+            (now, state, int(row["done"] or 0), int(row["success"] or 0),
+             int(row["failed"] or 0), str(error or "")[:500], job_id))
+
+
+def get_command_job(conn, job_id):
+    row = _r(conn).execute("SELECT * FROM command_jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        return None
+    job = dict(row)
+    job["targets"] = [dict(r) for r in _r(conn).execute(
+        "SELECT ip,firmware,state,ok,uncertain,msg,updated_ts FROM command_job_targets "
+        "WHERE job_id=? ORDER BY ip", (job_id,)).fetchall()]
+    return job
+
+
+def recover_command_jobs(conn):
+    """After a process crash, never replay commands: sent targets become UNCERTAIN."""
+    now = int(time.time())
+    with _wlock, conn:
+        active = [r["id"] for r in conn.execute(
+            "SELECT id FROM command_jobs WHERE state IN ('CREATED','DISPATCHING')").fetchall()]
+        for job_id in active:
+            conn.execute(
+                "UPDATE command_job_targets SET state='UNCERTAIN',uncertain=1,"
+                "msg='服务重启时命令结果未确认；请核实矿机状态，禁止自动重发',updated_ts=? "
+                "WHERE job_id=? AND state='DISPATCHING'", (now, job_id))
+            conn.execute(
+                "UPDATE command_job_targets SET state='CANCELLED',"
+                "msg='服务重启前尚未下发',updated_ts=? "
+                "WHERE job_id=? AND state='CREATED'", (now, job_id))
+            conn.execute(
+                "UPDATE command_jobs SET state='INTERRUPTED',updated_ts=?,"
+                "error='服务重启导致任务中断；未下发目标已取消，已下发目标需人工核实' WHERE id=?",
+                (now, job_id))
+    return len(active)
 
 
 def log_commands(conn, user, action, results, ts=None):
