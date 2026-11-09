@@ -269,8 +269,6 @@ def _validate(cfg):
     clamp("alerts", "unresponsive_rounds", 1, 1000, int)
     clamp("alerts", "container_offline_rounds", 1, 100, int)
     clamp("scan", "reconfirm_delay_sec", 0, 300)
-    clamp("alerts", "reject_pct", 0, 100)
-    clamp("alerts", "reject_min_shares", 1, 1000000, int)
     clamp("alerts", "zero_grace_sec", 0, 86400, int)
     clamp("alerts", "container_pressure_hold_sec", 0, 3600, int)
     clamp("alerts", "container_pressure_clear_sec", 0, 3600, int)
