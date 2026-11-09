@@ -1553,6 +1553,12 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
                                      args=(targets, action, params, user, skipped, job_id),
                                      daemon=True).start()
                 except Exception:
+                    try:
+                        db.update_command_job_targets(SVC.conn, job_id, ips, "CANCELLED")
+                        db.update_command_job(SVC.conn, job_id, "INTERRUPTED",
+                                              "后台任务线程未能启动；没有下发重启命令")
+                    except Exception:
+                        log.exception("后台任务启动失败后的台账更新失败")
                     CMD_PROGRESS.update({"running": False, "done": len(targets) + len(skipped),
                                          "failed": len(targets) + len(skipped),
                                          "fail_ips": (ips + [r["ip"] for r in skipped])[:100],
