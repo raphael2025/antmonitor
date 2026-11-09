@@ -12,6 +12,7 @@ def test_command_job_recovery_never_replays_uncertain_targets(conn):
     assert db.recover_command_jobs(conn) == 1
     job = db.get_command_job(conn, job_id)
     assert job["state"] == "INTERRUPTED"
+    assert (job["done"], job["success"], job["failed"]) == (2, 0, 2)
     targets = {row["ip"]: row for row in job["targets"]}
     assert targets["10.1.0.1"]["state"] == "UNCERTAIN"
     assert targets["10.1.0.1"]["uncertain"] == 1
