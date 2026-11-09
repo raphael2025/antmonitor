@@ -67,9 +67,8 @@ DEFAULTS = {
         "container_interval": 10,
     },
     "alerts": {
-        "enabled": True, "cooldown": 1800, "zero_grace_sec": 600, "reject_pct": 5.0,
+        "enabled": True, "cooldown": 1800, "zero_grace_sec": 600,
         "push_recovery": True,          # 掉线/整段掉线/高温/矿池篡改/集装箱故障恢复时推送
-        "reject_min_shares": 50,        # 拒绝率至少按这么多份额的增量判断(防样本太少误报)
         "segment_down_ratio": 0.6, "segment_down_min": 5,
         "low_hashrate_ratio": 0.7,      # 低于同型号中位数的此比例 → 掉算力告警；0=关
         "low_hashrate_rounds": 2,       # 需连续 N 轮成立才报(防单轮读数抖动)
