@@ -289,52 +289,20 @@ def _evaluate_pools(conn, cfg, monkeypatch, state, pools, uptime=100000):
     return [f for f in fired if f[1] == "reject"]
 
 
-def test_alive_pool_switch_does_not_turn_old_counters_into_new_rejections(conn, cfg, monkeypatch):
+def test_reject_share_changes_never_raise_reject_alerts(conn, cfg, monkeypatch):
+    """Reject-rate alerts are retired; accepted/rejected counters remain readable."""
     state = {}
     pools = [_pool(0, 1000, 0), _pool(1, 10000, 1000, "Dead")]
     assert _evaluate_pools(conn, cfg, monkeypatch, state, pools) == []
     pools[0]["Status"], pools[1]["Status"] = "Dead", "Alive"
     assert _evaluate_pools(conn, cfg, monkeypatch, state, pools) == []
-    assert db.active_alert(conn, IP, "reject") is None
     pools[1]["Rejected"] += 100
-    fired = _evaluate_pools(conn, cfg, monkeypatch, state, pools)
-    assert len(fired) == 1 and "100.0%" in fired[0][3]
-
-
-def test_one_pool_counter_reset_is_not_hidden_by_another_pool_growth(conn, cfg, monkeypatch):
-    state = {}
-    assert _evaluate_pools(conn, cfg, monkeypatch, state,
-                           [_pool(0, 1000, 0), _pool(1, 1000, 100)]) == []
-    assert _evaluate_pools(conn, cfg, monkeypatch, state,
-                           [_pool(0, 10, 0), _pool(1, 3000, 300)]) == []
+    assert _evaluate_pools(conn, cfg, monkeypatch, state, pools) == []
     assert db.active_alert(conn, IP, "reject") is None
-    assert _evaluate_pools(conn, cfg, monkeypatch, state,
-                           [_pool(0, 100, 0), _pool(1, 3010, 300)]) == []
 
-
-def test_uptime_rollback_resets_share_origin_even_if_total_counters_grew(conn, cfg, monkeypatch):
-    state = {}
-    assert _evaluate_pools(conn, cfg, monkeypatch, state, [_pool(0, 9000, 0)]) == []
-    assert _evaluate_pools(conn, cfg, monkeypatch, state, [_pool(0, 9500, 1000)], uptime=10) == []
-    assert db.active_alert(conn, IP, "reject") is None
-    fired = _evaluate_pools(conn, cfg, monkeypatch, state, [_pool(0, 9500, 1100)], uptime=20)
-    assert len(fired) == 1 and "100.0%" in fired[0][3]
-
-
-def test_counter_reset_is_compared_with_last_sample_not_only_min_share_origin():
-    bases = {}
-    assert alerts._share_delta(rec(IP, accepted=0, rejected=0), bases) is None
-    assert alerts._share_delta(rec(IP, accepted=5, rejected=0), bases) == (5, 0)
-    assert alerts._share_delta(rec(IP, accepted=2, rejected=0), bases) is None
-    assert alerts._share_delta(rec(IP, accepted=2, rejected=60), bases) == (0, 60)
-
-
-def test_missing_counter_does_not_imply_zero_accepted_or_keep_a_comparable_origin():
-    bases = {}
-    assert alerts._share_delta(rec(IP, accepted=1000, rejected=0), bases) is None
-    assert alerts._share_delta(rec(IP, accepted=None, rejected=1000), bases) is None
-    assert IP not in bases
-    assert alerts._share_delta(rec(IP, accepted=1000, rejected=1000), bases) is None
+    sample = miner_core.fetch_pool(IP, 1)
+    assert sample["accepted"] == 10000
+    assert sample["rejected"] == 1100
 
 
 @pytest.mark.parametrize("packet_kind", ["list", "dict", "empty_dict"])
