@@ -1338,10 +1338,10 @@ def _run_command_bg(targets, action, params, user, skipped=None, job_id=None):
 
     try:
         def before_group(ips):
-            attempted.update(ips)
             if job_id:
                 db.update_command_job_targets(SVC.conn, job_id, ips, "DISPATCHING")
                 db.update_command_job(SVC.conn, job_id, "DISPATCHING")
+            attempted.update(ips)
             SVC.mark_rebooting(ips)
 
         def after_group(_grp, group_results):
