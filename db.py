@@ -1110,6 +1110,14 @@ def update_command_job(conn, job_id, state, error=""):
              int(row["failed"] or 0), str(error or "")[:500], job_id))
 
 
+def list_command_jobs(conn, limit=50):
+    limit = max(1, min(200, int(limit)))
+    rows = _r(conn).execute(
+        "SELECT id,created_ts,updated_ts,user,action,state,total,done,success,failed,error "
+        "FROM command_jobs ORDER BY created_ts DESC,id DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_command_job(conn, job_id):
     row = _r(conn).execute("SELECT * FROM command_jobs WHERE id=?", (job_id,)).fetchone()
     if not row:
