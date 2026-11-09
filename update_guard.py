@@ -57,6 +57,42 @@ def validate_target(base, target):
                 raise RuntimeError('无法核验本机文件保护: ' + name)
 
 
+def prune_database_backups(recovery_dir, keep=10, protected=()):
+    """Keep a bounded set of verified update recovery points.
+
+    Paths referenced by the current pending update are protected even when
+    their timestamps are older than newer files. Never follow symlinks.
+    """
+    keep = max(1, min(100, int(keep)))
+    protected_paths = {os.path.abspath(os.fspath(p)) for p in (protected or ()) if p}
+    try:
+        entries = []
+        with os.scandir(recovery_dir) as scan:
+            for entry in scan:
+                if (entry.name.startswith("before-update-") and entry.name.endswith(".sqlite3")
+                        and entry.is_file(follow_symlinks=False)):
+                    entries.append((entry.path, entry.stat(follow_symlinks=False).st_mtime_ns))
+    except OSError:
+        return 0
+    entries.sort(key=lambda item: (item[1], item[0]), reverse=True)
+    retained = set(protected_paths)
+    removed = 0
+    for path, _mtime in entries:
+        absolute = os.path.abspath(path)
+        if absolute in retained:
+            continue
+        if len(retained) < keep:
+            retained.add(absolute)
+            continue
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            # A locked/permission-protected recovery point is safer to retain.
+            pass
+    return removed
+
+
 def database_preflight(base, candidate, interpreter, kind, recovery_dir):
     """Back up the live SQLite database, migrate only a copy twice and check integrity.
 
