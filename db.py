@@ -1144,10 +1144,15 @@ def recover_command_jobs(conn):
                 "UPDATE command_job_targets SET state='CANCELLED',"
                 "msg='服务重启前尚未下发',updated_ts=? "
                 "WHERE job_id=? AND state='CREATED'", (now, job_id))
+            counts = conn.execute(
+                "SELECT COUNT(*) total, SUM(state IN ('SUCCEEDED','FAILED','UNCERTAIN','CANCELLED')) done, "
+                "SUM(state='SUCCEEDED') success, SUM(state IN ('FAILED','UNCERTAIN','CANCELLED')) failed "
+                "FROM command_job_targets WHERE job_id=?", (job_id,)).fetchone()
             conn.execute(
-                "UPDATE command_jobs SET state='INTERRUPTED',updated_ts=?,"
+                "UPDATE command_jobs SET state='INTERRUPTED',updated_ts=?,done=?,success=?,failed=?,"
                 "error='服务重启导致任务中断；未下发目标已取消，已下发目标需人工核实' WHERE id=?",
-                (now, job_id))
+                (now, int(counts["done"] or 0), int(counts["success"] or 0),
+                 int(counts["failed"] or 0), job_id))
     return len(active)
 
 
