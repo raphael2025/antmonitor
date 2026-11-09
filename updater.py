@@ -656,6 +656,14 @@ def _apply(branch=None, restart=True, force=False):
         saved = _load_state()
         saved["pending"].update(validation)
         _save_state(saved)
+    if backup:
+        try:
+            import update_guard
+            recovery = _git("rev-parse", "--git-path", "update-backups")
+            backup_dir = os.path.abspath(os.path.join(BASE, recovery))
+            update_guard.prune_database_backups(backup_dir, keep=10, protected=[backup])
+        except Exception as exc:
+            log.warning("清理旧更新恢复点失败(保留全部备份，不影响本次更新): %s", exc)
     try:
         if st.get("switch_from"):   # 旧现场从 dev 改跟 main：dev 分支原样留着，回滚时切回去
             _git("checkout", "-B", st["branch"], st["remote_full"])

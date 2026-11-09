@@ -485,8 +485,6 @@ def _check_public_token(request: Request):
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         supplied = auth_header[7:].strip()
-    if not supplied:
-        supplied = request.query_params.get("token", "")
     # compare_digest 对含非 ASCII 的 str 会抛 TypeError(→500)，统一按 UTF-8 字节比较
     if not supplied or not _hmac.compare_digest(supplied.encode("utf-8", "surrogatepass"),
                                                 str(cfg_token).encode("utf-8", "surrogatepass")):
