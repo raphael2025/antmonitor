@@ -186,50 +186,6 @@ class _Batch:
         return self.to_fire
 
 
-def _share_delta(record, bases):
-    """Only difference comparable counters; preserve a separate last sample for resets."""
-    ip = record["ip"]
-    accepted, rejected = (miner_core._counter(record.get(k)) for k in ("accepted", "rejected"))
-    if accepted is None or rejected is None:
-        bases.pop(ip, None)
-        return None
-    basis = record.get("counter_basis") or "legacy-aggregate"
-    samples = record.get("counter_samples")
-    if samples is None:
-        samples = {"aggregate": (accepted, rejected)}
-    if not isinstance(samples, dict) or not samples:
-        bases.pop(ip, None)
-        return None
-    current = {}
-    for key, values in samples.items():
-        if not isinstance(values, (list, tuple)) or len(values) != 2:
-            bases.pop(ip, None)
-            return None
-        a, j = (miner_core._counter(v) for v in values)
-        if a is None or j is None:
-            bases.pop(ip, None)
-            return None
-        current[key] = (a, j)
-    uptime = miner_core._nonnegative(record.get("uptime"))
-    previous = bases.get(ip)
-    reset = not isinstance(previous, dict) or previous.get("basis") != basis
-    if not reset:
-        last = previous["last"]
-        reset = (last.keys() != current.keys()
-                 or any(a < last[key][0] or j < last[key][1] for key, (a, j) in current.items())
-                 or (uptime is not None and previous["uptime"] is not None
-                     and uptime < previous["uptime"]))
-    if reset:
-        bases[ip] = {"basis": basis, "base": current, "last": current, "uptime": uptime}
-        return None  # Pool switch/restart is a new origin, not newly rejected shares.
-    previous["last"] = current
-    if uptime is not None:
-        previous["uptime"] = uptime
-    base = previous["base"]
-    return (sum(a - base[key][0] for key, (a, _) in current.items()),
-            sum(j - base[key][1] for key, (_, j) in current.items()))
-
-
 def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     """对比上一次同类扫描，产生/恢复告警，返回本轮新增告警列表。
 
@@ -241,7 +197,6 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     state = state if state is not None else {}
     streak = state.setdefault("low_hr_streak", {})
     zero_since = state.setdefault("zero_since", {})   # ip → 连续零算力起始时间
-    shares = state.setdefault("reject_base", {})   # ip → 同源的份额基准/最近采样/uptime
     rebooting = state.setdefault("rebooting", {})   # ip → 下发重启的时间(MonitorService.mark_rebooting 写入)
     # 跨轮次确认用的起始时间/计数。大场地网络抖动(交换机重启、STP 收敛、ARP 表刷新)和矿机
     # 网页服务卡顿一两分钟就过去，单轮判定会"报掉线→几分钟后恢复"反复误报，所以掉线/整段
@@ -262,8 +217,6 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     cooldown = acfg.get("cooldown", 1800)
     seg_ratio = acfg.get("segment_down_ratio", 0.6)
     seg_min = acfg.get("segment_down_min", 5)
-    rej_thresh = acfg.get("reject_pct", 5.0)
-    rej_min = max(1, int(acfg.get("reject_min_shares", 50) or 50))
     grace = acfg.get("zero_grace_sec", 600)
     lo_ratio = acfg.get("low_hashrate_ratio", 0.7)
     lo_rounds = max(1, int(acfg.get("low_hashrate_rounds", 2)))
@@ -308,7 +261,6 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             continue
         seg_total[seg] = seg_total.get(seg, 0) + 1
         if r["status"] == "offline":
-            shares.pop(ip, None)
             seg_off[seg] = seg_off.get(seg, 0) + 1
     down_segments = set()   # 满足整段掉线条件的网段(含确认中)：段内单机告警一律静音
     active_segs = {a["ip"][:-2] for a in db.active_alerts_by_type(conn, "segment_down")
@@ -414,7 +366,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         alive_streak.pop(ip, None)
         if r["status"] == "offline":
             hot_reported = (ip, "overheat") in b.active
-            for t in ("zero", "reject", "low_hashrate", "overheat"):
+            for t in ("zero", "low_hashrate", "overheat"):
                 b.resolve(ip, t, recovered=False)   # 掉线了读不到，不代表恢复
             streak.pop(ip, None)
             zero_since.pop(ip, None)
@@ -538,30 +490,9 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             else:
                 b.resolve(ip, "pool_hijack")
 
-        # 拒绝率（矿池健康）：按两次判定之间的份额增量算。矿机给的是开机以来的累计值，
-        # 直接用累计值的话，跑了 30 天的机器突然全拒要一天多才报，刚重启 12 个份额拒 1 个
-        # 就立刻报。增量不足 reject_min_shares 份额时保留基准继续累积，告警状态不变
-        if rej_thresh and rej_thresh > 0:
-            delta = _share_delta(r, shares)
-            if muted and ip in shares:
-                shares[ip]["base"] = shares[ip]["last"]
-                b.resolve(ip, "reject")
-            elif delta is not None and sum(delta) >= rej_min:
-                da, dj = delta
-                shares[ip]["base"] = shares[ip]["last"]
-                rp = round(dj / (da + dj) * 100, 3)
-                if rp >= rej_thresh:
-                    b.fire(ip, "reject", "warn",
-                           f"{ip} 拒绝率 {rp}% ≥ {rej_thresh}%(最近 {da + dj} 份额)")
-                else:
-                    b.resolve(ip, "reject")
-
     for ip in list(streak):     # 已不在本轮样本内的机器(下架/换IP)：别让计数无限增长
         if ip not in cur:
             streak.pop(ip, None)
-    for ip in list(shares):
-        if ip not in cur:
-            shares.pop(ip, None)
     for ip in list(zero_since):
         if ip not in cur:
             zero_since.pop(ip, None)
@@ -572,6 +503,11 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     for ip in list(rebooting):  # 同理：静默期过了还没出现在样本里的(下架/换IP)
         if ip not in cur and rb_expired(ip):
             rebooting.pop(ip, None)
+
+    # Reject-rate alerts are disabled. Resolve legacy active records once so they do not
+    # remain visible forever after upgrading; share counters remain available for metrics.
+    for alert in db.active_alerts_by_type(conn, "reject"):
+        b.resolve(alert["ip"], "reject", recovered=False)
 
     fired = b.commit()
     if fired:
