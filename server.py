@@ -28,6 +28,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 
 from fastapi import (Body, Depends, FastAPI, HTTPException, Query, Request,
                      Response, WebSocket)
@@ -80,6 +81,10 @@ def _start_cloud_report():
 async def lifespan(app_):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
+    recovered_jobs = db.recover_command_jobs(SVC.conn)
+    if recovered_jobs:
+        log.warning("检测到 %d 个上次运行中断的批量命令任务；已下发目标标记为 UNCERTAIN，未下发目标取消",
+                    recovered_jobs)
     SVC.notify = _broadcast_threadsafe   # 扫描线程→WS 推送
     SVC.start_scheduler()
     guardian = MAIN_LOOP.create_task(_guardian_loop())   # 不依赖 daemon 线程的最终兜底
@@ -1252,7 +1257,8 @@ def _audit_reject(user, action, reason):
 
 # 批量重启后台进度(分批+延迟会耗时，异步执行，前端轮询)
 CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
-                "success": 0, "failed": 0, "fail_ips": [], "user": "", "error": ""}
+                "success": 0, "failed": 0, "fail_ips": [], "user": "", "error": "",
+                "job_id": ""}
 # 重启互斥锁挂在 SVC 上(手动 API 与零算力自动重启共用)，见 MonitorService._reboot_lock
 
 
@@ -1314,7 +1320,7 @@ def _record_command(user, action, params, results, audited=False):
             log.exception("命令推送失败")
 
 
-def _run_command_bg(targets, action, params, user, skipped=None):
+def _run_command_bg(targets, action, params, user, skipped=None, job_id=None):
     # 逐批保留执行结果：异常中断时已完成的机器不能变回“0 成功 / 0 失败”。
     results_by_ip = {r["ip"]: r for r in (skipped or [])}
     attempted = set()
@@ -1333,12 +1339,23 @@ def _run_command_bg(targets, action, params, user, skipped=None):
     try:
         def before_group(ips):
             attempted.update(ips)
+            if job_id:
+                db.update_command_job_targets(SVC.conn, job_id, ips, "DISPATCHING")
+                db.update_command_job(SVC.conn, job_id, "DISPATCHING")
             SVC.mark_rebooting(ips)
 
         def after_group(_grp, group_results):
             # 逐批写审计：分批重启要跑好几分钟，等全部跑完才记的话，中途进程退出(更新重启/
             # 断电)会丢掉已重启机器的记录，24h 次数上限和 15 分钟间隔对它们就失效了
             results_by_ip.update((r["ip"], r) for r in group_results)
+            if job_id:
+                durable = []
+                for result in group_results:
+                    state = ("UNCERTAIN" if result.get("uncertain") else
+                             "SUCCEEDED" if result.get("ok") else "FAILED")
+                    durable.append({**result, "state": state})
+                db.update_command_job_targets(SVC.conn, job_id, durable, "FAILED")
+                db.update_command_job(SVC.conn, job_id, "DISPATCHING")
             SVC.unmark_rebooting([r["ip"] for r in group_results if not r["ok"]])
             _audit_command(user, action, params, group_results)
             update_progress()
@@ -1361,6 +1378,13 @@ def _run_command_bg(targets, action, params, user, skipped=None):
                                    "msg": "执行结果未确认，请检查机器状态" if sent
                                    else "任务已中断，未下发"})
         results_by_ip.update((r["ip"], r) for r in unresolved)
+        if job_id:
+            durable = [{**r, "state": "UNCERTAIN" if r.get("uncertain") else "CANCELLED"}
+                       for r in unresolved]
+            try:
+                db.update_command_job_targets(SVC.conn, job_id, durable, "CANCELLED")
+            except Exception:
+                log.exception("批量任务台账更新失败")
         # 未下发的目标不能继续静默；已经开始请求但没有结果的目标保留重启宽限期。
         SVC.unmark_rebooting([r["ip"] for r in unresolved if not r["uncertain"]])
         try:
@@ -1372,6 +1396,11 @@ def _run_command_bg(targets, action, params, user, skipped=None):
         update_progress()
         success, failed = CMD_PROGRESS["success"], CMD_PROGRESS["failed"]
         CMD_PROGRESS["running"] = False
+        if job_id:
+            try:
+                db.update_command_job(SVC.conn, job_id, "INTERRUPTED" if error else "COMPLETED", error)
+            except Exception:
+                log.exception("批量任务最终状态保存失败")
         SVC._reboot_lock.release()
     _record_command(user, action, params, list(results_by_ip.values()), audited=True)
     log.info("批量 %s %s: 成功 %d / 未成功 %d (发起人 %s)",
@@ -1380,7 +1409,25 @@ def _run_command_bg(targets, action, params, user, skipped=None):
 
 @app.get("/api/command/progress")
 def api_command_progress(_: dict = Depends(require_ops)):
-    return dict(CMD_PROGRESS)
+    out = dict(CMD_PROGRESS)
+    job_id = out.get("job_id")
+    if job_id:
+        job = db.get_command_job(SVC.conn, job_id)
+        if job:
+            job.pop("params_json", None)
+            out["job"] = job
+    return out
+
+
+@app.get("/api/command/job/{job_id}")
+def api_command_job(job_id: str, _: dict = Depends(require_ops)):
+    if not re.fullmatch(r"[0-9a-f]{32}", str(job_id)):
+        return JSONResponse({"ok": False, "error": "任务 ID 非法"}, status_code=400)
+    job = db.get_command_job(SVC.conn, job_id)
+    if not job:
+        return JSONResponse({"ok": False, "error": "任务不存在"}, status_code=404)
+    job.pop("params_json", None)
+    return {"ok": True, "job": job}
 
 
 @app.post("/api/command")
@@ -1494,12 +1541,16 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
             log.info("命令 %s: %d 台(限流跳过 %d), 发起人 %s",
                      action, len(targets), len(skipped), user)
             if rb > 0 and len(targets) > rb:
-                CMD_PROGRESS.update({"running": True, "action": action, "done": 0,
+                job_id = uuid.uuid4().hex
+                # Persist the full target ledger before the first device request.
+                db.create_command_job(SVC.conn, job_id, user, action, params, targets, skipped)
+                CMD_PROGRESS.update({"running": True, "action": action, "done": len(skipped),
                                      "total": len(targets) + len(skipped), "success": 0,
-                                     "failed": 0, "fail_ips": [], "user": user, "error": ""})
+                                     "failed": len(skipped), "fail_ips": [r["ip"] for r in skipped][:100],
+                                     "user": user, "error": "", "job_id": job_id})
                 try:
                     threading.Thread(target=_run_command_bg,
-                                     args=(targets, action, params, user, skipped),
+                                     args=(targets, action, params, user, skipped, job_id),
                                      daemon=True).start()
                 except Exception:
                     CMD_PROGRESS.update({"running": False, "done": len(targets) + len(skipped),
