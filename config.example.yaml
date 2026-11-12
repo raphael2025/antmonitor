@@ -11,15 +11,20 @@ scan:
   hi: 160               # 回退用：第三段结束
   online_timeout: 3.0   # 在线判定超时(秒)：单台最多等 3 秒，扫描慢一点但不会把慢响应的矿机误报掉线；低于 3 按 3
   data_timeout: 5.0     # 取算力超时(秒)
-  workers: 300          # 名册巡检并发(已知真机,可高)
-  discovery_workers: 300 # 全网发现并发(只用于空地址这一段)
-  # 空地址不要一口气探完：连续一两分钟、每秒上百个死地址 ARP，交换机会把真机一起读丢。
-  # 每批这么多个，批与批之间停一下。pause 设 0 就是连续探(大场地容易误伤在线机)。
-  discovery_batch: 1000
-  discovery_pause_sec: 5
-  liveness_gate: true   # 发现时先快速 TCP 连 80 判活(三类设备都开80)，死IP不再白跑3个探测
-  gate_timeout: 3.0     # 判活连接超时(秒)；低于 3 按 3(太短会把慢响应的矿机判成离线)
-  max_pps: 300          # 每秒新建连接上限(≈死IP的ARP速率)，保护三层500pps CoPP；代码强制上限500，不可配更高
+  workers: 200          # 名册巡检并发(已知真机,ARP 多半命中缓存，可相对高)
+  discovery_workers: 64 # 全网发现并发(只用于空地址；务必低于名册，防打爆三层 arp-miss)
+  # 空地址不要一口气探完：连续狂扫死 IP 会打满三层 ARP/CPCAR，旁边真机一起读失败，
+  # 表现为"跑一段时间后扫不到机器"。小批次 + 批间停顿让交换机回血。
+  discovery_batch: 250
+  discovery_pause_sec: 20
+  liveness_gate: true   # 先 TCP 连 80 判活，死IP不再白跑原厂/第三方整套取数
+  gate_timeout: 3.0     # 名册判活超时(秒)；低于 3 按 3(防慢矿机误报掉线)
+  max_pps: 150          # 名册每秒新建连接上限；代码强制上限500
+  discovery_gate_timeout: 0.5  # 空地址判活超时(可亚秒：死IP别干等3秒)
+  discovery_max_pps: 80        # 空地址专用 pps，应明显低于 max_pps
+  # 名册阶段 unknown 比例过高(=网络已经在丢包)时，本轮跳过空地址发现
+  discovery_pressure_unknown_ratio: 0.15
+  discovery_pressure_min: 20
   # 二次确认：上次在线、本次掉线/零算力的机器，用更宽松超时重探，去掉抖动/慢响应误判
   reconfirm_enabled: true
   reconfirm_online_timeout: 3.0  # 二次确认的连接超时(秒)

@@ -570,27 +570,65 @@ class MonitorService:
         return [fixed.get(r["ip"], r) for r in miners]
 
     def _discover_blocked(self, miners):
-        """名册阶段已经是大面积掉线时，本轮不再探空地址。
+        """名册阶段已经网络吃紧时，本轮不再探空地址。
 
-        二次确认对这种情况会直接放弃重探(真实的交换机/断电)。接着再对上万个空地址
-        发 ARP，只会在已经故障的网络上再加压。新机留到下一轮全网发现。"""
-        limit = int(self.cfg["scan"].get("reconfirm_max", 800) or 0)
-        if limit <= 0:
-            return False
+        两种信号都要拦：
+          1) 大面积确认掉线(交换机/断电)——再扫空地址只会加压；
+          2) 大量 unknown /「本轮未探测」——典型是三层 arp-miss/CoPP 已在丢包，
+             真机判活失败。这时继续狂扫死 IP，下一轮名册会更惨，形成"跑久了扫不到"。
+        新机留到网络回血后的下一轮全网发现。"""
+        sc = self.cfg["scan"]
+        limit = int(sc.get("reconfirm_max", 800) or 0)
         prev_online = set(db.online_ips(self.conn))
         went_off = sum(1 for r in miners
                        if r["ip"] in prev_online and r["status"] == "offline")
-        if went_off > limit:
+        if limit > 0 and went_off > limit:
             log.info("全网发现: %d 台同时掉线，超过上限 %d，本轮不探空地址", went_off, limit)
             return True
+        # 名册压力：unknown 占比过高(=这一轮大量没探到/超时)，别再打空地址
+        roster_n = len(miners) or 0
+        if roster_n:
+            unknown_n = sum(1 for r in miners if r.get("status") == "unknown")
+            ratio = float(sc.get("discovery_pressure_unknown_ratio", 0.15) or 0)
+            min_n = int(sc.get("discovery_pressure_min", 20) or 0)
+            if ratio > 0 and unknown_n >= max(min_n, 1) and unknown_n / roster_n >= ratio:
+                log.info("全网发现: 名册 unknown %d/%d (≥%.0f%%)，疑似 ARP/CoPP 压力，本轮不探空地址",
+                         unknown_n, roster_n, ratio * 100)
+                return True
         return False
+
+    def _discovery_scan_cfg(self, base_cfg):
+        """空地址专用探测参数：短判活 + 独立低 pps，与名册巡检脱钩。"""
+        sc = self.cfg["scan"]
+        cc = dict(base_cfg)
+        # 死 IP 用短超时快速判死；名册仍用 ≥3s 的 gate_timeout 防慢机误报
+        gate = float(sc.get("discovery_gate_timeout", 0.5) or 0.5)
+        cc["liveness_gate"] = True
+        cc["gate_timeout"] = max(0.1, gate)
+        # 空地址阶段 online/data 也跟着收紧：闸门已判死就不会走到取数
+        cc["online_timeout"] = max(cc["gate_timeout"], min(float(cc.get("online_timeout", 3.0)), 1.5))
+        # 独立 pps：即便网页把 max_pps 调到 300，空地址仍按 discovery_max_pps 限速
+        d_pps = sc.get("discovery_max_pps")
+        if d_pps is None:
+            d_pps = min(int(sc.get("max_pps", 150) or 150), 80)
+        cc["max_pps"] = max(1, int(d_pps))
+        # 发现阶段不需要矿工名：少一次 4028，降低对真机的额外压力
+        cc["fetch_worker"] = False
+        return cc
 
     def _scan_discover(self, ips, scan_cfg, workers, progress_cb, base, total, gen):
         """分批探空地址。批间停顿，避免连续 ARP 把交换机打满后误伤真机。"""
         ips = list(ips)
         sc = self.cfg["scan"]
-        batch = max(1, int(sc.get("discovery_batch", 1000) or 1000))
-        pause = max(0.0, float(sc.get("discovery_pause_sec", 5) or 0))
+        batch = max(1, int(sc.get("discovery_batch", 250) or 250))
+        pause = max(0.0, float(sc.get("discovery_pause_sec", 20) or 0))
+        disc_cfg = self._discovery_scan_cfg(scan_cfg)
+        workers = min(int(workers or sc.get("discovery_workers", 64) or 64),
+                      int(sc.get("discovery_workers", 64) or 64))
+        log.info("全网发现空地址: %d 个, batch=%d pause=%.0fs workers=%d gate=%.2fs pps=%d",
+                 len(ips), batch, pause, workers,
+                 float(disc_cfg.get("gate_timeout", 0.5)),
+                 int(disc_cfg.get("max_pps", 80)))
         found = []
         for i in range(0, len(ips), batch):
             if gen != self._scan_gen:
@@ -601,7 +639,7 @@ class MonitorService:
             def cb(done, _t, off=offset):
                 progress_cb(base + off + done, total)
 
-            found += miner_core.scan(chunk, scan_cfg, progress_cb=cb, workers=workers)
+            found += miner_core.scan(chunk, disc_cfg, progress_cb=cb, workers=workers)
             if i + batch >= len(ips):
                 break
             if gen != self._scan_gen:
@@ -865,16 +903,16 @@ class MonitorService:
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         known = [ip for ip in ips if ip in roster]
         rest = [ip for ip in ips if ip not in roster]
-        return self._do_scan(kind, known, workers=self.cfg["scan"].get("workers", 300),
+        return self._do_scan(kind, known, workers=self.cfg["scan"].get("workers", 200),
                              discover=rest,
-                             discover_workers=self.cfg["scan"].get("discovery_workers", 300))
+                             discover_workers=self.cfg["scan"].get("discovery_workers", 64))
 
     def scan_quick(self, kind="quick"):
         """名册巡检：只探已知真机(在线过的 + 维修中的)，抓上线/下线。"""
         ips = db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7))
         if not ips:
             return self.scan_full(kind="full")   # 没有底库先全扫
-        return self._do_scan(kind, ips, workers=self.cfg["scan"].get("workers", 300))
+        return self._do_scan(kind, ips, workers=self.cfg["scan"].get("workers", 200))
 
     def _kick_containers(self):
         """离线太久的箱子移出监控。移出后漏液等冷却告警就不再检测，必须明确通知，
