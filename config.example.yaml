@@ -110,7 +110,7 @@ cloud:                  # 云端总览上报：本地每分钟主动推，场地
 
 control:
   enabled: true         # 远程命令总开关（重启/定位灯/换矿池）。关闭则一律拒绝写操作
-  uniplus_password: ""  # 第三方 UniPlusOS 解锁密码（重启/换矿池需要；定位灯免密）
+  uniplus_password: ""  # 第三方 UniPlusOS 密码（重启/换矿池/网页一键打开 bridge；默认 admin；定位灯免密）
   timeout: 8            # 单条命令超时(秒)
   max_batch: 1000       # 单次批量命令最多目标台数(防一次性误重启全场)
   # 重启浪涌保护：同变压器(常为连号IP)的机器同时上电涌流叠加会跳闸，故打乱+分批+延迟。

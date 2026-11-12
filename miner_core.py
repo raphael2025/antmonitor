@@ -640,9 +640,37 @@ def probe(ip, cfg, limiter=None):
     if gate and not tcp_open(ip, 80, cfg.get("gate_timeout", 0.4)):
         return _blank(ip, "offline")
     collect_identity = bool(cfg.get("collect_identity"))
-    rec = probe_stock(ip, online_to, data_to, passwords, collect_identity)
-    if rec is None:
+    # UniPlus 也常开 6060：若先走原厂会被误标 stock。优先看 80 口页面指纹。
+    def _uniplus_html(text):
+        low = (text or "").lower()
+        return 'content="uniplusos"' in low or "content='uniplusos'" in low or (
+            "firmware console" in low and "uniplus" in low)
+
+    uniplus_first = False
+    page_html = ""
+    try:
+        s = get_session()
+        page = s.get(f"http://{ip}/", timeout=min(online_to, 1.0))
+        auth = (page.headers.get("WWW-Authenticate") or "").lower()
+        page_html = page.text or ""
+        if page.status_code != 401 or "digest" not in auth:
+            uniplus_first = _uniplus_html(page_html)
+    except Exception:  # noqa: BLE001 - 指纹失败则沿用原顺序
+        uniplus_first = False
+
+    rec = None
+    if uniplus_first:
         rec = probe_uniplus(ip, online_to, data_to, collect_identity)
+        if rec is None:
+            rec = probe_stock(ip, online_to, data_to, passwords, collect_identity)
+    else:
+        rec = probe_stock(ip, online_to, data_to, passwords, collect_identity)
+        if rec is None:
+            rec = probe_uniplus(ip, online_to, data_to, collect_identity)
+        elif rec.get("firmware") == "stock" and page_html and _uniplus_html(page_html):
+            alt = probe_uniplus(ip, online_to, data_to, collect_identity)
+            if alt is not None:
+                rec = alt
     if rec is None:
         # AntBox 控制器响应比矿机慢（要查 PLC），给更宽超时
         cont = probe_antbox(ip, max(online_to, 1.5), data_to)

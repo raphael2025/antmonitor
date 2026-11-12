@@ -267,6 +267,36 @@ function alertClick(x) {
   if (x.ip && x.ip.split(".").length === 4) return `openMiner('${esc(x.ip)}')`;
   return "";
 }
+function consoleClick(ip) {
+  if (!/^[0-9.]+$/.test(String(ip || "")) || String(ip).split(".").length !== 4) return "";
+  return `openMinerConsole('${esc(ip)}'); event.stopPropagation();`;
+}
+async function openMinerConsole(ip) {
+  try {
+    const d = await jget(`/api/miner/${encodeURIComponent(ip)}/console`);
+    if (!d || d.ok === false) {
+      toast(t("toast.console_fail", { msg: (d && d.error) || "" }));
+      return;
+    }
+    if (d.kind === "uniplus" && d.bridge_path) {
+      window.open(d.bridge_path, "_blank", "noopener");
+      if (d.password) {
+        try { await navigator.clipboard.writeText(d.password); } catch (e) {}
+        toast(t("toast.console_uniplus", { pwd: d.password }), "ok");
+      }
+      return;
+    }
+    if (d.kind === "stock" && d.open_url) {
+      window.open(d.open_url, "_blank", "noopener");
+      toast(t("toast.console_stock", { user: d.username || "root", pwd: d.password || "root" }), "ok");
+      return;
+    }
+    window.open((d && d.open_url) || `http://${ip}/`, "_blank", "noopener");
+    toast(t("toast.console_unknown"), "ok");
+  } catch (e) {
+    toast(t("toast.console_fail", { msg: "" }));
+  }
+}
 function focusSegment(seg) {
   const sel = $("fSeg");
   if (![...sel.options].some(o => o.value === seg)) {
@@ -296,8 +326,10 @@ async function refreshAlerts() {
                       : `<button class="ackbtn" onclick="ackAlert(${x.id})">${esc(t("ack.confirm"))}</button>`;
       if (isMiner) tail += `<button class="rmbtn" onclick="removeFromAlert('${esc(x.ip)}')" title="${esc(t("alert.remove_title"))}">${esc(t("alert.remove_btn"))}</button>`;
     }
+    const cons = isMiner ? consoleClick(x.ip) : "";
     return `<div class="a ${esc(x.severity)}${x.ack_by ? " is-ack" : ""}"><span class="atime">${fmtDT(x.ts)} · ${ago(x.ts)}</span>`
       + `<span class="ip"${click ? ` onclick="${click}"` : ""}>${esc(x.ip)}</span>`
+      + (cons ? `<button type="button" class="console-link" onclick="${cons}" title="${esc(t("alert.open_console"))}">↗</button>` : "")
       + worker + `<span class="adetail">${esc(alertDetail(x))}</span>${tail}</div>`;
   }).join("") : `<div class="muted">${esc(t("alerts.none"))}</div>`)
     + (total > a.length ? `<div class="muted" style="text-align:center;padding:6px">${esc(t("alert.more", { shown: a.length, total }))}</div>` : "");
@@ -551,7 +583,8 @@ async function refreshMiners() {
     const ck = selected.has(r.ip) ? "checked" : "";
     return `<tr class="${rowClass(r)} ${selected.has(r.ip) ? "sel" : ""}">`
       + `<td class="cbcol"><input type="checkbox" data-ip="${esc(r.ip)}" ${ck}></td>`
-      + `<td class="ip-link" onclick="openMiner('${esc(r.ip)}')">${esc(r.ip)}</td>`
+      + `<td class="ip-link"><span onclick="openMiner('${esc(r.ip)}')">${esc(r.ip)}</span>`
+      + `<button type="button" class="console-link" onclick="${consoleClick(r.ip)}" title="${esc(t("alert.open_console"))}">↗</button></td>`
       + `<td>${r.mstate === "repair" ? `<span class="pill repair">${esc(t("status.repair"))}</span>` : `<span class="pill ${esc(r.status)}" title="${r.status === "unknown" ? esc(t("pill.unknown_title")) : ""}">${esc(statusLabel(r.status))}</span>`}</td>`
       + `<td>${r.firmware ? `<span class="pill ${esc(r.firmware)}">${esc(r.firmware)}</span>` : "-"}</td>`
       + `<td>${esc(r.model) || "-"}</td>`
@@ -734,6 +767,8 @@ async function openMiner(ip) {
     + t("miner.detail_eff", { eff: safeVal(c.eff), temp: safeVal(c.temp), up: fmtUptime(c.uptime) }) + "<br>"
     + t("miner.detail_worker", { w: esc(c.worker) || "-", a: safeVal(c.accepted), r: safeVal(c.rejected), s: safeVal(c.stale) })
     + (c.note ? "<br>" + t("miner.detail_note", { n: esc(c.note) }) : "");
+  const btn = $("mOpenConsole");
+  if (btn) btn.onclick = () => openMinerConsole(ip);
   $("modal").classList.remove("hidden");
 }
 

@@ -946,6 +946,52 @@ def api_miner(ip: str, _: dict = Depends(require_viewer)):
     return {"current": cur, "history": history}
 
 
+@app.get("/api/miner/{ip}/console")
+def api_miner_console(ip: str, live: bool = True, _: dict = Depends(require_viewer)):
+    """返回打开矿机官方/第三方网页的方案（不代替浏览器跨域登录限制）。"""
+    import miner_web
+    try:
+        ip = miner_web.validate_miner_ip(ip)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    _, recs = _latest_records()
+    cur = next((r for r in recs if r["ip"] == ip), None) or {}
+    cfg = SVC.cfg if hasattr(SVC, "cfg") else {}
+    passwords = cfg.get("passwords") or [["root", "root"]]
+    stock_user, stock_pwd = (passwords[0] + ["", ""])[:2] if passwords else ("root", "root")
+    control = cfg.get("control") or {}
+    uni_pwd = control.get("uniplus_password") or "admin"
+    try:
+        plan = miner_web.console_plan(
+            ip,
+            firmware_hint=str(cur.get("firmware") or ""),
+            stock_user=str(stock_user or "root"),
+            stock_password=str(stock_pwd or "root"),
+            uniplus_password=str(uni_pwd or "admin"),
+            live=bool(live),
+        )
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    plan["ok"] = True
+    plan["firmware_hint"] = cur.get("firmware")
+    if plan.get("kind") == "uniplus":
+        plan["bridge_path"] = f"/api/miner/{ip}/console/bridge"
+    return plan
+
+
+@app.get("/api/miner/{ip}/console/bridge")
+def api_miner_console_bridge(ip: str, _: dict = Depends(require_viewer)):
+    """UniPlus：新窗口 POST pwd 写入 cookie 后跳转 /dashboard。"""
+    import miner_web
+    try:
+        ip = miner_web.validate_miner_ip(ip)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    cfg = SVC.cfg if hasattr(SVC, "cfg") else {}
+    uni_pwd = (cfg.get("control") or {}).get("uniplus_password") or "admin"
+    return HTMLResponse(miner_web.uniplus_bridge_html(ip, str(uni_pwd or "admin")))
+
+
 @app.post("/api/alerts/ack")
 def api_alert_ack(body: dict = Body(...), sess: dict = Depends(require_ops)):
     """确认矿机告警（集装箱告警不允许确认，修复后自动消失）。"""
