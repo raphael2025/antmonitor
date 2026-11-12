@@ -1574,6 +1574,22 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
             return JSONResponse({"ok": False, "error":
                                  f"矿池不在白名单，已拒绝: {', '.join(bad)[:200]}"},
                                 status_code=403)
+        # 跨客户保护：换池会把 params 里同一个 user 写到所有目标机。
+        # 勾选里已有 ≥2 个不同矿工名时，必须显式 acknowledge_cross_customer，否则拒发。
+        known = db.known_identity(SVC.conn)
+        workers = sorted({
+            (known.get(ip) or {}).get("worker") or "" for ip in ips
+        } - {""})
+        if len(workers) >= 2 and body.get("acknowledge_cross_customer") is not True:
+            sample = "、".join(workers[:8]) + ("…" if len(workers) > 8 else "")
+            _audit_reject(user, action, f"跨客户换池未确认: {sample}")
+            return JSONResponse({
+                "ok": False, "need_cross_customer_ack": True,
+                "workers": workers[:50], "worker_count": len(workers),
+                "error": (f"选中机器分属 {len(workers)} 个矿工名（{sample}）。"
+                          "换池会把它们改成同一客户名，可能把别人算力划走。"
+                          "确认无误请传 acknowledge_cross_customer:true"),
+            }, status_code=400)
     # 从最近快照取每台固件类型，避免重复探测
     _, recs = _latest_records()
     fw_map = {r["ip"]: r["firmware"] for r in recs}

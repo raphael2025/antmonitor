@@ -546,6 +546,7 @@ function rejCell(r) {
 
 let lastMiners = [];            // 当前筛选结果全集（选择/命令都基于它，不受渲染上限影响）
 const selected = new Set();     // 选中的 IP
+let selectionLocked = false;  // 锁定勾选：换筛选也不收敛；自动刷新本就不收敛
 let showAllRows = false;
 
 let _minerSeq = 0;            // 列表请求序号：慢的旧响应晚到时丢弃，别覆盖新筛选的结果
@@ -560,11 +561,14 @@ async function refreshMiners() {
   lastMiners = d.miners || [];   // 后端异常响应(无miners字段)时兜底为空
   // 防误操作：用户自己换了筛选条件时，把选择集收敛到当前结果集，别让看不见的机器被命令误打。
   // 后台自动刷新(同一筛选条件)不动选择集：按"离线"勾了 300 台，期间 30 台恢复在线，
-  // 以前会被悄悄移出选择、实际只下发 270 台且没有任何提示
+  // 以前会被悄悄移出选择、实际只下发 270 台且没有任何提示。
+  // 「锁定勾选」时换筛选也不收敛——准备大批量时先锁住再核对。
   const filterKey = [st, fw, seg, q].join("|");
   if (filterKey !== _lastFilterKey) {
-    const visible = new Set(lastMiners.map(m => m.ip));
-    for (const ip of [...selected]) if (!visible.has(ip)) selected.delete(ip);
+    if (!selectionLocked) {
+      const visible = new Set(lastMiners.map(m => m.ip));
+      for (const ip of [...selected]) if (!visible.has(ip)) selected.delete(ip);
+    }
     _lastFilterKey = filterKey;
   }
   $("minerCount").textContent = d.count != null ? d.count : lastMiners.length;
@@ -618,11 +622,47 @@ async function refreshMiners() {
 function updateSelCount() {
   const visible = new Set(lastMiners.map(m => m.ip));
   const hidden = [...selected].filter(ip => !visible.has(ip)).length;
-  $("selCount").textContent = hidden
+  let text = hidden
     ? t("cmd.selected_hidden", { n: selected.size, h: hidden })
     : t("cmd.selected", { n: selected.size });
+  if (selectionLocked) text = t("cmd.locked_prefix") + text;
+  $("selCount").textContent = text;
+  const btn = $("btnLockSel");
+  if (btn) {
+    btn.classList.toggle("active", selectionLocked);
+    btn.textContent = selectionLocked ? t("cmd.unlocksel") : t("cmd.locksel");
+  }
   const all = $("cbAll");   // 全选框跟随当前结果集同步
   if (all) all.checked = lastMiners.length > 0 && lastMiners.every(m => selected.has(m.ip));
+}
+
+/** 勾选范围摘要：网段数 / 矿工名数，用于确认框顶部防误操作。 */
+function selectionScope(ips) {
+  const byIp = new Map(lastMiners.map(m => [m.ip, m]));
+  const segs = new Set(), workers = new Set();
+  let offline = 0, unknownWorker = 0;
+  for (const ip of ips) {
+    const m = byIp.get(ip);
+    const parts = String(ip).split(".");
+    if (parts.length === 4) segs.add(parts.slice(0, 3).join("."));
+    if (!m) { unknownWorker++; continue; }
+    if (m.status && m.status !== "online") offline++;
+    const w = (m.worker || "").trim();
+    if (w) workers.add(w); else unknownWorker++;
+  }
+  return { segs: [...segs], workers: [...workers], offline, unknownWorker };
+}
+
+function scopeSummaryHtml(scope) {
+  let html = `<div class="muted" style="margin:6px 0">${esc(t("cmd.scope_summary", {
+    segs: scope.segs.length, workers: scope.workers.length, offline: scope.offline,
+  }))}</div>`;
+  if (scope.workers.length >= 2)
+    html += `<div class="warn-box" style="border-width:2px">${esc(t("cmd.cross_customer", {
+      n: scope.workers.length,
+      names: scope.workers.slice(0, 8).join(", ") + (scope.workers.length > 8 ? " …" : ""),
+    }))}</div>`;
+  return html;
 }
 
 /* ---------------- 货架视图 ---------------- */
@@ -942,11 +982,22 @@ const NEED_CONFIRM_FLAG = new Set(["reboot"]);
 document.querySelector(".cmdbar").addEventListener("click", (e) => {
   const cmd = e.target.dataset && e.target.dataset.cmd;
   if (!cmd) return;
+  if (cmd === "locksel") {
+    selectionLocked = !selectionLocked;
+    updateSelCount();
+    toast(selectionLocked ? t("toast.sel_locked") : t("toast.sel_unlocked"), "ok");
+    return;
+  }
   if (cmd === "selall") {
     lastMiners.forEach(m => selected.add(m.ip));
     refreshMiners(); return;
   }
-  if (cmd === "clear") { selected.clear(); refreshMiners(); return; }
+  if (cmd === "clear") {
+    selected.clear();
+    selectionLocked = false;
+    refreshMiners();
+    return;
+  }
   if (cmd === "repair") return doMachineState("repair");
   if (cmd === "powercut") return doMachineState("powercut");
   if (cmd === "unrepair") return doMachineState("active");
@@ -960,10 +1011,19 @@ async function doMachineState(action) {
   // 单次上限 control.max_batch 是安全闸：超了直接提示分批，别在确认之后才被后端拒绝，
   // 也别在前端悄悄分批绕过它(下架 5000 台只需确认两次)
   if (ips.length > maxBatch) { toast(t("toast.batch_max", { n: maxBatch })); return; }
+  const scope = selectionScope(ips);
+  const scopeLine = t("cmd.scope_summary", {
+    segs: scope.segs.length, workers: scope.workers.length, offline: scope.offline,
+  });
   // 维修/限电/下架影响大(停告警/删名册)，二次确认把后果讲清；大批量再确认一次
-  if (action === "repair" && !confirm(t("confirm.repair", { n: ips.length }))) return;
-  if (action === "powercut" && !confirm(t("confirm.powercut", { n: ips.length }))) return;
-  if (action === "remove" && !confirm(t("confirm.remove", { n: ips.length }))) return;
+  if (action === "repair" && !confirm(scopeLine + "\n\n" + t("confirm.repair", { n: ips.length }))) return;
+  if (action === "powercut" && !confirm(scopeLine + "\n\n" + t("confirm.powercut", { n: ips.length }))) return;
+  if (action === "remove" && !confirm(scopeLine + "\n\n" + t("confirm.remove", { n: ips.length }))) return;
+  if (scope.workers.length >= 2 && (action === "repair" || action === "powercut" || action === "remove")
+      && !confirm(t("confirm.cross_customer", {
+        n: scope.workers.length,
+        names: scope.workers.slice(0, 8).join(", ") + (scope.workers.length > 8 ? " …" : ""),
+      }))) return;
   if (ips.length > 200 && (action === "repair" || action === "powercut" || action === "remove")
       && !confirm(t("confirm.bulk_state", { n: ips.length }))) return;
   if (ips.length > 500 && !confirm(t("confirm.bulk", { n: ips.length }))) return;
@@ -992,7 +1052,9 @@ function openCmdDialog(cmd, includeHidden) {
   pendingCmd = { action: meta.action, params: { ...meta.params }, danger: !!meta.danger,
                  short: meta.short || meta.title, ips };
   $("cmdTitle").textContent = meta.title;
-  let html = t("cmd.dialog_run", { n: ips.length, act: esc(meta.title) });
+  const scope = selectionScope(ips);
+  let html = t("cmd.dialog_run", { n: ips.length, act: esc(meta.title) })
+    + scopeSummaryHtml(scope);
   if (hiddenIps.length)
     html += `<div class="warn-box" style="border-width:2px">${t("cmd.hidden_warn", { n: hiddenIps.length, ips: hiddenIps.slice(0, 20).map(esc).join(", ") + (hiddenIps.length > 20 ? " …" : "") })}`
       + `<br><label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-top:6px">`

@@ -107,6 +107,7 @@ td.low { color: #f0883e; font-weight: 600; }
 .cmdbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
 .cmdbar .sep { width: 1px; height: 18px; background: #30363d; margin: 0 4px; }
 .mini-btn { padding: 5px 10px; font-size: 12px; }
+.mini-btn.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 .mini-btn.danger { border-color: #5a2327; color: #f85149; }
 .mini-btn.danger:hover { background: #3d1d20; }
 #selCount { min-width: 64px; }
