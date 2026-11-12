@@ -42,11 +42,17 @@ DEFAULTS = {
         "base": "172.16", "lo": 100, "hi": 160,
         # 单台判活/在线判定统一等 3 秒：扫一轮会慢一点，但慢响应的矿机不会被当成掉线乱报警
         "online_timeout": 3.0, "data_timeout": 5.0,
-        "workers": 300, "discovery_workers": 300,
-        # 空地址连续用 discovery_workers 探一两分钟，交换机会把 ARP 打满，旁边的真机跟着读失败。
-        # 每批 discovery_batch 个，批间停 discovery_pause_sec 秒，让 ARP 表喘口气。
-        "discovery_batch": 1000, "discovery_pause_sec": 5,
-        "liveness_gate": True, "gate_timeout": 3.0, "max_pps": 300,
+        # 名册并发可高(ARP 多半命中缓存)；空地址发现必须低并发+低 pps，否则三层 CoPP
+        # 把 arp-miss 丢光后，真机也跟着判不在线——跑一段时间"扫不到机器"的主因。
+        "workers": 200, "discovery_workers": 64,
+        # 空地址分批：小批次 + 较长批间停顿，让交换机 ARP/CPCAR 回血。
+        "discovery_batch": 250, "discovery_pause_sec": 20,
+        "liveness_gate": True, "gate_timeout": 3.0, "max_pps": 150,
+        # 空地址专用：短判活(死 IP 别干等 3 秒) + 独立 pps(可低于名册 max_pps)。
+        # 不要与 gate_timeout 共用下限 3 秒——那是名册防误报用的。
+        "discovery_gate_timeout": 0.5, "discovery_max_pps": 80,
+        # 名册阶段 unknown/误伤比例过高 → 本轮跳过空地址发现(网络已在吐血)。
+        "discovery_pressure_unknown_ratio": 0.15, "discovery_pressure_min": 20,
         "reconfirm_enabled": True, "reconfirm_online_timeout": 3.0,
         "reconfirm_data_timeout": 6.0, "reconfirm_passes": 2, "reconfirm_max": 800,
         # 每轮二次确认前等几秒：紧接着重探碰上的还是同一波网络抖动
@@ -222,10 +228,15 @@ def _validate(cfg):
     # 三层交换机 CoPP 硬限制约 500pps，这里是代码层面的最后一道保险——
     # 不管 config.yaml 还是网页设置怎么填，并发/连接速率永远不允许超过 500。
     clamp("scan", "max_pps", 1, 500, int)
+    clamp("scan", "discovery_max_pps", 1, 500, int)
     clamp("scan", "workers", 1, 500, int)
     clamp("scan", "discovery_workers", 1, 500, int)
     clamp("scan", "discovery_batch", 1, 100000, int)
     clamp("scan", "discovery_pause_sec", 0, 120)
+    # 空地址判活允许亚秒级；名册 gate_timeout 仍受 MIN_PROBE_TIMEOUT 保护
+    clamp("scan", "discovery_gate_timeout", 0.1, 30)
+    clamp("scan", "discovery_pressure_unknown_ratio", 0, 1)
+    clamp("scan", "discovery_pressure_min", 1, 100000, int)
     clamp("scan", "host_start", 1, 254, int)
     clamp("scan", "host_end", 1, 254, int)
     clamp("db", "retention_days", 1, 3650, int)
@@ -547,7 +558,8 @@ def _atomic_json(path, data):
 
 
 _INT_SETTINGS = ("scan_interval", "full_interval", "container_interval",
-                 "max_pps", "discovery_workers")
+                 "max_pps", "discovery_workers", "discovery_max_pps",
+                 "discovery_batch")
 # 网页可热改的 control 整数项(自动重启相关)；与 _INT_SETTINGS 分开，避免误写到 scan/schedule
 _CONTROL_INT_SETTINGS = ("reboot_concurrency", "reboot_delay_sec",
                          "reboot_max_per_day", "reboot_min_interval_sec")
@@ -563,7 +575,7 @@ def settings_overrides(cfg, s):
             continue
         if k in ("scan_interval", "full_interval", "container_interval"):
             cur = cfg["schedule"].get(k)
-        elif k in ("max_pps", "discovery_workers"):
+        elif k in ("max_pps", "discovery_workers", "discovery_max_pps", "discovery_batch"):
             cur = cfg["scan"].get(k)
         else:
             cur = (cfg.get("control") or {}).get(k)
@@ -580,7 +592,8 @@ def apply_settings(cfg, s):
                 v = int(s[k])
             except (TypeError, ValueError):
                 continue
-            if k in ("max_pps", "discovery_workers") and v < 1:
+            if k in ("max_pps", "discovery_workers", "discovery_max_pps",
+                     "discovery_batch") and v < 1:
                 # 旧版网页清空输入框会存成 0，校验时被夹成 1 → 每秒只探 1 台，扫描形同停摆。
                 # 这种值当作没设置，沿用 config.yaml/默认值
                 log.warning("settings.json 里 %s=%s 无效(会让扫描几乎停摆)，已忽略，沿用配置值", k, v)

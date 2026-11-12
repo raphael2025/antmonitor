@@ -645,6 +645,61 @@ def test_mass_offline_skips_dead_address_scan(svc, monkeypatch):
     assert svc.progress["done"] == svc.progress["total"] == 5
 
 
+def test_discovery_uses_short_gate_and_own_pps(svc, monkeypatch):
+    """空地址发现必须用短判活 + 独立低 pps，不能跟名册共用 3 秒 gate。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2")]))
+    svc.scan_full("full")
+    svc.cfg["scan"].update(
+        reconfirm_enabled=False, max_pps=300, discovery_max_pps=77,
+        discovery_gate_timeout=0.4, discovery_workers=11, discovery_batch=1000)
+    cfgs = []
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        cfgs.append((list(ips), dict(cfg), workers))
+        return fake_scan([rec("10.9.0.2")])(ips, cfg, progress_cb, workers)
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    svc.scan_full("full")
+    # 第 1 次名册，第 2 次空地址
+    assert cfgs[0][0] == ["10.9.0.2"]
+    assert cfgs[0][1].get("max_pps") == 300
+    dead = cfgs[1]
+    assert set(dead[0]) == {"10.9.0.1", "10.9.0.3", "10.9.0.4", "10.9.0.5"}
+    assert dead[1]["max_pps"] == 77
+    assert dead[1]["gate_timeout"] == 0.4
+    assert dead[1]["liveness_gate"] is True
+    assert dead[1].get("fetch_worker") is False
+    assert dead[2] == 11
+
+
+def test_unknown_pressure_skips_dead_address_scan(svc, monkeypatch):
+    """名册大量 unknown(=ARP/CoPP 压力)时跳过空地址，避免越扫越盲。"""
+    monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2"), rec("10.9.0.4")]))
+    svc.scan_full("full")
+    svc.cfg["scan"].update(
+        reconfirm_enabled=False,
+        discovery_pressure_unknown_ratio=0.5,
+        discovery_pressure_min=1,
+    )
+    calls = []
+
+    def _scan(ips, cfg, progress_cb=None, workers=None):
+        calls.append(list(ips))
+        out = []
+        for ip in ips:
+            r = miner_core._blank(ip, "unknown")
+            r["note"] = "本轮未探测(扫描超时)"
+            out.append(r)
+        if progress_cb:
+            progress_cb(len(out), len(out))
+        return out
+
+    monkeypatch.setattr(miner_core, "scan", _scan)
+    out = svc.scan_full("full")
+    assert calls == [["10.9.0.2", "10.9.0.4"]]
+    assert out["online"] == 0
+
+
 def test_loop_waits_full_interval_after_scan_finishes(svc, monkeypatch):
     """扫完再等满 scan_interval：单轮耗时比间隔还长也不能紧接着开下一轮。"""
     clock = {"t": 1000.0}
