@@ -378,3 +378,38 @@ def test_update_file_lock_blocks_a_second_process(state, monkeypatch):
     finally:
         updater._restart_file_lock.close()
         updater._apply_lock.release()
+
+
+def test_resolve_git_prefers_portable_mingit_when_path_has_none(monkeypatch, tmp_path):
+    import os
+    import sys
+    import types
+    portable = str(tmp_path / "MinGit" / "cmd" / "git.exe")
+    monkeypatch.setattr(updater, "_git_exe", None)
+    monkeypatch.setattr(updater.shutil, "which", lambda name: None)
+    monkeypatch.setattr(updater.os, "name", "nt")
+    fake = types.ModuleType("git_bootstrap")
+    fake.find_git = lambda: portable
+    fake.install_mingit = lambda: (_ for _ in ()).throw(AssertionError("already found"))
+    monkeypatch.setitem(sys.modules, "git_bootstrap", fake)
+    assert updater._resolve_git_exe() == portable
+    assert str(tmp_path / "MinGit" / "cmd") in os.environ["PATH"].split(os.pathsep)
+
+
+def test_stale_core_worktree_is_cleared(tmp_path, monkeypatch):
+    import subprocess
+    site = tmp_path / "site"
+    site.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=site, check=True)
+    subprocess.run(
+        ["git", "config", "core.worktree", str(tmp_path / "missing-old-pc")],
+        cwd=site, check=True)
+    monkeypatch.setattr(updater, "BASE", str(site))
+    monkeypatch.setattr(updater, "_git_exe", None)
+    monkeypatch.setattr(updater, "_repo_git_ready", False)
+    updater._heal_stale_core_worktree()
+    probe = subprocess.run(
+        ["git", "config", "--local", "--get", "core.worktree"],
+        cwd=site, capture_output=True, text=True)
+    assert probe.returncode != 0
+    assert updater._git("rev-parse", "--is-inside-work-tree") == "true"

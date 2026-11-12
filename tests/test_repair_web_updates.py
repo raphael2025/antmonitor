@@ -162,3 +162,16 @@ def test_cli_failure_has_nonzero_exit_and_no_success_result(installation, tmp_pa
                           "--result", str(result_file)])
     assert code == 1
     assert not result_file.exists()
+
+
+def test_stale_core_worktree_from_migrated_folder_is_cleared(installation, tmp_path):
+    site, remote, _old, before = installation
+    recovery.repair(site, str(remote))
+    git(site, "config", "core.worktree", str(tmp_path / "old-pc-missing"))
+    result = recovery.repair(site, str(remote))
+    assert result["adopted"] is False
+    probe = subprocess.run(
+        ["git", "config", "--local", "--get", "core.worktree"],
+        cwd=str(site), capture_output=True, text=True)
+    assert probe.returncode != 0
+    assert_preserved(site, before)

@@ -57,6 +57,28 @@ def repair(base, repo_url, branch="main"):
             )
         adopted = bool(commit)
 
+    # Whole-folder copy keeps .git but often leaves core.worktree pointing at the old PC.
+    git_dir = base / ".git"
+    if git_dir.is_dir():
+        probe = subprocess.run(
+            [str(git), "--git-dir", str(git_dir), "--work-tree", str(base),
+             "config", "--local", "--get", "core.worktree"],
+            cwd=str(base), stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=30,
+            env=dict(os.environ, **git_bootstrap._GIT_ENV),
+        )
+        worktree = (probe.stdout or "").strip() if probe.returncode == 0 else ""
+        if worktree:
+            candidate = Path(worktree) if os.path.isabs(worktree) else (base / worktree)
+            if not candidate.is_dir():
+                subprocess.run(
+                    [str(git), "--git-dir", str(git_dir), "--work-tree", str(base),
+                     "config", "--local", "--unset-all", "core.worktree"],
+                    cwd=str(base), stdin=subprocess.DEVNULL, capture_output=True,
+                    text=True, encoding="utf-8", errors="replace", timeout=30,
+                    env=dict(os.environ, **git_bootstrap._GIT_ENV),
+                )
+
     top = Path(_git(git, base, "rev-parse", "--show-toplevel")).resolve()
     if os.path.normcase(str(top)) != os.path.normcase(str(base)):
         raise RuntimeError("Git points at a different working tree; the selected folder was not repaired.")
