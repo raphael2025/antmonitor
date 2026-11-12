@@ -131,6 +131,79 @@ _GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never",
 # 不注入 GIT_SSH_COMMAND：它优先级高于 core.sshCommand/GIT_SSH，会覆盖现场自己配的 SSH
 # (如 TortoisePlink/pageant)，用 SSH 部署密钥的站点 fetch 直接失败
 
+_git_exe = None
+_repo_git_ready = False
+
+
+def _resolve_git_exe():
+    """PATH 上的 git，或 Windows 便携 MinGit（换机 ZIP / 未走 launcher 时常见）。"""
+    global _git_exe
+    if _git_exe:
+        return _git_exe
+    found = shutil.which("git")
+    if found and "\\windowsapps\\" not in found.lower():
+        _git_exe = found
+        return found
+    if os.name == "nt":
+        try:
+            import git_bootstrap
+            found = git_bootstrap.find_git() or git_bootstrap.install_mingit()
+            if found:
+                git_dir = str(os.path.dirname(os.path.abspath(found)))
+                path = os.environ.get("PATH", "")
+                if git_dir and git_dir not in path.split(os.pathsep):
+                    os.environ["PATH"] = git_dir + os.pathsep + path
+                _git_exe = found
+                return found
+        except Exception as exc:  # noqa: BLE001 - 缺 git 时仍按原错误路径返回
+            log.warning("准备便携 Git 失败: %s", exc)
+    _git_exe = "git"
+    return "git"
+
+
+def _heal_stale_core_worktree():
+    """整夹拷贝后 core.worktree 常指向旧机路径，git 会报 Invalid path。"""
+    git_dir = os.path.join(BASE, ".git")
+    if not os.path.isdir(git_dir):
+        return
+    git = _resolve_git_exe()
+    env = dict(os.environ, **_GIT_ENV)
+    try:
+        probe = subprocess.run(
+            [git, "--git-dir", git_dir, "--work-tree", BASE,
+             "config", "--local", "--get", "core.worktree"],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            env=env, timeout=15, encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        raise
+    except Exception:  # noqa: BLE001
+        return
+    if probe.returncode != 0:
+        return
+    worktree = (probe.stdout or "").strip()
+    if not worktree:
+        return
+    candidate = (worktree if os.path.isabs(worktree)
+                 else os.path.normpath(os.path.join(BASE, worktree)))
+    if os.path.isdir(candidate):
+        return
+    subprocess.run(
+        [git, "--git-dir", git_dir, "--work-tree", BASE,
+         "config", "--local", "--unset-all", "core.worktree"],
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        env=env, timeout=15, encoding="utf-8", errors="replace")
+    log.warning("已清除失效的 core.worktree=%s（常见于换机拷贝安装目录）", worktree)
+
+
+def _prepare_repo_git():
+    """每次更新操作前：找到 git，并修好换机带来的坏 worktree 配置。"""
+    global _repo_git_ready
+    if _repo_git_ready:
+        return
+    _resolve_git_exe()
+    _heal_stale_core_worktree()
+    _repo_git_ready = True
+
 
 def _load_state():
     try:
@@ -242,8 +315,9 @@ def mark_healthy(expected_sha=None):
 
 
 def _git(*args, timeout=60):
-    r = subprocess.run(["git", "-c", "i18n.logOutputEncoding=utf-8", *args], cwd=BASE,
-                       capture_output=True, text=True, stdin=subprocess.DEVNULL,
+    _prepare_repo_git()
+    r = subprocess.run([_resolve_git_exe(), "-c", "i18n.logOutputEncoding=utf-8", *args],
+                       cwd=BASE, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                        env=dict(os.environ, **_GIT_ENV),
                        timeout=timeout, encoding="utf-8", errors="replace")
     if r.returncode != 0:
