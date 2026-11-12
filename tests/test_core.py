@@ -35,7 +35,9 @@ def test_model_baselines_separates_models():
 def test_reject_pct():
     assert miner_core.reject_pct(0, 0) == 0.0
     assert miner_core.reject_pct(99, 1) == 1.0
-    assert miner_core.reject_pct(None, None) == 0.0
+    assert miner_core.reject_pct(None, None) is None
+    assert miner_core.reject_pct(None, 10) is None
+    assert miner_core.reject_pct(10, None) is None
 
 
 def test_gh_to_th():
@@ -183,7 +185,7 @@ def test_scan_overall_timeout_returns_unknown_instead_of_raising(monkeypatch):
 def test_scan_containers_overall_timeout_does_not_raise(monkeypatch):
     import time as _t
     import miner_core
-    monkeypatch.setattr(miner_core, "probe_antbox", lambda ip, a, b: _t.sleep(2))
+    monkeypatch.setattr(miner_core, "probe_antbox", lambda ip, a, b, **kw: _t.sleep(2))
     orig = miner_core.as_completed
     monkeypatch.setattr(miner_core, "as_completed", lambda fs, timeout=None: orig(fs, timeout=0.3))
     assert miner_core.scan_containers(["10.0.0.9"], {}) == []
@@ -224,13 +226,13 @@ def test_antbox_leak_fault_survives_malformed_minerinfo(monkeypatch):
     assert [f["flag"] for f in rec["faults"]] == ["leakage_fault"]
 
 
-def test_antbox_malformed_coolerstate_counts_as_not_collected(monkeypatch):
-    """coolerState 的 params 不是字典：按"没采到"(交给连续未采到→控制器离线告警)，
-    绝不能返回一条故障位全空的记录——那会把正在报的漏液告警当成已恢复消掉。"""
+def test_antbox_malformed_coolerstate_is_reachable_with_unknown_data(monkeypatch):
+    """响应证明控制器可达，坏 params 只能表示读数未知，不能清故障或伪造离线。"""
     import miner_core
     monkeypatch.setattr(miner_core, "get_session", lambda: _S({
         "coolerState": {"ok": True, "method": "coolerState", "params": ["garbage"]}}))
-    assert miner_core.probe_antbox("10.0.0.9", 1, 1) is None
+    result = miner_core.probe_antbox("10.0.0.9", 1, 1)
+    assert result["status"] == "unknown" and result["observed_fault_flags"] == []
 
 
 def test_stock_miner_with_malformed_stats_stays_online(monkeypatch):

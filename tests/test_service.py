@@ -42,11 +42,10 @@ def fake_scan(records):
 
 
 def test_full_scan_persists_only_real_machines(svc, monkeypatch):
-    """全新部署第一轮必须落全量(否则离线数恒为0、面板误显示全在线)；
-    之后每轮只留在线机 + 名册内的离线机，丢掉上万个死地址。"""
+    """首轮和后续扫描都只统计真机；空 IP 不能膨胀矿机总数和离线数。"""
     monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1"), rec("10.9.0.2")]))
     first = svc.scan_full("full")
-    assert first["miners"] == 5        # 首轮：5 个地址全落库
+    assert first["miners"] == 2        # 首轮也只保留已确认的 2 台机器
 
     second = svc.scan_full("full")
     assert second["online"] == 2
@@ -431,7 +430,7 @@ def test_old_migrations_do_not_trip_the_migration_breaker(svc, monkeypatch):
 def test_restart_after_scans_pruned_is_not_treated_as_first_run(svc, monkeypatch):
     """停机超过保留期、旧扫描已被清理但名册还在：不是首轮，不能把死地址全量落库。"""
     monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.1")]))
-    assert svc.scan_full("full")["miners"] == 5      # 真首轮：全量
+    assert svc.scan_full("full")["miners"] == 1      # 首轮也只落确认的真机
     with db._wlock, svc.conn:
         svc.conn.execute("DELETE FROM snapshots")
         svc.conn.execute("DELETE FROM scans")
@@ -445,9 +444,11 @@ def test_rollup_ignores_dead_addresses_from_first_scan(conn):
         [rec(f"10.3.0.{i}", status="offline") for i in range(2, 50)]
     insert_scan(conn, h + 60, "full", recs)
     db.rollup_hours(conn)
-    workers = {r["worker"]: r for r in conn.execute("SELECT * FROM worker_hourly WHERE hour=?",
+    workers = {r["worker"]: r for r in conn.execute("SELECT * FROM worker_metrics_hourly WHERE hour=?",
                                                     (h,)).fetchall()}
     assert set(workers) == {"A"}
+    assert workers["A"]["machines"] == 1
+    assert conn.execute("SELECT COUNT(*) FROM worker_hourly").fetchone()[0] == 0
 
 
 def test_machine_unknown_last_round_still_gets_reconfirmed(svc, monkeypatch):

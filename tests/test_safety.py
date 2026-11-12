@@ -309,4 +309,5 @@ def test_unreadable_settings_json_is_not_overwritten(tmp_path, monkeypatch):
     with pytest.raises(appconfig.SettingsError):
         appconfig.update_settings({"scan_interval": 300})
     assert p.read_text(encoding="utf-8").startswith('{"cloud": {"token": "keep-me"}')
-    assert appconfig.load_settings() == {}   # 读路径照常降级，服务能起来
+    with pytest.raises(appconfig.SettingsError):
+        appconfig.load_settings()  # 不能在升级/重启时悄悄切回默认配置

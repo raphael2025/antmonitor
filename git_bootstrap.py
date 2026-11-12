@@ -13,6 +13,7 @@ Steps, all inside a temporary git dir that only becomes `.git` on success:
    "fast-forward -> self-check -> restart" path brings it to the latest version.
 If no commit matches (files edited, or not a GitHub ZIP), nothing is changed.
 """
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -21,6 +22,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -29,6 +32,8 @@ BRANCH = "main"
 MINGIT_VERSION = "2.56.0"
 _MINGIT_URL = ("https://github.com/git-for-windows/git/releases/download/"
                "v{v}.windows.1/MinGit-{v}-{arch}.zip")
+_MINGIT_MIRROR_URL = ("https://sourceforge.net/projects/git-for-windows.mirror/files/"
+                      "v{v}.windows.1/MinGit-{v}-{arch}.zip/download")
 # SHA-256 of the official MinGit archives; a download with any other content is rejected.
 MINGIT_SHA256 = {
     "64-bit": "064b440ff870ed5198527e8f3a92cdf5bd2fd0fedf5e718af95e3fdaddeff718",
@@ -38,6 +43,7 @@ MINGIT_SHA256 = {
 MAX_COMMITS = 300   # how far back a ZIP may be matched
 _GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never",
             "GIT_HTTP_LOW_SPEED_LIMIT": "1000", "GIT_HTTP_LOW_SPEED_TIME": "30"}
+_MINGIT_COMPLETE = ".antmonitor-complete"
 
 
 def _say(msg):
@@ -71,6 +77,85 @@ def _mingit_arch():
     return {"AMD64": "64-bit", "X86": "32-bit", "ARM64": "arm64"}.get(arch)
 
 
+def _retry_access_denied(operation):
+    """Allow a short antivirus/sharing lock to clear, without delaying startup forever."""
+    for attempt in range(3):
+        try:
+            return operation()
+        except OSError as e:
+            if (e.errno not in (errno.EACCES, errno.EPERM)
+                    and getattr(e, "winerror", None) not in (5, 32, 33)) or attempt == 2:
+                raise
+            time.sleep(0.2 * (attempt + 1))
+
+
+def _usable_git(git):
+    """An incomplete extraction can contain git.exe but still be missing its DLLs."""
+    def version():
+        return subprocess.run([str(git), "--version"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                              timeout=10, env=dict(os.environ, **_GIT_ENV))
+    try:
+        result = _retry_access_denied(version)
+        return result.returncode == 0 and result.stdout.strip().startswith("git version ")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _usable_mingit(git):
+    if not _usable_git(git):
+        return False
+    try:
+        # `--version` can work in an old partial installation even when HTTPS fetch
+        # cannot. Let Git locate and start its helper: official MinGit moves these
+        # executables from --exec-path into the architecture's bin directory.
+        # Without arguments remote-curl exits with its usage message BEFORE HTTP
+        # initialization. This verifies the runtime without making a network request.
+        env = dict(os.environ, **_GIT_ENV)
+        env.update(LC_ALL="C", PATH="")
+        env.pop("GIT_EXEC_PATH", None)  # do not borrow another installation's helper
+        result = _retry_access_denied(lambda: subprocess.run(
+            [str(git), "-c", "help.autocorrect=0", "-c", "protocol.allow=never", "remote-https"],
+            capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+            timeout=10, env=env))
+        return result.returncode == 1 and "remote-curl: usage:" in result.stderr
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _mingit_marker(arch):
+    return "MinGit {} {}\nsha256 {}\n".format(MINGIT_VERSION, arch, MINGIT_SHA256[arch])
+
+
+def _find_mingit():
+    # Keep using healthy installations created by the old launcher. Never repair one
+    # in place: an older monitor (or antivirus) can still have its files open.
+    legacy = _mingit_dir()
+    git = legacy / "cmd" / "git.exe"
+    if git.is_file() and _usable_mingit(git):
+        return str(git)
+    arch = _mingit_arch()
+    if not arch:
+        return None
+    try:
+        candidates = sorted(legacy.parent.glob(legacy.name + "-" + arch + "-*"))
+    except OSError:
+        return None
+    for candidate in candidates:
+        try:
+            # Only fully extracted and verified installs are discoverable after a
+            # restart. A killed/concurrent installer may leave an unfinished folder.
+            if (candidate / _MINGIT_COMPLETE).read_text(encoding="ascii") != _mingit_marker(arch):
+                continue
+            git = candidate / "cmd" / "git.exe"
+            if git.is_file() and _usable_mingit(git):
+                return str(git)
+        except (OSError, UnicodeError):
+            continue
+    return None
+
+
 def _path_dir_for(git):
     """Directory the server must have first on PATH to run this git: "" when PATH already
     resolves `git` to it. The Windows Store alias under WindowsApps does not count as git."""
@@ -86,41 +171,84 @@ def _path_dir_for(git):
 def find_git():
     """git on PATH (ignoring the Store alias), else a portable MinGit installed earlier."""
     found = shutil.which("git")
-    if found and "\\windowsapps\\" not in found.lower():
+    if found and "\\windowsapps\\" not in found.lower() and _usable_git(found):
         return found
-    portable = _mingit_dir() / "cmd" / "git.exe"
-    return str(portable) if portable.is_file() else None
+    return _find_mingit()
+
+
+def _download_mingit(archive, arch):
+    """Every source, including a local/offline package, must match the same pin."""
+    local = os.environ.get("MINER_MINGIT_ZIP")
+    if not local:
+        bundled = Path(__file__).resolve().parent / "offline" / (
+            "MinGit-{}-{}.zip".format(MINGIT_VERSION, arch))
+        if bundled.is_file():
+            local = str(bundled)
+    if local:
+        shutil.copyfile(local, archive)
+        if hashlib.sha256(archive.read_bytes()).hexdigest() != MINGIT_SHA256[arch]:
+            raise RuntimeError("local portable Git package failed verification (sha256 mismatch)")
+        return
+    sources = [_MINGIT_URL, _MINGIT_MIRROR_URL]
+    if os.environ.get("MINER_DOWNLOAD_SOURCE", "").lower() == "gitee":
+        sources.reverse()
+    failures = []
+    for template in sources:
+        url = template.format(v=MINGIT_VERSION, arch=arch)
+        try:
+            _say("Downloading verified portable Git {} from {}...".format(
+                MINGIT_VERSION, urllib.parse.urlsplit(url).netloc))
+            with urllib.request.urlopen(url, timeout=120) as r, open(archive, "wb") as f:
+                shutil.copyfileobj(r, f)
+            if hashlib.sha256(archive.read_bytes()).hexdigest() != MINGIT_SHA256[arch]:
+                raise RuntimeError("sha256 mismatch")
+            return
+        except (OSError, RuntimeError) as e:
+            failures.append(str(e))
+            _say("Portable Git source unavailable or failed verification; trying the next source.")
+    raise RuntimeError("portable Git download failed verification or could not be reached: {}. "
+                       "Use MINER_MINGIT_ZIP for a verified local MinGit ZIP.".format("; ".join(failures)))
 
 
 def install_mingit():
-    """Download, verify and unpack MinGit into the per-user folder; returns git.exe."""
+    """Reuse or install verified MinGit in an owned per-user cache; returns git.exe.
+
+    Extract directly into a unique permanent folder. Publishing by renaming a directory
+    from TEMP fails with WinError 5 on some Windows machines, and replacing an existing
+    install can fail while Git or antivirus holds a file open. A completion marker makes
+    discovery safe without either operation, including concurrent launcher starts.
+    """
     arch = _mingit_arch()
     if not arch:
         raise RuntimeError("unsupported Windows architecture for portable Git")
-    dest = _mingit_dir()
+    existing = _find_mingit()
+    if existing:
+        return existing
+    legacy = _mingit_dir()
     tmp = Path(tempfile.mkdtemp(prefix="antmonitor-mingit-"))
+    dest = None
+    complete = False
     try:
         archive = tmp / "mingit.zip"
-        url = _MINGIT_URL.format(v=MINGIT_VERSION, arch=arch)
-        _say("Git not found. Downloading portable Git {} for web updates...".format(MINGIT_VERSION))
-        with urllib.request.urlopen(url, timeout=120) as r, open(archive, "wb") as f:
-            shutil.copyfileobj(r, f)
-        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-        if digest != MINGIT_SHA256[arch]:
-            raise RuntimeError("portable Git download failed verification (sha256 mismatch)")
-        unpack = tmp / "unpacked"
+        _download_mingit(archive, arch)
+        _retry_access_denied(lambda: legacy.parent.mkdir(parents=True, exist_ok=True))
+        dest = Path(_retry_access_denied(lambda: tempfile.mkdtemp(
+            prefix=legacy.name + "-" + arch + "-", dir=str(legacy.parent))))
         with zipfile.ZipFile(archive) as z:
-            z.extractall(unpack)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            _rmtree(dest)
-        os.replace(str(unpack), str(dest))
+            _retry_access_denied(lambda: z.extractall(dest))
+        git = dest / "cmd" / "git.exe"
+        if not git.is_file() or not _usable_mingit(git):
+            raise RuntimeError("portable Git could not run or is missing its HTTPS runtime")
+        _retry_access_denied(lambda: (dest / _MINGIT_COMPLETE).write_text(
+            _mingit_marker(arch), encoding="ascii"))
+        complete = True
+        return str(git)
     finally:
         _rmtree(tmp)
-    git = dest / "cmd" / "git.exe"
-    if not git.is_file():
-        raise RuntimeError("portable Git is missing cmd\\git.exe")
-    return str(git)
+        # Only remove this invocation's incomplete folder. Pre-existing installs and
+        # other launchers' folders are never removed, even when they appear broken.
+        if dest is not None and not complete:
+            _rmtree(dest)
 
 
 def _runner(git, git_dir, base):
@@ -155,8 +283,8 @@ def adopt(base, git, repo_url=REPO_URL, branch=BRANCH):
     base = Path(base)
     if (base / ".git").exists():
         return None, []
-    git_dir = base / ".git.adopting"
-    _rmtree(git_dir)
+    # Concurrent launcher starts must never remove each other's unfinished metadata.
+    git_dir = Path(tempfile.mkdtemp(prefix=".git.adopting-", dir=str(base)))
     g = _runner(git, git_dir, base)
     done = False
     try:
@@ -165,7 +293,7 @@ def adopt(base, git, repo_url=REPO_URL, branch=BRANCH):
         # list it, so exclude it here or `add -A` would hash git's own object files.
         (git_dir / "info").mkdir(exist_ok=True)
         with open(git_dir / "info" / "exclude", "a", encoding="utf-8") as f:
-            f.write("\n/.git.adopting/\n")
+            f.write("\n/.git.adopting*/\n")
         g("config", "core.autocrlf", "false")   # keep files byte-identical to the ZIP
         g("remote", "add", "origin", repo_url)
         g("fetch", "-q", "--no-tags", "origin",
@@ -188,11 +316,13 @@ def adopt(base, git, repo_url=REPO_URL, branch=BRANCH):
         g("read-tree", match)                       # index (incl. file modes) from the commit
         if g("status", "--porcelain", "--untracked-files=no").strip():
             return None, []
+        if (base / ".git").exists():
+            return None, []  # another launcher finished first; keep its metadata
+        _retry_access_denied(lambda: os.rename(str(git_dir), str(base / ".git")))
         done = True
     finally:
         if not done:
             _rmtree(git_dir)
-    os.replace(str(git_dir), str(base / ".git"))
     return match, extra
 
 
@@ -202,22 +332,25 @@ def bootstrap(base):
     if os.environ.get("MINER_NO_GIT_BOOTSTRAP"):
         return ""
     base = Path(base)
+    git = None
     try:
         git = find_git()
-        if (base / ".git").exists():
-            return _path_dir_for(git)
         if git is None:
             git = install_mingit()
+        if (base / ".git").exists():
+            return _path_dir_for(git)
         commit, extra = adopt(base, git)
         if commit:
             _say("Web updates enabled: this folder now tracks {} at {}.".format(BRANCH, commit[:10]))
             if extra:
                 _say("Note: extra files block web updates until removed or moved: "
                      + ", ".join(extra[:10]))
-        else:
+        elif not (base / ".git").exists():
             _say("Web updates unavailable: the files do not match any published version "
                  "(edited, or not downloaded from GitHub). Use `git clone` to enable updates.")
         return _path_dir_for(git)
     except Exception as e:  # noqa: BLE001 - never block the monitor from starting
         _say("Web updates unavailable ({}). The monitor still starts normally.".format(e))
-        return ""
+        # Git is still useful when an offline/edited ZIP cannot be adopted yet. The
+        # server must inherit its PATH so a later repair/update can use it.
+        return _path_dir_for(git)

@@ -70,12 +70,12 @@ def insert_scan(conn, ts, kind, records):
     sid = cur.lastrowid
     conn.executemany(
         "INSERT INTO snapshots(scan_id,ip,status,firmware,model,sn,hr_rt,hr_avg,power,temp,"
-        "eff,uptime,worker,accepted,rejected,stale,note)"
-        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "eff,uptime,worker,accepted,rejected,stale,note,measured_ts)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [(sid, r["ip"], r["status"], r["firmware"], r["model"], r["sn"], r.get("hr_rt"),
           r.get("hr_avg"), r.get("power"), r.get("temp"), r.get("eff"), r.get("uptime"),
           r.get("worker", ""), r.get("accepted"), r.get("rejected"), r.get("stale"),
-          r.get("note", "")) for r in records])
+          r.get("note", ""), r.get("measured_ts")) for r in records])
     conn.commit()
     return sid
 

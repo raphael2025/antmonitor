@@ -71,6 +71,16 @@ def prepare_environment(base):
                 run_checked([python, "-m", "ensurepip", "--upgrade"], base)
             install = [python, "-m", "pip", "install", "--disable-pip-version-check",
                        "--only-binary=:all:", "-r", requirements]
+            wheelhouse = os.environ.get("MINER_WHEELHOUSE")
+            if not wheelhouse and (base / "offline" / "wheels").is_dir():
+                wheelhouse = str(base / "offline" / "wheels")
+            if wheelhouse:
+                wheels = Path(wheelhouse)
+                if not wheels.is_absolute():
+                    wheels = base / wheels
+                if not wheels.is_dir():
+                    raise FileNotFoundError("Local dependency directory does not exist: {}".format(wheels))
+                install += ["--no-index", "--find-links", wheels]
             if installed == fingerprint and probe.returncode:
                 # Metadata can survive missing/damaged package files; a plain pip
                 # install would report "already satisfied" and leave them broken.
@@ -136,7 +146,9 @@ def supervise(base):
     enable_web_updates(base, env)
     first_launch = True
     while True:
-        python = prepare_environment(base)
+        import updater
+        active = updater._load_state().get("active_python")
+        python = Path(updater.runtime_python()) if active else prepare_environment(base)
         if first_launch:
             prepare_config(python, base)
             first_launch = False

@@ -14,6 +14,22 @@ import cloud_report
 
 
 @pytest.fixture
+def local_tls_session(monkeypatch):
+    """Only use the local fixture, independent of developer proxy/CA variables."""
+    original = cloud_report._session
+    proxies = {}
+
+    def session(config):
+        result = original(config)
+        result.trust_env = False
+        result.proxies.update(proxies)
+        return result
+
+    monkeypatch.setattr(cloud_report, "_session", session)
+    return proxies
+
+
+@pytest.fixture
 def https_server(tmp_path):
     key, crt = tmp_path / "k.pem", tmp_path / "c.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key),
@@ -69,20 +85,21 @@ def connect_proxy():
     srv.shutdown()
 
 
-def test_pinned_fingerprint_direct(https_server):
+def test_pinned_fingerprint_direct(https_server, local_tls_session):
     url, fp = https_server
-    assert cloud_report.test({"url": url, "token": "t", "tls_fingerprint": fp}, "s")[0]
+    ok, msg = cloud_report.test({"url": url, "token": "t", "tls_fingerprint": fp}, "s")
+    assert ok, msg
     ok, msg = cloud_report.test({"url": url, "token": "t", "tls_fingerprint": "00" * 32}, "s")
     assert not ok and "指纹" in msg
     ok, msg = cloud_report.test({"url": url, "token": "t"}, "s")   # 自签证书、没填指纹
     assert not ok
 
 
-def test_pinned_fingerprint_through_proxy(https_server, connect_proxy, monkeypatch):
+def test_pinned_fingerprint_through_proxy(https_server, connect_proxy, local_tls_session):
     url, fp = https_server
-    monkeypatch.setenv("HTTPS_PROXY", connect_proxy)
-    monkeypatch.setenv("NO_PROXY", "")
-    monkeypatch.delenv("no_proxy", raising=False)
-    assert cloud_report.test({"url": url, "token": "t", "tls_fingerprint": fp}, "s")[0]
+    local_tls_session["https"] = connect_proxy
+    ok, msg = cloud_report.test({"url": url, "token": "t", "tls_fingerprint": fp}, "s")
+    assert ok, msg
     ok, _msg = cloud_report.test({"url": url, "token": "t", "tls_fingerprint": "00" * 32}, "s")
     assert not ok   # 走代理也必须校验指纹
+    assert not cloud_report.test({"url": url, "token": "t"}, "s")[0]

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""登录加固：弱口令只准本机登录并强制改密；限流绕不过；空闲超时；网页改密码写回配置。"""
+"""登录加固：弱口令提示与角色权限；登录限流；空闲超时；网页改密码写回配置。"""
 import importlib
 import shutil
 import threading

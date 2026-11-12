@@ -40,7 +40,7 @@
 | **水冷 / 风冷** | 集装箱冷却状态与矿机一起盯 |
 | **多场地老板** | 本地值班 + [云端总览](https://github.com/raphael2025/antmonitor-cloud) 随时扫一眼全网 |
 
-不需要会写代码。Ubuntu / Windows 都是一行命令装好。
+不需要会写代码。Ubuntu / Windows 均提供 GitHub 和 Gitee 安装入口。
 
 ---
 
@@ -58,37 +58,192 @@
 
 ## 三分钟上手
 
-不用先 `git clone`，没装 git / Python 也行，一行命令装好：
+GitHub / Gitee 是下载代码的网站，无需注册账号或安装它们的客户端。Ubuntu 和 Windows 都会自动准备 Git / Python；
+按网络情况选择下面的一条命令即可。Ubuntu 命令需要 `curl`；系统没有时先执行 `sudo apt-get update && sudo apt-get install -y curl ca-certificates`。
 
-**Ubuntu（推荐）**
+### Ubuntu（推荐）
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash
-```
-
-自动装依赖、下载代码、建服务并启动，安装时设置 admin 密码（直接回车会生成强密码并显示）。
-面板 `http://<监控机IP>:8800`。再跑一次同样的命令 = 管理菜单（更新 / 修复 / 卸载 / 重置账号）。
-
-装的时候顺便接入云端（接入码在云端面板「🔌 场地接入」里复制，运行后按提示粘贴，不会留在命令历史里）：
+**GitHub：**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --connect-code - --site-name 内蒙一场
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- --source github
 ```
 
-**Windows 10 / 11**（PowerShell 里执行，不需要管理员）
+**Gitee（国内下载）：**
+
+```bash
+curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- --source gitee
+```
+
+<details><summary>不确定哪个网站能访问？自动选择 GitHub / Gitee</summary>
+
+下面是一条命令：先尝试 GitHub，下载失败再尝试 Gitee；完整下载成功后才执行安装脚本一次。
+安装器也会自动选择可用的源码来源，不会在安装已开始后重复运行另一份安装程序。
+
+```bash
+( f=$(mktemp) && trap 'rm -f "$f"' EXIT && { curl -fsSL --connect-timeout 10 --max-time 60 https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh -o "$f" || curl -fsSL --connect-timeout 10 --max-time 60 https://gitee.com/raphael01/antmonitor/raw/main/install.sh -o "$f"; } && sudo bash "$f" --source auto )
+```
+
+</details>
+
+Gitee 命令会自动安装 Git，并从 Gitee 拉取源码；后续网页更新使用同一仓库来源。
+
+自动装依赖、下载代码、建服务并启动，安装时设置 admin 密码（直接回车会生成强密码并显示），
+随后可直接粘贴云端接入码，暂时不接云端就按回车跳过。
+默认安装目录 `/opt/antmonitor`，服务名 `antmonitor`，面板端口 `8800`。
+已安装后再次运行同一安装入口，有交互终端时会进入管理菜单；选 **6「连接 / 更换云端」** 即可补接云端。
+
+#### Ubuntu 没有桌面，怎样打开面板？
+
+**Ubuntu Server 不需要安装桌面或浏览器。** AntMonitor 会启动 Web 服务；Linux 上不会自动弹出浏览器，
+请用同一局域网内另一台电脑的浏览器配置：
+
+1. 在 Ubuntu 终端执行 `hostname -I`，找到另一台电脑能访问的局域网 IP（可能显示多个地址）。
+2. 在 Windows / Mac / 其他电脑的浏览器打开 `http://<Ubuntu监控机IP>:8800`，
+   例如 `http://192.168.1.50:8800`，替换成你自己的 Ubuntu IP。
+3. 用 **admin** 登录 → 顶部 **「☁ 连接云端」**（未连接时会突出显示）。
+4. 云端「🔌 场地接入」点 **「生成并复制接入信息」** → 本地端点 **「粘贴接入信息并连接」**。
+   局域网 HTTP 页面若提示不能自动读剪贴板，直接按 **Ctrl+V** 即可继续连接。地址、token、场地名与类型自动带入；旧码缺名称时补填一次。
+   程序自动测试、保存并启用上报，验证失败时保留原配置和输入。
+   下方状态会持续更新；显示「等待首轮扫描」时，在「⚙ 网段」设置矿机网段并开始全网扫描，完成后自动上报。
+
+**只有 SSH 能访问 Ubuntu？** 在有浏览器的电脑上运行（把用户名和 IP 换成实际 SSH 登录信息）：
+
+```bash
+ssh -N -L 18800:127.0.0.1:8800 用户名@Ubuntu监控机IP
+```
+
+保持 SSH 窗口打开，在这台电脑的浏览器访问 `http://127.0.0.1:18800`。
+以上地址使用默认 HTTP / 8800 配置；如果改过面板端口或启用了 HTTPS，按实际配置调整。
+
+#### 通过终端接入云端
+
+从**云端面板「🔌 场地接入」**复制接入码。首次运行上方一键安装命令时，按提示粘贴即可，输入不会显示；
+新码自带场地名和类型，旧码会提示补填。暂时没有接入码，可以回车跳过。
+
+**已经安装后接入或更换云端：**重跑同一条安装命令，选菜单 **6「连接 / 更换云端」**。
+也可以按脚本下载源选一条，直接进入接入提示：
+
+```bash
+# GitHub
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- connect
+
+# Gitee
+curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- connect
+```
+
+`connect` 只验证连接、保存云端配置并重启现有服务，不更新代码或依赖，也不改变原来的更新源。
+接入码格式或连接测试失败时保留原配置，可立即重试。
+如果原来使用自定义安装目录，还需补 `--dir '/实际安装目录'`。
+接入后核对具体连接测试结果及云端是否出现本场地；详细排查见
+[中文指南 · Ubuntu 无桌面访问与云端配置](docs/guide/zh.md#ubuntu-无桌面访问与云端配置)。
+
+已经更新到当前版本，也可在安装目录直接运行 `sudo bash install.sh connect --dir .`，无需再次下载脚本。
+**Windows 的同一份接入信息**可在本地网页使用，也可双击安装目录内的 `connect-cloud.bat` 后粘贴。
+命令界面输入不显示；测试通过后才保存。如果原 Windows 监控仍在运行，按提示关闭原窗口并重新运行 `run.bat`；
+端口空闲时会自动打开监控。程序保存配置和首次真实上报是两个步骤，以面板的上报成功时间为准。
+
+### Windows 10 / 11
+
+在 PowerShell 里执行，不需要管理员。按下载源选一条：
+
+**GitHub：**
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1 | iex"
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1'))) -Source github
 ```
 
-下载到 `%LOCALAPPDATA%\AntMonitor\antmonitor`，桌面生成「AntMonitor」快捷方式并启动；没有 Python 会自动从
-python.org 下载并验证签名后安装（当前用户，不需要管理员），之后可在网页上一键更新。
-也可以照旧下载 ZIP 解压后双击 `run.bat`。
+**Gitee（GitHub 无法访问时使用）：**
 
-**装好以后**：admin 登录 →「⚙ 网段」填矿机网段 → 保存并全网扫描；要接云端就在同一页「☁ 云端上报」粘贴接入码，
-点「🔌 测试连接」，下面会一直显示上报状态（最近一次成功 / 失败原因），不用登机器看日志。
+```powershell
+& ([scriptblock]::Create((irm 'https://gitee.com/raphael01/antmonitor/raw/main/install.ps1'))) -Source gitee
+```
 
-GitHub 访问慢可设镜像前缀 `GH_PROXY`；连不上 GitHub 时可把源码 ZIP 拷过去，解压后在目录里 `sudo bash install.sh`（Python 依赖仍要能访问 PyPI 或国内镜像）。
+两种方式均无需预装 Git / Python。缺少 Git 时先自动准备便携 Git；Gitee 优先使用经过固定 SHA256 校验的 SourceForge 镜像，
+不需要先成功访问 GitHub。下载到 `%LOCALAPPDATA%\AntMonitor\antmonitor`，桌面生成「AntMonitor」快捷方式并启动；
+缺少 Python 时从 python.org 下载并验证签名后安装（当前用户，不需要管理员），之后可在网页上一键更新。
+Windows 已有安装再次运行脚本只会启动程序，保留原来的更新源；换源说明见[中文指南](docs/guide/zh.md#windows一键安装)。
+
+<details><summary>Windows 自动选择 GitHub / Gitee</summary>
+
+复制这一整段到 PowerShell 执行。先完整下载脚本，再执行一次；不会在安装失败后重新执行另一份脚本。
+
+```powershell
+$s=$null; foreach($u in @('https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.ps1','https://gitee.com/raphael01/antmonitor/raw/main/install.ps1')) { try { $s=Invoke-RestMethod -Uri $u -TimeoutSec 60 -ErrorAction Stop; break } catch { Write-Host ('Download unavailable: '+([uri]$u).Host) } }; if([string]::IsNullOrWhiteSpace($s)) { throw 'GitHub/Gitee unavailable; use downloaded source.' }; & ([scriptblock]::Create($s)) -Source auto
+```
+
+</details>
+
+<a id="windows-web-update-recovery"></a>
+
+### Windows 网页提示找不到 Git：一键恢复
+
+适用于已能正常监控，但网页更新提示「找不到 git」，或启动时安装便携 Git 出现 `WinError 5 / 拒绝访问` 的旧版本。
+**先在原 AntMonitor 控制台按 Ctrl+C，等程序停止，再用同一 Windows 用户打开 PowerShell，选一条执行：**
+
+```powershell
+# GitHub
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/raphael2025/antmonitor/main/repair-web-updates.ps1')))
+
+# Gitee
+& ([scriptblock]::Create((irm 'https://gitee.com/raphael01/antmonitor/raw/main/repair-web-updates.ps1'))) -Source gitee
+```
+
+脚本会寻找当前目录或默认安装目录；找不到时提示粘贴含有 `run.bat` 的原文件夹路径。
+恢复成功会自动启动新窗口，随后登录网页点击「更新」，安装最新版本。
+脚本保留原源码、配置和数据库；旧 ZIP 会匹配它原来的发布版本，已有 Git 仓库保留原 `origin`。
+Gitee 选择恢复脚本和无 `.git` 时的仓库来源；缺少 Git 时优先使用 SourceForge 上与官方文件 SHA256 一致的 MinGit，
+镜像失败才尝试官方 GitHub。也可通过 `MINER_MINGIT_ZIP` 指定本地固定版本安装包。
+自定义目录、网络失败或本地改动的处理见[中文指南 · Windows 网页更新恢复](docs/guide/zh.md#windows-web-update-recovery)。
+
+### 后续更新与换源
+
+Ubuntu 更新代码、依赖并重启，按希望使用的来源选一条：
+
+```bash
+# GitHub
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/install.sh | sudo bash -s -- update --source github
+
+# Gitee
+curl -fsSL https://gitee.com/raphael01/antmonitor/raw/main/install.sh | sudo bash -s -- update --source gitee
+```
+
+Ubuntu 显式传入 `--source github` / `--source gitee` 可在两个官方仓库之间切换更新源；不传或 `--source auto` 时保留已有 `origin`。
+默认自动模式下，官方来源网络失败时可尝试另一平台的同分支，只接受快进更新，不回退到旧镜像版本。
+自定义仓库不会被自动覆盖。自定义安装目录仍需追加 `--dir '/实际安装目录'`。
+Windows 日常从网页更新；GitHub / Gitee 仓库是否已有新版本，取决于发布者的同步情况。
+若网页更新报 `Permission denied (publickey)`（历史 SSH/deploy key 现场），先在监控机执行一次：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/raphael2025/antmonitor/main/heal-update-remote.sh | sudo bash
+```
+
+把官方 origin 改成匿名 HTTPS 后，再用面板更新即可切到新更新器；之后 GitHub/Gitee 能访问就能更新，不再需要 SSH key。
+更新并重启后，正常刷新网页即可加载新版脚本和语言文件；资源版本自动生成，ZIP 安装也适用。
+详细步骤见[中文指南 · Ubuntu 更新与选择下载源](docs/guide/zh.md#ubuntu-更新与选择下载源)。
+
+### 装好以后
+
+admin 登录 →「⚙ 网段」填矿机网段 → 保存并全网扫描。
+接云端用顶部 **「☁ 连接云端」**：先在云端复制完整接入信息，再点本地 **「粘贴接入信息并连接」**。
+浏览器不允许自动读取时，按提示 **Ctrl+V** 即可继续。测试通过后自动保存并启用，持续显示等待扫描、上报成功或失败重试。
+手动填写地址、token、证书指纹，以及暂停上报，都在连接窗口的「高级设置」中。
+
+登录页和顶部都能切换 **跟随系统 / 按时间自动 / 日间 / 夜间**，浏览器会记住选择。
+按时间自动使用浏览设备的本地时间：07:00–19:00 为日间，其余为夜间，无需设置服务器。
+
+### GitHub 和 Gitee 都打不开
+
+在能联网的电脑下载完整源码 ZIP，拷到监控机解压，然后使用本地安装入口：
+
+| 系统 | 在解压后的源码目录执行 |
+|---|---|
+| Ubuntu | `sudo bash install.sh --dir /opt/antmonitor` |
+| Windows PowerShell | `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1` |
+
+这条路径不需要访问 GitHub / Gitee 下载源码。**源码包不等于完整离线安装包**：系统包、Python、Python 依赖仍需可用下载源，
+或事先拷入对应系统和版本的安装包 / wheels。Windows 支持本地签名 Python 安装器和校验过的 MinGit ZIP，
+两系统支持 `offline/wheels` 依赖目录，具体变量和操作见[中文指南 · 无法访问代码托管平台](docs/guide/zh.md#无法访问代码托管平台)。
 
 **大场地防误报**：发现掉线或零算力先等 20 秒用更长超时重探一遍（二次确认），仍不行当轮就报；整段掉线不重探、直接报整段掉线；单台判活最多等 3 秒；高温连续 2 轮才报；全场同时大面积掉线
 只报一条「全场掉线」；矿机网页卡住但还在挖矿时改从 4028 端口取数，不再误报掉线。参数见
@@ -96,14 +251,56 @@ GitHub 访问慢可设镜像前缀 `GH_PROXY`；连不上 GitHub 时可把源码
 
 完整「简介 · 部署 · 使用」→ [选语言阅读](docs/guide/README.md)
 
+### 客户实时算力与 24 小时平均
+
+客户按每台矿机**第一配置矿池的账户名**归属（去掉 `.矿机后缀`），不随主池掉线、备用池启用或临时切池改变。
+第二、第三矿池使用不同矿工名，也不会因此新增客户。同一客户在不同机器的第一矿池使用不同账户时，仍分别显示，系统不凭相似名字猜测合并。
+云端客户数只统计当前名单中的客户；旧备用名若还有统计期内的数据，会保留为「历史记录，不计入当前客户数」。
+更新并重启两端后，完成一轮巡检并成功上报即可刷新当前归属，不必等待 24 小时，也不必手动删除旧客户记录。
+
+客户实时算力是各台矿机**当前实测算力之和**；近 24 小时平均按运行记录和持续时间计算，确认离线的时段计为零。
+一台机器全天稳定在 **293 TH/s**，24 小时平均仍为 **293 TH/s**；100 台均如此时，客户合计为 **29.3 PH/s**。
+`台数 × 标称算力` 只能表示理论值，实际停机、降频和算力波动都会影响平均值。
+
+历史不足或监控断档时，已有平均值会显示在主数值中，并常显「按有效时段计算」和覆盖时长；没有数据显示未知，不当成零。
+例如 `有效数据 23.26/24h` 表示平均只覆盖其中 23.26 小时。矿机列表原有的「平均算力」来自固件，周期不保证是 24 小时。
+累计交付 `TH·h` 另用于周期统计与 CSV：293 TH/s 持续一天是 7,032 TH·h，不能把这个数当成平均算力。
+云端同时查看这些指标时，请更新**场地端和云端**；默认实时客户数据随场地摘要每 60 秒上报，平均报表每 600 秒更新。
+若云端总览正常、客户表却提示「本地未上报」，请确认此场地的本地端已经**更新并重启运行进程**。
+升级可直接利用保留的原始扫描记录计算平均，无需一律再等满 24 小时；仅下载新代码或刷新网页不会更新正在运行的旧进程。
+详细口径见[中文指南 · 客户算力怎么看](docs/guide/zh.md#客户算力怎么看)。
+
+本轮[数据逻辑审计](docs/DATA_LOGIC_AUDIT.md)同时修正了客户归属、按时间加权在线率、未知/过期读数、归档边界和云端日报等问题。
+算力、功率、在线状态各自显示有效覆盖；耗电为监控估算，确认离线按零贡献处理不代表电表为零。
+网页当前功率固定用 **kW**，统计期累计耗电固定用 **kWh（度）**。总览是矿机功率合计，AntBox 配电读数另列，不重复加总，也不冒充全场电表负荷。
+本地首页直接显示已有有效功耗的合计；缺少部分读数时只标注「已统计 x/y 台」。能耗比为 **功耗合计（W）÷实时算力合计（TH/s）**，仅使用两项都有有效读数的同一批矿机；单机也用这两项计算。
+客户报表按共同的十分钟截止边界查询，旧账本保留为 `legacy_*` 对照；缺失的历史不会自动补齐。
+
+**算力趋势出现空档时**：空档表示没有可展示的有效采样，不能直接解释为矿机停机。完整读数显示蓝色实线；
+部分矿机读不到算力时，已有实测小计显示为橙色虚线/点，悬停可查看「已统计 x/y 台」，它不是完整全场总量。
+确认读到的零算力会正常画在零值；全无有效读数或两轮记录相隔超过 15 分钟仍保留断线，不拿旧值补齐。
+升级前已有的完整总量照常显示；旧部分缺测点缺少可靠的覆盖记录，保持空缺，不从旧快照补算。
+升级后的新扫描会保存实测小计及台数，已有历史和客户账目不改写。
+
+云端主复制流程提供 **AMC1 完整接入包**，包含地址、token 和场地信息；本轮强化主复制说明与实际包解析预览，本地网页或命令界面仍可整段粘贴。
+升级请**先更新并重启云端，再更新并重启各场地端**，并确认两端系统时间正确。源包延迟或时钟异常不会被接收时间刷新成有效新读数。
+审计文档列出了具体数值反例、API 字段、测试命令和仍需真实设备响应/数据库才能核验的范围。
+
+### 运维功能与操作可靠性
+
+[运维与功能逻辑审查](docs/OPERATIONS_LOGIC_REVIEW.md)按扫描、告警、定位、处理和恢复核查当前功能。
+本次修复重启并发限流、排队后设置变化、同批异常丢结果、审计失败补记和更新期间插入重启的问题。
+自动重启每批发送前重新核查；关闭开关或标记维修会停止后续尚未发送的目标。
+「维修中」在机器恢复正算力后会自动解除，「下架移除」清理名册但不会永久排除仍通电的机器；详细边界见审查报告。
+
 ---
 
 ## 产品与仓库
 
-| | 开源地址 | 做什么 |
-|:---|:---|:---|
-| **场地端** | [antmonitor](https://github.com/raphael2025/antmonitor) | 局域网监控、告警、运维（本仓库） |
-| **云端** | [antmonitor-cloud](https://github.com/raphael2025/antmonitor-cloud) | 多场地 KPI、卡片、趋势、客户汇总 |
+| | GitHub | Gitee | 做什么 |
+|:---|:---|:---|:---|
+| **场地端** | [antmonitor](https://github.com/raphael2025/antmonitor) | [antmonitor](https://gitee.com/raphael01/antmonitor) | 局域网监控、告警、运维（本仓库） |
+| **云端** | [antmonitor-cloud](https://github.com/raphael2025/antmonitor-cloud) | [antmonitor-cloud](https://gitee.com/raphael01/antmonitor-cloud) | 多场地 KPI、卡片、趋势、客户汇总 |
 
 两边互相独立、互相配合：本地保管明细与历史，云端只收摘要总览。
 

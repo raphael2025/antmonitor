@@ -16,6 +16,7 @@ import time
 import alerts
 import appconfig
 import db
+import data_metrics
 import logs
 import miner_core
 
@@ -25,6 +26,18 @@ from appconfig import (load_config, load_segments, save_segments,      # noqa: F
                        SEG_FILE, SETTINGS_FILE)
 
 log = logs.get(__name__)
+
+
+def _scan_batch(ips, cfg, **kwargs):
+    """Keep each probe's clock; timestamp legacy records before another phase runs."""
+    records = miner_core.scan(ips, cfg, **kwargs)
+    sampled_at = time.time()
+    result = []
+    for original in records:
+        record = dict(original)
+        record.setdefault("measured_ts", sampled_at)
+        result.append(record)
+    return result
 
 
 class MonitorService:
@@ -47,7 +60,7 @@ class MonitorService:
                          "loop_beat": 0, "pending": False}
         # 最近一次扫描结果的内存副本：API 直接读它，不必每个请求都从 SQLite
         # 重新拉 5000 行(一个浏览器每30秒会触发3~4次这样的全量查询)。
-        self.snapshot = {"scan_id": 0, "ts": 0, "kind": "", "records": []}
+        self.snapshot = {"scan_id": 0, "ts": 0, "started_ts": None, "kind": "", "records": []}
         self._snap_lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -79,22 +92,40 @@ class MonitorService:
         self._wake.set()
 
     # ---- 内存快照 ----
-    def _publish(self, scan_id, ts, kind, records):
+    def _publish(self, scan_id, ts, kind, records, started_ts=None):
         with self._snap_lock:
-            self.snapshot = {"scan_id": scan_id, "ts": ts, "kind": kind, "records": records}
+            if scan_id < self.snapshot["scan_id"]:
+                return  # A concurrent inventory event/new scan already superseded this result.
+            self.snapshot = {"scan_id": scan_id, "ts": ts, "started_ts": started_ts,
+                             "kind": kind, "records": records}
 
     def latest(self):
         """返回 (meta, records)。records 为共享只读列表，调用方不得原地修改。"""
         snap = self.snapshot
-        if snap["records"]:
+        if snap["scan_id"]:
             return snap, snap["records"]
         # 内存里还没有(刚重启)→ 回落到数据库
         ls = db.latest_scan(self.conn)
         if not ls:
             return None, []
         recs = db.scan_records(self.conn, ls["scan_id"])
-        self._publish(ls["scan_id"], ls["ts"], ls.get("kind") or "", recs)
-        return self.snapshot, recs
+        self._publish(ls["scan_id"], ls["ts"], ls.get("kind") or "", recs,
+                      started_ts=ls.get("started_ts"))
+        snap = self.snapshot
+        return snap, snap["records"]
+
+    def latest_display(self):
+        """页面与上报使用最近一轮完整结果，下一轮完成前保持不变。
+
+        全网发现先探已知矿机，再花时间搜索空地址；逐台采样时间不能作为
+        显示倒计时，否则扫描途中会把上一轮在线机器逐台变成未知/零算力。
+        显示层只规范读数，不续写采样时间；告警和自动操作仍通过 latest()
+        的原始证据与 record_freshness() 单独检查是否允许执行。
+        """
+        scan, records = self.latest()
+        stamp = (scan or {}).get("ts")
+        return scan, [data_metrics.live_record(record, db.record_time_valid(record, stamp))
+                      for record in records]
 
     def mark_rebooting(self, ips):
         """记下刚下发重启的机器：静默期内掉线不报警(见 alerts.evaluate)。
@@ -122,17 +153,52 @@ class MonitorService:
         for ip in ips:
             rb.pop(ip, None)
 
+    def _zero_reboot_thermal_blocks(self, records):
+        """自动重启须确认已降温；告警关闭不等于允许绕过温度保护。"""
+        acfg = self.cfg.get("alerts") or {}
+        defaults = appconfig.DEFAULTS["alerts"]
+        hot = data_metrics.measurement(acfg.get("overheat_c"))
+        if not hot:
+            hot = defaults["overheat_c"]
+            clear = defaults["overheat_clear_c"]
+        else:
+            clear = data_metrics.measurement(acfg.get("overheat_clear_c"))
+            if clear is None or clear >= hot:
+                clear = max(0, hot - 5)
+        active = {a["ip"] for a in db.active_alerts_by_type(self.conn, "overheat")}
+        blocked = {}
+        for r in records:
+            ip = r["ip"]
+            temp = data_metrics.measurement(r.get("temp"))
+            if ip in active:
+                blocked[ip] = "高温告警尚未解除，自动重启已暂停"
+            elif temp is None or not miner_core.TEMP_MIN_C <= temp <= miner_core.TEMP_MAX_C:
+                blocked[ip] = "芯片温度缺失或无效，无法确认已降温，自动重启已暂停"
+            elif temp >= hot:
+                blocked[ip] = f"芯片温度 {temp:g}℃ ≥ {hot:g}℃，自动重启已暂停"
+            elif temp >= clear:
+                # Always require a measurement below the recovery threshold. This
+                # also preserves the thermal interlock across a service restart,
+                # without relying on an in-memory high-temperature latch.
+                blocked[ip] = f"芯片温度尚未低于 {clear:g}℃ 回落阈值，自动重启已暂停"
+        return blocked
+
     def zero_reboot_candidates(self, records, now=None):
         """持续零算力重启：首个合格零算力样本起等15分钟，每次尝试后等15分钟，最多4次。"""
         now = int(time.time()) if now is None else int(now)
         ctl = self.cfg.get("control") or {}
         acfg = self.cfg.get("alerts") or {}
         states = db.zero_reboot_states(self.conn)
+        thermal = self._zero_reboot_thermal_blocks(records)
         repair = db.repair_ips(self.conn)
         active_segments = {a["ip"][:-2] for a in db.active_alerts_by_type(self.conn, "segment_down")
                            if a["ip"].endswith(".x")}
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         clear = set(repair) | (set(states) - roster)
+        # 缺温/高温期间不能累计首次自动重启的等候时间；确认降温且告警解除后重新等满15分钟。
+        # 已尝试的次数和真实下发时间保留，不能靠温度变化绕过4次上限。
+        clear.update(ip for ip, st in states.items()
+                     if ip in thermal and int(st.get("attempts") or 0) == 0)
         rebooting = self._alert_state.get("rebooting") or {}
         rb_grace = int(ctl.get("reboot_grace_sec", 600))
         # 旧版可能在离线期间保留了零算力计时。未下发过自动重启的机器，
@@ -231,7 +297,7 @@ class MonitorService:
             if r.get("status") != "online" or r.get("hr_rt") != 0:
                 continue
             seg = ".".join(ip.split(".")[:3])
-            if ip in repair or seg in active_segments or seg in paused:
+            if ip in repair or ip in thermal or seg in active_segments or seg in paused:
                 continue
             # Start the 15-minute timer on the first zero sample. Startup grace is
             # checked separately before sending, so it never delays the timer itself.
@@ -256,7 +322,7 @@ class MonitorService:
                 if grace and isinstance(uptime, (int, float)) and uptime < grace:
                     continue
                 seg = ".".join(ip.split(".")[:3])
-                if ip in repair or seg in active_segments or seg in paused:
+                if ip in repair or ip in thermal or seg in active_segments or seg in paused:
                     continue
             else:
                 # 自动重启只处理在线且明确读到 0 算力的机器。
@@ -280,44 +346,132 @@ class MonitorService:
 
     def _maybe_auto_reboot_zero(self, targets):
         import control
-        allowed, skipped = control.filter_reboot_targets(self.conn, targets, self.cfg)
-        user = "system@auto-zero-reboot"
-        if skipped:
-            db.log_commands(self.conn, user, "reboot", skipped)
-            log.info("零算力自动重启限流跳过 %d 台", len(skipped))
-        if not allowed:
-            return
+        import updater
         if not self._reboot_lock.acquire(blocking=False):
-            log.info("零算力自动重启跳过: 已有重启任务在执行(%d 台待重启)", len(allowed))
+            log.info("零算力自动重启跳过: 已有重启任务在执行(%d 台待重启)", len(targets))
             return
-        threading.Thread(target=self._run_auto_zero_reboot, args=(allowed, user),
-                         daemon=True, name="auto-zero-reboot").start()
+        started = False
+        try:
+            if updater.is_applying():
+                log.info("零算力自动重启推迟: 程序正在更新或等待重启")
+                return
+            # 与手动重启共用锁，限流必须在拿锁后查，才看得到上一批刚写入的审计。
+            control.flush_reboot_audit(self)
+            allowed, skipped = control.filter_reboot_targets(self.conn, targets, self.cfg)
+            user = "system@auto-zero-reboot"
+            if skipped:
+                db.log_commands(self.conn, user, "reboot", skipped)
+                log.info("零算力自动重启限流跳过 %d 台", len(skipped))
+            if not allowed:
+                return
+            threading.Thread(target=self._run_auto_zero_reboot, args=(allowed, user),
+                             daemon=True, name="auto-zero-reboot").start()
+            started = True  # 后台线程接管锁；启动失败或全被限流则由本线程释放。
+        finally:
+            if not started:
+                self._reboot_lock.release()
+
+    def _filter_auto_zero_group(self, targets):
+        """分批等待期间状态可能已变；只给仍满足自动重启条件的机器下发命令。"""
+        import control
+        ctl = self.cfg.get("control") or {}
+        stopped = getattr(self, "_stop", None)
+        if not ctl.get("enabled") or not ctl.get("reboot_enabled") or (stopped and stopped.is_set()):
+            return [], [{"ip": ip, "ok": False, "skipped": True,
+                         "msg": "零算力自动重启已关闭或服务正在停止，未下发"} for ip, _fw in targets]
+
+        now = time.time()
+        meta, records = self.latest()
+        scan_ts = (meta or {}).get("ts")
+        current = {r["ip"]: r for r in records}
+        roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
+        repair = db.repair_ips(self.conn)
+        states = db.zero_reboot_states(self.conn)
+        thermal = self._zero_reboot_thermal_blocks(records)
+        # A later batch may see heat that was absent at candidate selection. Do
+        # not retain an unattempted due timer through that safety interruption.
+        db.clear_zero_reboot_states(self.conn, [ip for ip, _fw in targets
+                                    if ip in thermal and ip in states
+                                    and int(states[ip].get("attempts") or 0) == 0])
+        active_segments = {a["ip"][:-2] for a in db.active_alerts_by_type(self.conn, "segment_down")
+                           if a["ip"].endswith(".x")}
+        paused = self._alert_state.get("zero_mass_segs") or set()
+        rebooting = self._alert_state.get("rebooting") or {}
+        rb_grace = int(ctl.get("reboot_grace_sec", 600))
+        grace = int((self.cfg.get("alerts") or {}).get("zero_grace_sec", 600) or 0)
+        eligible, skipped = [], []
+        for ip, firmware in targets:
+            row, st = current.get(ip), states.get(ip)
+            seg = ".".join(ip.split(".")[:3])
+            reason = ""
+            if ip in repair:
+                reason = "机器已标记维修"
+            elif ip not in roster:
+                reason = "机器已移出监控名册"
+            elif not row or not db.record_freshness(row, scan_ts, now):
+                reason = "最新采样缺失或已过期"
+            elif row.get("status") != "online" or data_metrics.measurement(row.get("hr_rt")) != 0:
+                reason = "最新采样已不是在线零算力"
+            elif ip in thermal:
+                reason = thermal[ip]
+            elif seg in active_segments or seg in paused:
+                reason = "网段故障或成片零算力事件，自动重启已暂停"
+            elif now - int(rebooting.get(ip, 0) or 0) < rb_grace:
+                reason = "机器仍在重启静默期"
+            elif (grace and isinstance(row.get("uptime"), (int, float))
+                  and row["uptime"] < grace):
+                reason = "机器仍在开机宽限期"
+            elif not st or int(st.get("attempts") or 0) >= 4:
+                reason = "零算力计时已取消或自动尝试已达上限"
+            elif now < int(st.get("last_attempt_at") or st["started_at"]) + 900:
+                reason = "尚未到下一次自动重启时间"
+            if reason:
+                skipped.append({"ip": ip, "ok": False, "skipped": True,
+                                "msg": f"{reason}，未下发"})
+            else:
+                eligible.append((ip, row.get("firmware") or firmware))
+        # 本方法只在 _run_auto_zero_reboot 持锁时调用；再次限流也覆盖等待期间调整的配置。
+        allowed, limited = control.filter_reboot_targets(self.conn, eligible, self.cfg)
+        skipped.extend({**r, "skipped": True} for r in limited)
+        return allowed, skipped
 
     def _run_auto_zero_reboot(self, targets, user):
         import control
         try:
+            def filter_group(group):
+                allowed, skipped = self._filter_auto_zero_group(group)
+                if skipped:
+                    db.log_commands(self.conn, user, "reboot", skipped)
+                return allowed, skipped
+
             def after_group(group, results):
                 # Count each attempted command, including a definite device-side failure;
                 # otherwise a dead miner would be hammered on every 5-minute scan.
-                ips = [r["ip"] for r in results]
-                db.record_zero_reboot_attempts(self.conn, ips, int(time.time()))
+                ips = [r["ip"] for r in results if not r.get("skipped")]
                 self.unmark_rebooting([r["ip"] for r in results if not r["ok"]])
                 # 逐批写审计：中途进程退出(更新重启)也不丢已下发的记录，限流照样有效
-                db.log_commands(self.conn, user, "reboot", results)
+                # 先缓存真实命令结果，持久化异常时下一请求须先补记，不能当作从未重启。
+                try:
+                    control.audit_reboot_results(self, user, results)
+                finally:
+                    db.record_zero_reboot_attempts(self.conn, ips, int(time.time()))
 
             results, err = control.run_batch(targets, "reboot", {}, self.cfg,
                                              before_group=self.mark_rebooting,
-                                             after_group=after_group)
+                                             after_group=after_group,
+                                             filter_group=filter_group)
             if err:
                 self.unmark_rebooting([ip for ip, _fw in targets])
                 log.warning("零算力自动重启批次错误: %s", err)
-            if results:
-                ok_n = sum(1 for r in results if r["ok"])
-                log.info("零算力自动重启完成: 尝试 %d 台，已下发 %d 台", len(results), ok_n)
+            attempted = [r for r in results if not r.get("skipped")]
+            if attempted:
+                ok_n = sum(1 for r in attempted if r["ok"])
+                log.info("零算力自动重启完成: 尝试 %d 台，已下发 %d 台，跳过 %d 台",
+                         len(attempted), ok_n, len(results) - len(attempted))
                 try:
                     alerts.push_text(
                         self.cfg,
-                        f"⚙ {user} 自动重启 {len(results)} 台(成功 {ok_n})")
+                        f"⚙ {user} 自动重启 {len(attempted)} 台(成功 {ok_n})")
                 except Exception:  # noqa: BLE001
                     log.exception("零算力自动重启推送失败")
         except Exception as e:  # noqa: BLE001
@@ -326,12 +480,12 @@ class MonitorService:
             self._reboot_lock.release()
 
     def drop_from_snapshot(self, ips):
-        """下架移除后立刻从内存快照剔除，否则要等下一轮扫描列表才更新。"""
-        drop = set(ips)
-        with self._snap_lock:
-            snap = dict(self.snapshot)
-            snap["records"] = [r for r in snap["records"] if r["ip"] not in drop]
-            self.snapshot = snap
+        """db.remove_miners 已追加库存事件；发布新快照，不改写旧扫描的历史含义。"""
+        latest = db.latest_scan(self.conn)
+        if latest:
+            records = db.scan_records(self.conn, latest["scan_id"])
+            self._publish(latest["scan_id"], latest["ts"], latest.get("kind") or "", records,
+                          started_ts=latest.get("started_ts"))
 
     # ---- 自愈 ----
     def _scheduling_on(self):
@@ -539,9 +693,10 @@ class MonitorService:
         cc["liveness_gate"] = False    # 不走判活闸门，给慢响应机器充分时间
         cc["alive_probe"] = True       # 接口都没应答时补测 80/4028：连得上就不算离线
         cc["max_pps"] = sc.get("max_pps", 100)   # 保留限速，护住三层 ARP/CoPP
-        def rank(r):   # 在线且有算力 > 在线 > 未探测 > 离线
+        def rank(r):   # 在线正算力 > 在线实测零 > 在线缺测 > 未探测 > 离线
             if r["status"] == "online":
-                return 3 if r.get("hr_rt") else 2
+                hr = data_metrics.measurement(r.get("hr_rt"))
+                return (4 if hr > 0 else 3) if hr is not None else 2
             return 1 if r["status"] == "unknown" else 0
 
         # 各轮结果只升不降：任一轮确认在线就算在线。直接覆盖会让后一轮的瞬时丢包
@@ -558,10 +713,13 @@ class MonitorService:
             if gen is not None and gen != self._scan_gen:
                 return miners
             self._beat(gen)
-            again = miner_core.scan(remaining, cc, workers=min(100, len(remaining)))
+            again = _scan_batch(remaining, cc, workers=min(100, len(remaining)))
             amap = {r["ip"]: r for r in again if r.get("device") != "container"}
             for ip, r in amap.items():
                 if ip not in fixed or rank(r) > rank(fixed[ip]):
+                    # Keep the complete chosen sample, including measured_ts.
+                    # Mixing old fields into a newer timestamp would falsely
+                    # extend their freshness and historical coverage.
                     fixed[ip] = r
             remaining = [ip for ip, r in amap.items()
                          if r["status"] == "offline" or r.get("hr_rt") in (None, 0)]
@@ -639,7 +797,7 @@ class MonitorService:
             def cb(done, _t, off=offset):
                 progress_cb(base + off + done, total)
 
-            found += miner_core.scan(chunk, disc_cfg, progress_cb=cb, workers=workers)
+            found += _scan_batch(chunk, disc_cfg, progress_cb=cb, workers=workers)
             if i + batch >= len(ips):
                 break
             if gen != self._scan_gen:
@@ -677,7 +835,7 @@ class MonitorService:
             # MAC is a stable fallback identity for firmware that cannot expose
             # an SN.  Fetch it on discovery scans, not every five-minute patrol.
             scan_cfg["collect_identity"] = kind in {"full", "manual"}
-            records = miner_core.scan(ips, scan_cfg, progress_cb=cb, workers=workers) if ips else []
+            records = _scan_batch(ips, scan_cfg, progress_cb=cb, workers=workers) if ips else []
             # 看门狗恢复会递增世代并启动新扫描。旧线程苏醒后必须在任何进度更新、
             # 二次探测或落库前退出，否则会覆盖新扫描的进度/快照。
             if gen != self._scan_gen:
@@ -713,6 +871,21 @@ class MonitorService:
             ident = db.known_identity(self.conn)
             for r in miners:
                 info = ident.get(r["ip"])
+                # 把本轮可用的归属上下文随快照保存，避免旧命名样本被清理后客户归属丢失。
+                # 有效 SN 优先；SN 不能可靠对比时，用两次实测的有效 MAC 识别同 IP 换机。
+                # 缺测/无效 MAC 不能作为换机证据，但已证实换机不能继承旧客户。
+                if not r.get("worker") and (r["status"] == "online" or
+                        (info and info.get("state") != "migrated")):
+                    changed = False
+                    if info:
+                        if miner_core.sn_valid(r.get("sn")) and miner_core.sn_valid(info.get("sn")):
+                            changed = r["sn"] != info["sn"]
+                        else:
+                            old_mac = miner_core.normalize_mac(info.get("mac"))
+                            new_mac = miner_core.normalize_mac(r.get("mac"))
+                            changed = bool(old_mac and new_mac and old_mac != new_mac)
+                    owner = info.get("worker") if info and info.get("state") != "migrated" and not changed else None
+                    r["worker"] = owner or "(未知)"
                 # 只回填离线机：在线机的 MAC 必须是本轮实测值——有合法 SN 的原厂机不读 MAC，
                 # 若回填名册旧值(可能是之前在这个 IP 上的另一台机)，残影判定会把真掉线的
                 # 那台当成"已在别处上线"自动下架、告警静音
@@ -729,30 +902,40 @@ class MonitorService:
                 self._maybe_request_early_full(miners)
             miners = self._drop_migrated_ghosts(miners)
 
-            # 只落库在线机 + 名册内(曾在线/维修)的离线机；丢弃约1.5万死IP空记录。
-            # 全新部署的第一轮还没有名册，此时必须落全量，否则离线数恒为0、面板误显示全在线。
-            # 判据用"库里有没有过扫描"而不是"名册是否为空"——后者会被 IP 迁移批量下架
-            # 清空名册的情况误伤，导致某一轮突然把上万个死地址全写进库。
+            # 首轮也只统计确认过的矿机：空地址不是离线矿机，陌生 HTTP 异常也不是已知矿机。
+            # db.save_scan 保留本轮确认的 online 记录，长时间搜索空地址不会改变
+            # 它们的显示状态；原始 measured_ts 继续供动作门禁与历史计算使用。
             roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
-            # 名册也要是空的：停机超过 retention_days 后重启，旧扫描已被清理但名册还在，
-            # 那不是首轮，按首轮落全量会把上万个死地址写进库
-            first_run = db.latest_scan(self.conn) is None and not db.known_identity(self.conn)
-            sid, ts, kept = db.save_scan(self.conn, kind, miners,
-                                         keep_ips=(None if first_run else roster))
+            sid, ts, kept = db.save_scan(self.conn, kind, miners, keep_ips=roster, started_ts=now)
             # 矿池地址不落库(列表且只用于本轮防篡改检查)，但 kept 是按库列重建的干净记录，
             # 要带回去，否则 alerts 永远看不到 pools、矿池篡改告警形同虚设
             pools_by_ip = {r["ip"]: r["pools"] for r in miners if r.get("pools") is not None}
+            counters_by_ip = {r["ip"]: {key: r[key] for key in ("counter_basis", "counter_samples")
+                                        if key in r} for r in miners}
             for r in kept:
                 if r["ip"] in pools_by_ip:
                     r["pools"] = pools_by_ip[r["ip"]]
+                r.update(counters_by_ip.get(r["ip"], {}))
             alive_ips = {r["ip"] for r in miners if r.get("alive")}
             for r in kept:   # alive 同理不落库：告警层靠它区分"连得上但读不到"与扫描超时
                 if r["ip"] in alive_ips:
                     r["alive"] = True
-            self._publish(sid, ts, kind, kept)
+            self._publish(sid, ts, kind, kept, started_ts=now)
             online_recs = [r for r in miners if r["status"] == "online"]
-            online_ips = {r["ip"] for r in online_recs}
             db.upsert_known_miners(self.conn, online_recs, ts)
+            # 原始快照供历史审计；告警和自动动作只使用仍然新鲜的运行视图。
+            # 全网发现可能用掉半小时，不能让半小时前的零算力触发现在的重启。
+            observed_now = time.time()
+            current = []
+            for record in kept:
+                fresh = db.record_freshness(record, ts, observed_now)
+                row = data_metrics.live_record(record, fresh=fresh)
+                if not fresh:
+                    row.pop("alive", None)
+                current.append(row)
+            # 完成日志/返回值描述本轮实际确认结果；过期动作证据不能把已确认
+            # 在线数量改成 0。告警/自动重启继续只接收上面的严格 current 视图。
+            online_ips = {r["ip"] for r in kept if r["status"] == "online"}
             # 扫描+落库已成功 → 立即更新 last_finished(看门狗据此判活)
             self.progress["last_finished"] = ts
 
@@ -760,18 +943,19 @@ class MonitorService:
             try:   # 维修机恢复出算力 → 自动恢复为正常。只看"在线"不够：拆了算力板、控制板
                 # 还通电的机器在线但零算力，一上线就撤销标记会让它照常报警、被零算力自动重启
                 back = db.repair_ips(self.conn) & {
-                    r["ip"] for r in online_recs if (r.get("hr_rt") or 0) > 0}
+                    r["ip"] for r in current
+                    if r["status"] == "online" and (r.get("hr_rt") or 0) > 0}
                 if back:
                     db.set_machine_state(self.conn, list(back), "active")
             except Exception as e:  # noqa: BLE001
                 log.warning("repair-restore error: %s", e)
             try:
-                fired = alerts.evaluate(self.conn, sid, kept, self.cfg, kind=kind,
+                fired = alerts.evaluate(self.conn, sid, current, self.cfg, kind=kind,
                                         state=self._alert_state)
             except Exception as e:  # noqa: BLE001
                 log.exception("alerts.evaluate error: %s", e)
             try:   # 与告警同轮：持续零算力自动重启(开关关则 no-op；限流后异步下发)
-                self._maybe_auto_reboot(kept)
+                self._maybe_auto_reboot(current)
             except Exception as e:  # noqa: BLE001
                 log.exception("auto-reboot error: %s", e)
             # 集装箱：全网扫描只负责发现新箱，已知箱的读数和故障评估全部交给 10 秒刷新。
@@ -1071,18 +1255,15 @@ class MonitorService:
     def _maintenance_tick(self, now=None):
         now = now or time.monotonic()
         dbc = self.cfg["db"]
-        # 只读连接是"每个碰过DB的线程各开一个、用到进程退出才关"(db._r())，FastAPI的
-        # sync路由跑在会动态开关线程的线程池里，线程一多、活得越久就攒得越多——
-        # 面板被人盯着看、上报/告警轮询越频繁，攒的速度越快，攒够 1024 就把服务打
-        # 到句柄耗尽、连上报的新 socket 都开不出来(生产上实测复现过)。定期强制关闭
-        # 重来，跟写连接完全独立。扫描进行中先不清：扫描线程的读操作撞上被关掉的连接会让
-        # 整轮扫描作废；一轮只要一两分钟，推迟到扫描空闲再清，句柄不会因此攒爆。
+        # 定期回收常驻线程的只读连接；退出线程的读句柄由弱引用释放。
+        # close_readers 立即关闭空闲连接，活跃查询完成后再关闭；缓存句柄下次读取时重开。
+        # 仍选扫描空闲时清理，以减少同一轮扫描反复重开连接；并发读取由读句柄自身保护。
         sweep_iv = max(60, int(dbc.get("reader_sweep_minutes", 15)) * 60)
         if now - self._last_reader_sweep >= sweep_iv and not self.progress.get("running"):
             self._last_reader_sweep = now
             n = db.close_readers()
             if n:
-                log.info("已关闭 %d 个只读连接句柄(定期清理，防句柄泄漏)", n)
+                log.info("已回收 %d 个空闲只读连接(活跃查询结束后再回收，下次读取自动重开)", n)
         if now - self._last_rollup >= 300:          # 每5分钟归档一次已结束的小时
             self._last_rollup = now
             db.rollup_hours(self.conn)

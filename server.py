@@ -10,7 +10,13 @@ if __name__ == "__main__":
     # 刚网页/自动更新过：先于其它业务模块 import 记一次启动尝试。新版本若在模块级就崩，
     # 连续几次后在这里自动回滚到上一版(见 updater.boot_guard)
     import updater as _updater
+    _updater.select_runtime()
     _updater.boot_guard()
+    # 官方 SSH origin → 匿名 HTTPS：启动时先改好，旧更新器下次也能 `git fetch origin`
+    try:
+        _updater.ensure_public_update_remote()
+    except Exception:  # noqa: BLE001
+        pass
 
 import asyncio
 import contextlib
@@ -22,21 +28,25 @@ import re
 import sys
 import threading
 import time
+import uuid
 
 from fastapi import (Body, Depends, FastAPI, HTTPException, Query, Request,
                      Response, WebSocket)
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from web_assets import index_html
 from fastapi.middleware.gzip import GZipMiddleware
 
 import alerts
 import appconfig
 import auth
 import cloud_alert_summary
+import cloud_connect
 import cloud_report
 import control
+import data_metrics
 import db
 import logs
 import miner_core
@@ -64,22 +74,35 @@ MAIN_LOOP = None
 def _start_cloud_report():
     """(重新)启动云端上报线程，供启动、设置热更新、看门狗自愈共用同一套参数。"""
     return cloud_report.start(CFG, _build_cloud_summary,
-                              lambda hours: db.customer_report(SVC.conn, hours))
+                              _customer_report_packet)
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app_):
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
+    recovered_jobs = db.recover_command_jobs(SVC.conn)
+    if recovered_jobs:
+        log.warning("检测到 %d 个上次运行中断的批量命令任务；已下发目标标记为 UNCERTAIN，未下发目标取消",
+                    recovered_jobs)
     SVC.notify = _broadcast_threadsafe   # 扫描线程→WS 推送
     SVC.start_scheduler()
     guardian = MAIN_LOOP.create_task(_guardian_loop())   # 不依赖 daemon 线程的最终兜底
     if _start_cloud_report():
         log.info("云端上报已启动 → %s (场地: %s, ID: %s)", CFG["cloud"]["url"],
                  CFG["cloud"]["site_name"], cloud_report.site_id(CFG))
+    try:
+        updater.ensure_public_update_remote()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("启动时自愈更新源失败: %s", exc)
     updater.start_auto(CFG.get("update") or {})
     # 新版本稳定运行 60 秒 → 确认更新成功(清掉回滚标记)
-    _h = threading.Timer(updater.HEALTHY_AFTER_SEC, updater.mark_healthy)
+    try:
+        _running_sha = updater._git("rev-parse", "HEAD")
+    except Exception:
+        _running_sha = None
+    _h = threading.Timer(updater.HEALTHY_AFTER_SEC, updater.mark_healthy,
+                         kwargs={"expected_sha": _running_sha})
     _h.daemon = True
     _h.start()
     _startup_selfcheck()
@@ -106,9 +129,9 @@ def _startup_selfcheck():
         weak = auth.weak_default_users(CFG)
         if weak:
             log.error("=" * 64)
-            log.error("安全警告: 用户 %s 仍在使用默认弱口令(admin888 等)", weak)
-            log.error("这些账号只能在本机 http://127.0.0.1:%d 登录，登录后网页会强制改密码；"
-                      "或运行 `python auth.py passwd 用户名` 设置", CFG["server"]["port"])
+            log.error("账号配置提醒: 用户 %s 存在默认弱口令、明文口令或尚未设置密码", weak)
+            log.error("弱口令登录只提示修改，仍保留该账号的角色权限。请在网页修改密码；"
+                      "空口令/示例占位符不能登录，可运行 `python auth.py passwd 用户名` 设置后重启服务")
             log.error("=" * 64)
     else:
         log.warning("auth.enabled=false：任何人可匿名只读访问面板")
@@ -312,8 +335,8 @@ async def ws_endpoint(websocket: WebSocket):
 
 
 def _latest_records():
-    """(scan_meta, records)。records 是共享只读列表——需要改写字段的调用方必须先拷贝。"""
-    return SVC.latest()
+    """Show the last completed round until its replacement is fully committed."""
+    return SVC.latest_display()
 
 
 # ---- 通用短缓存 + 每来源限流 ----
@@ -381,58 +404,67 @@ def api_summary(_: dict = Depends(require_viewer)):
     return {"scanned": True, **_summary_stats(ls, recs), **extra}
 
 
+def _container_stale_after():
+    return max(60, float(CFG.get("schedule", {}).get("container_interval", 10) or 10) * 3)
+
+
+def _current_containers():
+    """Keep raw/last-known evidence, but never call a stalled reader current."""
+    now = time.time()
+    lifetime = _container_stale_after()
+    out = []
+    for original in db.get_containers(SVC.conn):
+        c = dict(original)
+        stamp = data_metrics.measurement(c.get("measured_ts"))
+        if not stamp or stamp > now + 60 or now - stamp > lifetime:
+            c.update(data_status="unknown", data_complete=0, data_stale=True)
+        out.append(c)
+    return out
+
+
+def _container_unknown(c):
+    return bool(c.get("data_stale") or c.get("data_status") == "unknown" or
+                (c.get("online") and c.get("data_complete") != 1))
+
+
 def _container_faulty(c, ignore):
     """该集装箱是否有"未被忽略"的真实故障——口径必须与 alerts.evaluate_containers 一致，
     否则用户明明已经把某个故障位加进忽略列表(不报警)，总览/列表的"故障"计数却还在算它。"""
-    if not c.get("online"):
+    if not c.get("online") or c.get("data_stale"):
         return False
-    if any(f["flag"] not in ignore for f in (c.get("faults") or [])):
+    if any(f["flag"] not in ignore and f.get("observed") is not False for f in (c.get("faults") or [])):
         return True
     # 供/回液压力低也是告警条件(alerts 里按阈值判)：以前卡片标红、告警也报了，"故障 N"却不算它
     a = CFG.get("alerts", {})
     for key, lim in (("supply_pressure", a.get("container_supply_pressure_min", 0) or 0),
                      ("return_pressure", a.get("container_return_pressure_min", 0) or 0)):
-        v = c.get(key)
-        if lim and isinstance(v, (int, float)) and v < lim:
+        v = data_metrics.measurement(c.get(key))
+        if lim and v is not None and v < lim:
             return True
     return False
 
 
 def _summary_stats(ls, recs):
     """/api/summary 与 /api/public/summary 共用的统计口径，保证两边永远一致。"""
-    with_hr, no_hr, _offline = miner_core.rank(recs)
-    by_fw = {}
-    online = 0
-    offline = 0
-    total_power = 0
-    for r in recs:
-        if r["status"] == "online":
-            online += 1
-            by_fw[r["firmware"]] = by_fw.get(r["firmware"], 0) + 1
-            if r.get("power"):
-                total_power += r["power"]
-        elif r["status"] == "offline":
-            offline += 1
-        # status="unknown"(本轮扫描超时没来得及探测)不计入 total/online/offline——
-        # 口径须跟 db.save_scan 一致，否则总览/云端上报的"总数"、"离线数"会被虚高
-    total_hr = round(sum(r["hr_rt"] for r in with_hr), 2) if with_hr else 0.0
-    effs = [r["eff"] for r in with_hr if r.get("eff")]
-    cs = db.get_containers(SVC.conn)
-    total = online + offline
+    stats = data_metrics.aggregate(recs)
+    stamps = [db.record_measured_ts(r, ls.get("ts")) for r in recs]
+    measured = min(stamps) if stamps and all(ts is not None for ts in stamps) else None
+    if not recs:  # A completed empty-inventory scan is known zero at its scan time.
+        measured = ls.get("ts")
+    if stats["unknown"]:
+        measured = None
+    cs = _current_containers()
     ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
     return {
+        **stats,
         "scan_id": ls.get("scan_id"), "scan_ts": ls.get("ts"), "scan_kind": ls.get("kind"),
-        "total": total, "online": online, "offline": offline,
-        "with_hashrate": len(with_hr), "no_hashrate": len(no_hr),
-        "total_hashrate_th": total_hr,
-        "avg_hashrate_th": round(total_hr / len(with_hr), 2) if with_hr else 0,
-        "total_power_kw": round(total_power / 1000, 1),
-        "avg_efficiency": round(sum(effs) / len(effs), 2) if effs else 0,
-        "by_firmware": by_fw,
+        "scan_started_ts": ls.get("started_ts"),
+        "measurement_ts": measured,
         "active_alerts": db.count_active(SVC.conn),
         "containers": len(cs),
         "containers_faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
-        "containers_offline": sum(1 for c in cs if not c.get("online")),
+        "containers_offline": sum(1 for c in cs if not c.get("online") and not _container_unknown(c)),
+        "containers_unknown": sum(_container_unknown(c) for c in cs),
     }
 
 
@@ -453,8 +485,6 @@ def _check_public_token(request: Request):
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         supplied = auth_header[7:].strip()
-    if not supplied:
-        supplied = request.query_params.get("token", "")
     # compare_digest 对含非 ASCII 的 str 会抛 TypeError(→500)，统一按 UTF-8 字节比较
     if not supplied or not _hmac.compare_digest(supplied.encode("utf-8", "surrogatepass"),
                                                 str(cfg_token).encode("utf-8", "surrogatepass")):
@@ -482,32 +512,49 @@ def _build_public_summary():
     """与 api_summary 同一数据路径，另加一份精简全量矿机列表。包异常，绝不返回 500。"""
     try:
         ls, recs = _latest_records()
-        base = {"ok": True, "ts": int(time.time()), "progress": SVC.progress}
+        progress = dict(SVC.progress)
+        base = {"ok": True, "ts": int(time.time()), "progress": progress,
+                "scanning": bool(progress.get("running")),
+                "scan_progress_ts": progress.get("progress_ts") if progress.get("running") else None}
         if not ls:
             return {**base, "scanned": False,
-                    "online": 0, "offline": 0, "total": 0,
-                    "online_count": 0, "offline_count": 0, "total_count": 0,
-                    "total_hashrate_ths": 0.0, "active_alerts": 0, "miners": []}
+                    "online": None, "offline": None, "total": None, "unknown": None,
+                    "online_count": None, "offline_count": None, "total_count": None,
+                    "total_hashrate_ths": None, "total_power_kw": None,
+                    "hashrate_complete": False, "power_complete": False,
+                    "measurement_ts": None, "active_alerts": None, "miners": []}
         s = _summary_stats(ls, recs)
+        # 在线矿机有时能读到算力但读不到矿池名；只补已知身份，不能把客户误清成 0。
+        # 正常快照不查名册，保持每轮云端客户实时摘要轻量。
+        customer_identity = None
+        if any(not r.get("worker") for r in recs):
+            customer_identity = {ip: a.get("worker") or "(未知)"
+                                 for ip, a in db.known_identity(SVC.conn).items()}
         return {
             **base, "scanned": True,
             "scan_id": s["scan_id"], "scan_ts": s["scan_ts"], "scan_kind": s["scan_kind"],
+            "scan_started_ts": s["scan_started_ts"],
+            "measurement_ts": s["measurement_ts"],
             "total": s["total"], "online": s["online"], "offline": s["offline"],
+            "unknown": s["unknown"],
             "online_count": s["online"], "offline_count": s["offline"],
             "total_count": s["total"],
             "with_hashrate": s["with_hashrate"], "no_hashrate": s["no_hashrate"],
             "total_hashrate_ths": s["total_hashrate_th"],
+            "known_hashrate_ths": s["known_hashrate_ths"],
+            "hashrate_complete": s["hashrate_complete"],
+            "hashrate_known_machines": s["hashrate_known_machines"],
             "avg_hashrate_ths": s["avg_hashrate_th"],
             "total_power_kw": s["total_power_kw"],
+            "known_power_kw": s["known_power_kw"],
+            "power_complete": s["power_complete"],
+            "power_known_machines": s["power_known_machines"],
             "active_alerts": s["active_alerts"],
             "containers": s["containers"], "containers_faulty": s["containers_faulty"],
             "containers_offline": s["containers_offline"],
-            "miners": [{"ip": r["ip"], "model": r.get("model") or "",
-                        "firmware": r.get("firmware") or "",
-                        "status": r.get("status") or "unknown",
-                        "hashrate_ths": round(r.get("hr_rt") or 0.0, 2),
-                        "temp_c": r.get("temp") or 0, "power_w": r.get("power") or 0,
-                        "worker": r.get("worker") or ""} for r in recs],
+            "containers_unknown": s["containers_unknown"],
+            "customer_hashrates": db.customer_hashrates(ls, recs, identities=customer_identity),
+            "miners": [_public_miner_row(r) for r in recs],
         }
     except Exception as e:  # noqa: BLE001
         log.exception("build_public_summary error")
@@ -528,14 +575,15 @@ def _build_cloud_summary():
 
 def _public_miner_row(r):
     """单台矿机的 Agent 友好视图（稳定字段名 + 显式单位）。"""
+    r = data_metrics.live_record(r)
     return {
         "ip": r["ip"], "status": r.get("status") or "unknown",
         "firmware": r.get("firmware") or "", "model": r.get("model") or "",
         "sn": r.get("sn") or "", "mac": r.get("mac") or "",
         "worker": r.get("worker") or "",
-        "hashrate_ths": round(r.get("hr_rt") or 0.0, 2),
-        "hashrate_avg_ths": round(r.get("hr_avg") or 0.0, 2),
-        "power_w": r.get("power") or 0, "temp_c": r.get("temp") or 0,
+        "hashrate_ths": r["hr_rt"], "hashrate_avg_ths": r["hr_avg"],
+        "power_w": r["power"], "temp_c": r["temp"],
+        "measured_ts": r.get("measured_ts"), "data_stale": bool(r.get("data_stale")),
         "efficiency_jth": r.get("eff"), "uptime_s": r.get("uptime"),
         "accepted": r.get("accepted"), "rejected": r.get("rejected"),
     }
@@ -602,10 +650,13 @@ def api_public_miners(request: Request, status: str = "", fw: str = "", seg: str
     def build():
         _, recs = _latest_records()
         out = _filter_recs(recs, status, fw, seg, q)
-        online = [r for r in out if r["status"] == "online"]
-        return {"ok": True, "ts": int(time.time()), "count": len(out), "online": len(online),
-                "total_hashrate_ths": round(sum(r["hr_rt"] for r in online if r.get("hr_rt")), 2),
-                "total_power_w": sum(r["power"] for r in online if r.get("power")),
+        stats = data_metrics.aggregate(out)
+        return {"ok": True, "ts": int(time.time()), "count": len(out), "online": stats["online"],
+                "unknown": stats["unknown"],
+                "total_hashrate_ths": stats["total_hashrate_th"],
+                "known_hashrate_ths": stats["known_hashrate_ths"],
+                "hashrate_complete": stats["hashrate_complete"], "power_complete": stats["power_complete"],
+                "total_power_w": None if stats["total_power_kw"] is None else stats["total_power_kw"] * 1000,
                 "miners": [_public_miner_row(r) for r in out[:max(1, limit)]]}
     return _cached(("miners", status, fw, seg, q, limit), 8, build)
 
@@ -618,10 +669,11 @@ def api_public_miner(ip: str, request: Request):
     cur = next((r for r in recs if r["ip"] == ip), None)
     if not cur:
         return {"ok": True, "ts": int(time.time()), "found": False, "ip": ip}
-    hist = [{"ts": h["ts"], "status": h.get("status"),
-             "hashrate_ths": round(h.get("hr_rt") or 0.0, 2),
-             "temp_c": h.get("temp") or 0, "power_w": h.get("power") or 0}
-            for h in db.ip_history(SVC.conn, ip, 200)]
+    hist = []
+    for h in db.ip_history(SVC.conn, ip, 200):
+        point = data_metrics.live_record(h, db.record_freshness(h, h["ts"], h["ts"]))
+        hist.append({"ts": h["ts"], "measured_ts": h.get("measured_ts"), "status": point["status"],
+                     "hashrate_ths": point["hr_rt"], "temp_c": point["temp"], "power_w": point["power"]})
     return {"ok": True, "ts": int(time.time()), "found": True,
             "miner": _public_miner_row(cur), "history": hist}
 
@@ -648,38 +700,62 @@ def api_public_containers(request: Request):
     _check_public_token(request)
 
     def build():
-        cs = db.get_containers(SVC.conn)
+        cs = _current_containers()
         ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
         return {"ok": True, "ts": int(time.time()), "count": len(cs),
                 "faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
-                "offline": sum(1 for c in cs if not c.get("online")),
+                "offline": sum(1 for c in cs if not c.get("online") and not _container_unknown(c)),
+                "unknown": sum(_container_unknown(c) for c in cs),
                 "containers": cs}
     return _cached(("containers",), 8, build)
 
 
 def _report_window(hours):
-    """把请求周期收敛到实际有数据的范围，返回 (生效小时数, 是否被截断)。"""
+    """兼容的历史跨度提示，不能用这个取整数替换实际查询窗口。"""
     cov = db.coverage_hours(SVC.conn) or 1
     eff = min(max(1, int(hours)), cov)
     return eff, eff < hours
 
 
+def _report_end(until_ts=None):
+    """共同的 UTC 十分钟边界；各端必须真的查询同一时间窗才能合计。"""
+    now = int(time.time())
+    if until_ts is None:
+        return now // 600 * 600
+    end = data_metrics.measurement(until_ts)
+    if end is None or end <= 0 or end > now:
+        raise HTTPException(400, "统计截止时间必须是已经过去的有效 Unix 秒数")
+    return int(end)
+
+
+def _customer_report_packet(hours=24, until_ts=None):
+    """One query and its exact window, including a verifiably empty customer list."""
+    hours = max(1, min(8760, int(hours)))
+    end = _report_end(until_ts)
+    rows = _cached(("customers", hours, end), 45,
+                   lambda: db.customer_report(SVC.conn, hours, until_ts=end))
+    # A first query may create hourly archives; report the resulting retained span.
+    eff, truncated = _report_window(hours)
+    return {"hours": hours, "covered_hours": eff, "truncated": truncated,
+            "period_start_ts": end - hours * 3600, "period_end_ts": end,
+            "billing_period_start_ts": end - hours * 3600, "billing_period_end_ts": end,
+            "customers": rows}
+
+
 @app.get("/api/public/customers")
-def api_public_customers(request: Request, hours: int = 24):
-    """按客户(矿工名)报表：机器数 / 可用率% / 交付算力 TH·h / 耗电 kWh。"""
+def api_public_customers(request: Request, hours: int = 24, until_ts: float = None):
+    """客户实时/时段平均算力、有效观测覆盖，以及兼容的计费报表字段。"""
     _check_public_token(request)
     hours = max(1, min(8760, hours))   # 顺手封顶，避免任意 hours 撑爆缓存键空间
-    eff, truncated = _report_window(hours)
+    end = _report_end(until_ts)
 
     def build():   # 最重的查询, 缓存 45 秒(报表变化慢)
-        return {"ok": True, "ts": int(time.time()), "hours": hours,
-                "covered_hours": eff, "truncated": truncated,
-                "customers": db.customer_report(SVC.conn, eff)}
+        return {"ok": True, "ts": int(time.time()), **_customer_report_packet(hours, end)}
     # 缓存槽位必须按**原始入参 hours** 区分：响应里带了 hours/truncated 两个随原始入参
     # 变化的字段，若按收敛后的 eff 做键，hours=20 与 hours=21(都收敛到 eff=20)会互相
     # 拿到对方的元数据。另外键名与 /api/reports/customers 的 ("customers", eff) 区分开
     # ——那边缓存的是裸行列表，同键会让两个端点互相返回对方的数据结构。
-    return _cached(("public_customers", hours), 45, build)
+    return _cached(("public_customers", hours, end), 45, build)
 
 
 # ---- 会话 API ----
@@ -697,11 +773,17 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
     _, recs = _latest_records()
     repair = db.repair_ips(SVC.conn)
     out = _filter_recs(recs, status, fw, seg, q, repair=repair)
-    online = [r for r in out if r["status"] == "online"]
-    agg = {"count": len(out), "online": len(online),
-           "offline": sum(1 for r in out if r["status"] == "offline"),
-           "total_hr": round(sum(r["hr_rt"] for r in online if r.get("hr_rt")), 2),
-           "total_power": sum(r["power"] for r in online if r.get("power"))}
+    stats = data_metrics.aggregate(out)
+    agg = {"count": len(out), "online": stats["online"], "offline": stats["offline"],
+           "unknown": stats["unknown"], "total_hr": stats["total_hashrate_th"],
+           "known_hashrate_ths": stats["known_hashrate_ths"],
+           "hashrate_complete": stats["hashrate_complete"], "power_complete": stats["power_complete"],
+           "total_power": None if stats["total_power_kw"] is None else stats["total_power_kw"] * 1000,
+           "known_power": None if stats["known_power_kw"] is None else stats["known_power_kw"] * 1000,
+           "power_known_machines": stats["power_known_machines"],
+           "avg_efficiency": stats["avg_efficiency"], "known_efficiency": stats["known_efficiency"],
+           "efficiency_known_machines": stats["efficiency_known_machines"],
+           "efficiency_complete": stats["efficiency_complete"]}
     if sort not in _SORT_FIELDS:   # 防任意字段排序产生空/错误结果
         sort = "hr_rt"
     rev = order == "desc"
@@ -721,58 +803,65 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
 
 @app.get("/api/workers")
 def api_workers(_: dict = Depends(require_viewer)):
-    """按矿工名(矿池User)聚合在线矿机：总台数 / 总算力 / 机型分布。"""
+    """同一完整快照内的已知客户机器；离线/未知不从客户名下消失。"""
     _, recs = _latest_records()
+    identities = {ip: r.get("worker") for ip, r in db.known_identity(SVC.conn).items()}
     agg = {}
     for r in recs:
-        if r["status"] != "online":
-            continue
-        w = r.get("worker") or "(未知)"
+        w = r.get("worker") or identities.get(r["ip"]) or "(未知)"
         model = r.get("model") or "Unknown"
-        a = agg.setdefault(w, {"worker": w, "total": 0, "hashrate": 0.0, "models": {}})
-        a["total"] += 1
-        if r.get("hr_rt"):
-            a["hashrate"] = round(a["hashrate"] + r["hr_rt"], 2)
+        a = agg.setdefault(w, {"worker": w, "models": {}, "_records": []})
+        a["_records"].append(r)
         a["models"][model] = a["models"].get(model, 0) + 1
+    for a in agg.values():
+        stats = data_metrics.aggregate(a.pop("_records"))
+        a.update(total=stats["total"], online=stats["online"], unknown=stats["unknown"],
+                 hashrate=stats["total_hashrate_th"], known_hashrate_ths=stats["known_hashrate_ths"],
+                 hashrate_complete=stats["hashrate_complete"])
     out = sorted(agg.values(), key=lambda x: x["total"], reverse=True)
     return {"workers": out, "count": len(out)}
 
 
 @app.get("/api/reports/customers")
-def api_report_customers(hours: int = 24, format: str = "", _: dict = Depends(require_viewer)):
-    eff, truncated = _report_window(hours)
-    rows = _cached(("customers", eff), 45,
-                   lambda: db.customer_report(SVC.conn, eff))
+def api_report_customers(hours: int = 24, format: str = "", until_ts: float = None,
+                         _: dict = Depends(require_viewer)):
+    hours = max(1, min(8760, hours))
+    packet = _customer_report_packet(hours, until_ts)
+    end, rows = packet["period_end_ts"], packet["customers"]
     if format == "csv":   # 对客户出账：UTF-8 BOM 的 CSV(Excel 直接打开不乱码)
         import csv as _csv
         import io
         buf = io.StringIO()
         buf.write("﻿")
         w = _csv.writer(buf)
-        days = round(eff / 24, 1)
-        w.writerow([f"客户报表  数据覆盖近 {days} 天" + ("（已按可用数据截断）" if truncated else "")])
-        w.writerow(["客户(矿工名)", "机器数", "可用率%", "交付算力(TH·h)", "耗电(kWh)"])
+        w.writerow([f"客户报表：近 {hours} 小时，截止 Unix 秒 {end}"])
+        w.writerow(["客户(矿工名)", "台数", "可用率%", "交付算力(TH·h)", "耗电(kWh)",
+                    "当前机器数", "实时算力(TH/s)", "平均算力(TH/s)",
+                    "统计开始(Unix秒)", "统计截止(Unix秒)"])
         def cell(v):   # 矿工名来自矿机(可被篡改)：= + - @ 开头会被 Excel 当公式执行
             s = str(v or "")
             return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
 
         for r in rows:
             w.writerow([cell(r["worker"]), r["machines"], r["uptime_pct"],
-                        r["delivered_th_h"], r["power_kwh"]])
+                        r["delivered_th_h"], r["power_kwh"], r.get("current_machines"),
+                        r.get("hashrate_ths"), r.get("avg_hashrate_ths"),
+                        r.get("period_start_ts"), r.get("period_end_ts")])
         return Response(content=buf.getvalue(), media_type="text/csv; charset=utf-8",
                         headers={"Content-Disposition":
-                                 f'attachment; filename="customers_{eff}h.csv"'})
-    return {"hours": hours, "covered_hours": eff, "truncated": truncated, "customers": rows}
+                                 f'attachment; filename="customers_{hours}h.csv"'})
+    return packet
 
 
 @app.get("/api/containers")
 def api_containers(_: dict = Depends(require_viewer)):
-    cs = db.get_containers(SVC.conn)
+    cs = _current_containers()
     acfg = CFG.get("alerts", {})
     ignore = set(acfg.get("container_faults_ignore", []))
     return {"count": len(cs),
             "faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
-            "offline": sum(1 for c in cs if not c.get("online")),
+            "offline": sum(1 for c in cs if not c.get("online") and not _container_unknown(c)),
+            "unknown": sum(_container_unknown(c) for c in cs),
             "containers": cs,
             "faults_ignore": acfg.get("container_faults_ignore", []),
             "supply_pressure_min": acfg.get("container_supply_pressure_min", 0),
@@ -788,8 +877,9 @@ def api_containers_scan(_: dict = Depends(require_ops)):
 
 @app.get("/api/container/{ip}")
 def api_container(ip: str, _: dict = Depends(require_viewer)):
-    cur = next((c for c in db.get_containers(SVC.conn) if c["ip"] == ip), None)
-    return {"current": cur, "history": db.container_history(SVC.conn, ip)}
+    cur = next((c for c in _current_containers() if c["ip"] == ip), None)
+    return {"current": cur, "history": db.container_history(SVC.conn, ip),
+            "stale_after": _container_stale_after()}
 
 
 @app.get("/api/racks")
@@ -826,21 +916,24 @@ def api_racks(_: dict = Depends(require_viewer)):
     out = []
     for seg in sorted(by_seg, key=lambda n: tuple(int(x) for x in n.split("."))):
         hosts = by_seg[seg]
-        slots, cnt, hr_sum = [], {}, 0.0
+        slots, cnt, rack_records = [], {}, []
         for h in range(hs, he + 1):
             r = hosts.get(h)
             st = state(r)
             cnt[st] = cnt.get(st, 0) + 1
-            if r and r.get("hr_rt"):
-                hr_sum += r["hr_rt"]
+            if r:
+                rack_records.append(r)
             slots.append({"h": h, "ip": f"{seg}.{h}", "st": st,
                           "hr": (r.get("hr_rt") if r else None),
                           "temp": (r.get("temp") if r else None)})
+        stats = data_metrics.aggregate(rack_records)
         out.append({"name": seg, "slots": slots,
                     "online": cnt.get("ok", 0) + cnt.get("zero", 0),
                     "abnormal": cnt.get("zero", 0), "offline": cnt.get("offline", 0),
                     "empty": cnt.get("empty", 0), "unknown": cnt.get("unknown", 0),
-                    "hashrate": round(hr_sum, 2)})
+                    "hashrate": stats["total_hashrate_th"],
+                    "known_hashrate_ths": stats["known_hashrate_ths"],
+                    "hashrate_complete": stats["hashrate_complete"]})
     return {"racks": out}
 
 
@@ -848,7 +941,9 @@ def api_racks(_: dict = Depends(require_viewer)):
 def api_miner(ip: str, _: dict = Depends(require_viewer)):
     _, recs = _latest_records()
     cur = next((r for r in recs if r["ip"] == ip), None)
-    return {"current": cur, "history": db.ip_history(SVC.conn, ip)}
+    history = [data_metrics.live_record(h, db.record_freshness(h, h["ts"], h["ts"]))
+               for h in db.ip_history(SVC.conn, ip)]
+    return {"current": cur, "history": history}
 
 
 @app.post("/api/alerts/ack")
@@ -927,9 +1022,6 @@ def api_settings_get(sess: dict = Depends(require_viewer)):
     return out
 
 
-_SITE_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-
-
 def _cloud_form(c, keep_token=True):
     """校验网页提交的云端上报配置，返回 (配置, 错误)。token 留空 = 沿用已保存的。"""
     cur = CFG.get("cloud") or {}
@@ -939,6 +1031,11 @@ def _cloud_form(c, keep_token=True):
     if fp is None:
         return None, "证书指纹格式不对：应为 64 位十六进制(可带冒号)，从云端面板「场地接入」复制"
     url = str(c.get("url") or "").strip().rstrip("/")
+    if url:
+        try:
+            url = cloud_connect.validate_url(url)
+        except cloud_connect.SetupError as error:
+            return None, str(error)
     if not token and keep_token and cur.get("token"):
         # 沿用已保存的 token 只限地址和指纹都没变：否则改个地址就能让本服务把 token
         # 明文发到任意服务器——浏览器拿不到 token 的保护就白做了
@@ -946,6 +1043,8 @@ def _cloud_form(c, keep_token=True):
         if url != str(cur.get("url") or "").rstrip("/") or fp != saved_fp:
             return None, "云端地址或证书指纹改了，请重新填写上报 token(或粘贴新的接入码)"
         token = str(cur.get("token") or "")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in token):
+        return None, "上报 token 格式不对，请重新复制完整接入信息"
     cl = {"enabled": c.get("enabled", False),
           "url": url,
           "token": token,
@@ -953,27 +1052,24 @@ def _cloud_form(c, keep_token=True):
           "site_type": c.get("site_type") if c.get("site_type") in ("air", "hydro", "mixed")
           else "air",
           "tls_fingerprint": fp}
+    # settings.json replaces the cloud object as a whole. Preserve reporting
+    # intervals/timeouts that are configured outside this connection form.
+    for key in ("interval", "timeout", "customer_interval", "customer_hours"):
+        if key in cur:
+            cl[key] = cur[key]
     # 场地 ID 一旦定下就别丢：表单没带时沿用当前值(否则重启后回落到 cloud_site_id.txt，云端变成新场地)
-    sid = str(c.get("site_id") or cur.get("site_id") or "").strip()
-    if sid:
-        if not _SITE_ID_RE.match(sid):
-            return None, "场地 ID 只能是 1~64 位字母/数字/._-"
+    raw_sid = str(c.get("site_id") or cur.get("site_id") or "")
+    if raw_sid:
+        # 与云端绑定 token 的目标校验一致：旧码可用中文或带空格的名称作 ID。
+        # 清洗后必须原样，禁止静默改写身份，否则可能指向另一个场地。
+        sid = "".join(ch for ch in raw_sid if ch >= " " and ch != "\x7f").strip()
+        if sid != raw_sid or not 1 <= len(sid) <= 64:
+            return None, "场地 ID 须为 1~64 个字符，不能含控制符或首尾空白"
         cl["site_id"] = sid
     if "enabled" in c and not isinstance(c["enabled"], bool):
         return None, "cloud.enabled 须为布尔值"
     if cl["enabled"] and not (cl["url"] and cl["token"] and cl["site_name"]):
         return None, "启用上报需填写 云端地址/上报token/场地名"
-    if cl["url"] and not cl["url"].startswith(("http://", "https://")):
-        return None, "云端地址须以 http:// 或 https:// 开头"
-    if cl["url"].startswith("http://"):   # 明文上报会暴露 token 和场地数据；只放行内网调试地址
-        h = _host_name(cl["url"][7:].split("/", 1)[0])
-        try:
-            ip = ipaddress.ip_address(h)
-            private = ip.is_private or ip.is_loopback
-        except ValueError:
-            private = h == "localhost"
-        if not private:
-            return None, "公网云端地址必须用 https://(云端没有域名时用 https://IP:端口 + 证书指纹)"
     return cl, ""
 
 
@@ -1159,14 +1255,22 @@ def _audit_reject(user, action, reason):
 
 # 批量重启后台进度(分批+延迟会耗时，异步执行，前端轮询)
 CMD_PROGRESS = {"running": False, "action": "", "done": 0, "total": 0,
-                "success": 0, "failed": 0, "fail_ips": [], "user": ""}
+                "success": 0, "failed": 0, "fail_ips": [], "user": "", "error": "",
+                "job_id": ""}
 # 重启互斥锁挂在 SVC 上(手动 API 与零算力自动重启共用)，见 MonitorService._reboot_lock
 
 
 def _update_busy():
-    """更新会重启进程：重启/批量命令执行中时推迟更新(手动和自动更新都走这里)。"""
-    if SVC._reboot_lock.locked() or CMD_PROGRESS.get("running"):
-        return "正在执行重启/批量命令"
+    """更新已占用更新锁；再检查设备锁，避免更新和设备命令互相穿过闸门。"""
+    if CMD_PROGRESS.get("running") or not SVC._reboot_lock.acquire(blocking=False):
+        return "正在执行设备命令"
+    try:
+        control.flush_reboot_audit(SVC)
+    except Exception:
+        log.exception("设备命令审计尚未保存，推迟更新")
+        return "设备命令执行记录尚未保存，请检查数据库或磁盘后重试"
+    finally:
+        SVC._reboot_lock.release()
     return ""
 
 
@@ -1185,7 +1289,16 @@ def _audit_command(user, action, params, results):
         desc = _pools_desc(params)
         for r in results:
             r["msg"] = f'{r["msg"]} | {desc}'[:500]
-    db.log_commands(SVC.conn, user, action, results)
+    if action == "reboot":
+        control.audit_reboot_results(SVC, user, results)
+    else:
+        if not results:
+            return
+        if not hasattr(SVC, "_pending_command_audit"):
+            SVC._pending_command_audit = []
+        SVC._pending_command_audit.append(
+            (int(time.time()), user, action, [dict(r) for r in results]))
+        control.flush_command_audit(SVC)
 
 
 def _record_command(user, action, params, results, audited=False):
@@ -1205,43 +1318,119 @@ def _record_command(user, action, params, results, audited=False):
             log.exception("命令推送失败")
 
 
-def _run_command_bg(targets, action, params, user, skipped=None):
+def _run_command_bg(targets, action, params, user, skipped=None, job_id=None):
+    # 逐批保留执行结果：异常中断时已完成的机器不能变回“0 成功 / 0 失败”。
+    results_by_ip = {r["ip"]: r for r in (skipped or [])}
+    attempted = set()
+    error = ""
+
+    def update_progress():
+        rows = list(results_by_ip.values())
+        CMD_PROGRESS.update({
+            "done": len(rows), "total": len(targets) + len(skipped or []),
+            "success": sum(1 for r in rows if r["ok"]),
+            "failed": sum(1 for r in rows if not r["ok"]),
+            "fail_ips": [r["ip"] for r in rows if not r["ok"]][:100],
+            "error": error,
+        })
+
     try:
-        def prog(done, total):
-            CMD_PROGRESS["done"] = done
-            CMD_PROGRESS["total"] = total
+        def before_group(ips):
+            if job_id:
+                db.update_command_job_targets(SVC.conn, job_id, ips, "DISPATCHING")
+                db.update_command_job(SVC.conn, job_id, "DISPATCHING")
+            attempted.update(ips)
+            SVC.mark_rebooting(ips)
+
         def after_group(_grp, group_results):
             # 逐批写审计：分批重启要跑好几分钟，等全部跑完才记的话，中途进程退出(更新重启/
             # 断电)会丢掉已重启机器的记录，24h 次数上限和 15 分钟间隔对它们就失效了
+            results_by_ip.update((r["ip"], r) for r in group_results)
+            if job_id:
+                durable = []
+                for result in group_results:
+                    state = ("UNCERTAIN" if result.get("uncertain") else
+                             "SUCCEEDED" if result.get("ok") else "FAILED")
+                    durable.append({**result, "state": state})
+                db.update_command_job_targets(SVC.conn, job_id, durable, "FAILED")
+                db.update_command_job(SVC.conn, job_id, "DISPATCHING")
             SVC.unmark_rebooting([r["ip"] for r in group_results if not r["ok"]])
             _audit_command(user, action, params, group_results)
+            update_progress()
 
         if skipped:
             _audit_command(user, action, params, skipped)
-        results, _err = control.run_batch(targets, action, params, CFG, progress=prog,
-                                          before_group=SVC.mark_rebooting,
-                                          after_group=after_group)
-        all_results = list(skipped or []) + list(results)
-        _record_command(user, action, params, all_results, audited=True)
-        ok_n = sum(1 for r in results if r["ok"])
-        fail_n = len(results) - ok_n + len(skipped or [])
-        CMD_PROGRESS["success"] = ok_n
-        CMD_PROGRESS["failed"] = fail_n
-        CMD_PROGRESS["fail_ips"] = (
-            [r["ip"] for r in (skipped or []) if not r["ok"]]
-            + [r["ip"] for r in results if not r["ok"]])[:100]
-        log.info("批量 %s 完成: 成功 %d / 失败 %d (发起人 %s, 限流跳过 %d)",
-                 action, ok_n, fail_n, user, len(skipped or []))
+        update_progress()
+        results, err = control.run_batch(targets, action, params, CFG,
+                                         before_group=before_group, after_group=after_group)
+        results_by_ip.update((r["ip"], r) for r in results)
+        if err:
+            raise RuntimeError(err)
     except Exception as e:  # noqa: BLE001
+        error = "批量任务已中断，请检查未完成机器的状态后再操作"
+        unresolved = []
+        for ip, _fw in targets:
+            if ip not in results_by_ip:
+                sent = ip in attempted
+                unresolved.append({"ip": ip, "ok": False, "uncertain": sent,
+                                   "msg": "执行结果未确认，请检查机器状态" if sent
+                                   else "任务已中断，未下发"})
+        results_by_ip.update((r["ip"], r) for r in unresolved)
+        if job_id:
+            durable = [{**r, "state": "UNCERTAIN" if r.get("uncertain") else "CANCELLED"}
+                       for r in unresolved]
+            try:
+                db.update_command_job_targets(SVC.conn, job_id, durable, "CANCELLED")
+            except Exception:
+                log.exception("批量任务台账更新失败")
+        # 未下发的目标不能继续静默；已经开始请求但没有结果的目标保留重启宽限期。
+        SVC.unmark_rebooting([r["ip"] for r in unresolved if not r["uncertain"]])
+        try:
+            _audit_command(user, action, params, unresolved)
+        except Exception:
+            log.exception("批量中断结果审计写入失败")
         log.exception("async command error: %s", e)
     finally:
+        update_progress()
+        success, failed = CMD_PROGRESS["success"], CMD_PROGRESS["failed"]
         CMD_PROGRESS["running"] = False
+        if job_id:
+            try:
+                db.update_command_job(SVC.conn, job_id, "INTERRUPTED" if error else "COMPLETED", error)
+            except Exception:
+                log.exception("批量任务最终状态保存失败")
         SVC._reboot_lock.release()
+    _record_command(user, action, params, list(results_by_ip.values()), audited=True)
+    log.info("批量 %s %s: 成功 %d / 未成功 %d (发起人 %s)",
+             action, "中断" if error else "完成", success, failed, user)
 
 
 @app.get("/api/command/progress")
 def api_command_progress(_: dict = Depends(require_ops)):
-    return dict(CMD_PROGRESS)
+    out = dict(CMD_PROGRESS)
+    job_id = out.get("job_id")
+    if job_id:
+        job = db.get_command_job(SVC.conn, job_id)
+        if job:
+            job.pop("params_json", None)
+            out["job"] = job
+    return out
+
+
+@app.get("/api/command/jobs")
+def api_command_jobs(limit: int = 50, _: dict = Depends(require_ops)):
+    return {"jobs": db.list_command_jobs(SVC.conn, max(1, min(200, limit)))}
+
+
+@app.get("/api/command/job/{job_id}")
+def api_command_job(job_id: str, _: dict = Depends(require_ops)):
+    if not re.fullmatch(r"[0-9a-f]{32}", str(job_id)):
+        return JSONResponse({"ok": False, "error": "任务 ID 非法"}, status_code=400)
+    job = db.get_command_job(SVC.conn, job_id)
+    if not job:
+        return JSONResponse({"ok": False, "error": "任务不存在"}, status_code=404)
+    job.pop("params_json", None)
+    return {"ok": True, "job": job}
 
 
 @app.post("/api/command")
@@ -1333,59 +1522,115 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
     _, recs = _latest_records()
     fw_map = {r["ip"]: r["firmware"] for r in recs}
     targets = [(ip, fw_map.get(ip, "")) for ip in ips]
-    skipped = []
     if action == "reboot":
-        # 手动与自动共用 15min/24h 限流：超限 IP 跳过并记审计，不打断整批
-        targets, skipped = control.filter_reboot_targets(SVC.conn, targets, CFG)
-        ips = [t[0] for t in targets]
-        if not targets:
-            _record_command(user, action, params, skipped)
-            return {"ok": True, "action": action, "success": 0,
-                    "failed": len(skipped), "results": skipped, "skipped": len(skipped)}
-    log.info("命令 %s: %d 台(限流跳过 %d), 发起人 %s", action, len(targets), len(skipped), user)
-    # 重启且开启分批(打乱+延迟会耗时) → 后台异步执行，前端轮询 /api/command/progress
-    ctl = CFG.get("control", {})
-    rb = int(ctl.get("reboot_concurrency", 0) or 0)
-    if action == "reboot" and rb > 0 and len(targets) > rb:
+        # 限流查询、下发、成功审计必须在同一个共享锁内。
+        # 在锁外先查限流时，并发请求能拿着旧配额依次抢锁，重复重启同一台。
         if not SVC._reboot_lock.acquire(blocking=False):
             _audit_reject(user, action, "已有批量命令在执行")
             return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
                                 status_code=409)
-        SVC.mark_rebooting(ips)
-        CMD_PROGRESS.update({"running": True, "action": action, "done": 0,
-                             "total": len(targets) + len(skipped), "success": 0, "failed": 0,
-                             "fail_ips": [], "user": user})
-        threading.Thread(target=_run_command_bg,
-                         args=(targets, action, params, user, skipped),
-                         daemon=True).start()
-        return {"ok": True, "async": True, "action": action, "count": len(targets),
-                "skipped": len(skipped), "batch": rb, "delay": ctl.get("reboot_delay_sec", 0)}
-    if action == "reboot":
-        # 小批量同步重启也要占锁：否则异步分批跑着时再提交几批 ≤reboot_concurrency 的，
-        # 会和当前批次同时上电，绕过防浪涌分批；也挡住自动重启撞车
-        if not SVC._reboot_lock.acquire(blocking=False):
-            _audit_reject(user, action, "已有批量命令在执行")
-            return JSONResponse({"ok": False, "error": "已有批量重启在执行，请稍候"},
-                                status_code=409)
+        background_owns_lock = False
+        results, skipped = [], []
         try:
+            if updater.is_applying():
+                return JSONResponse({"ok": False, "error": "程序正在更新或等待重启，请更新完成后再执行矿机重启"},
+                                    status_code=409)
+            # 上轮命令已下发但审计失败时，先按原执行时刻补记；失败则继续阻止新命令。
+            control.flush_reboot_audit(SVC)
+            targets, skipped = control.filter_reboot_targets(SVC.conn, targets, CFG)
+            ips = [ip for ip, _fw in targets]
+            ctl = CFG.get("control", {})
+            rb = int(ctl.get("reboot_concurrency", 0) or 0)
+            log.info("命令 %s: %d 台(限流跳过 %d), 发起人 %s",
+                     action, len(targets), len(skipped), user)
+            if rb > 0 and len(targets) > rb:
+                job_id = uuid.uuid4().hex
+                # Persist the full target ledger before the first device request.
+                db.create_command_job(SVC.conn, job_id, user, action, params, targets, skipped)
+                CMD_PROGRESS.update({"running": True, "action": action, "done": len(skipped),
+                                     "total": len(targets) + len(skipped), "success": 0,
+                                     "failed": len(skipped), "fail_ips": [r["ip"] for r in skipped][:100],
+                                     "user": user, "error": "", "job_id": job_id})
+                try:
+                    threading.Thread(target=_run_command_bg,
+                                     args=(targets, action, params, user, skipped, job_id),
+                                     daemon=True).start()
+                except Exception:
+                    try:
+                        db.update_command_job_targets(SVC.conn, job_id, ips, "CANCELLED")
+                        db.update_command_job(SVC.conn, job_id, "INTERRUPTED",
+                                              "后台任务线程未能启动；没有下发重启命令")
+                    except Exception:
+                        log.exception("后台任务启动失败后的台账更新失败")
+                    CMD_PROGRESS.update({"running": False, "done": len(targets) + len(skipped),
+                                         "failed": len(targets) + len(skipped),
+                                         "fail_ips": (ips + [r["ip"] for r in skipped])[:100],
+                                         "error": "任务未能启动，没有下发重启命令"})
+                    log.exception("启动批量重启线程失败")
+                    return JSONResponse({"ok": False, "error": CMD_PROGRESS["error"]},
+                                        status_code=503)
+                background_owns_lock = True
+                return {"ok": True, "async": True, "action": action, "count": len(targets),
+                        "skipped": len(skipped), "batch": rb,
+                        "delay": ctl.get("reboot_delay_sec", 0), "job_id": job_id}
             SVC.mark_rebooting(ips)
-            results, err = control.run_batch(targets, action, params, CFG,
-                                             before_group=SVC.mark_rebooting)
-            SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
+            if targets:
+                results, err = control.run_batch(targets, action, params, CFG,
+                                                 before_group=SVC.mark_rebooting)
+                SVC.unmark_rebooting([r["ip"] for r in results if not r["ok"]] if not err else ips)
+                if err:
+                    return JSONResponse({"ok": False, "error": err}, status_code=400)
+            # 审计落库后才放开锁；Telegram 推送在锁外进行。
+            _audit_command(user, action, params, skipped + results)
+        except Exception:
+            ok_n = sum(1 for r in results if r["ok"])
+            log.exception("重启任务或审计失败，已确认下发 %d 台", ok_n)
+            if results:
+                message = (f"已确认下发 {ok_n} 台，但执行记录保存失败；"
+                           "已暂停新的重启，记录恢复后自动解除，请勿重复下发")
+            elif getattr(SVC, "_pending_reboot_audit", None):
+                message = "上次重启记录尚未保存，暂不下发新命令；请检查数据库或磁盘状态后重试"
+            else:
+                message = "重启执行结果未确认，请检查机器状态后再操作"
+            return JSONResponse({"ok": False, "error": message, "success": ok_n,
+                                 "results": results}, status_code=503)
         finally:
-            SVC._reboot_lock.release()
-        if err:
-            return JSONResponse({"ok": False, "error": err}, status_code=400)
+            if not background_owns_lock:
+                SVC._reboot_lock.release()
         all_results = skipped + results
-        _record_command(user, action, params, all_results)
+        _record_command(user, action, params, all_results, audited=True)
         ok_n = sum(1 for r in results if r["ok"])
         return {"ok": True, "action": action, "success": ok_n,
                 "failed": len(all_results) - ok_n, "results": all_results,
                 "skipped": len(skipped)}
-    results, err = control.run_batch(targets, action, params, CFG)
-    if err:
-        return JSONResponse({"ok": False, "error": err}, status_code=400)
-    _record_command(user, action, params, results)
+    # 换池/定位同样会改变设备状态，共用重启和更新的闸门。逐批审计落库后才继续下发。
+    if not SVC._reboot_lock.acquire(blocking=False):
+        return JSONResponse({"ok": False, "error": "已有设备命令在执行，请稍候"}, status_code=409)
+    results = []
+    try:
+        if updater.is_applying():
+            return JSONResponse({"ok": False, "error": "程序正在更新或等待重启，请更新完成后再执行设备命令"},
+                                status_code=409)
+        control.flush_reboot_audit(SVC)
+        log.info("命令 %s: %d 台, 发起人 %s", action, len(targets), user)
+
+        def after_group(_group, group_results):
+            results.extend(group_results)
+            _audit_command(user, action, params, group_results)
+
+        returned, err = control.run_batch(targets, action, params, CFG, after_group=after_group)
+        if err:
+            return JSONResponse({"ok": False, "error": err}, status_code=400)
+        # run_batch 的标准回调已逐批审计；保留完整排序结果供响应/通知使用。
+        results = returned
+    except Exception:
+        ok_n = sum(1 for r in results if r["ok"])
+        log.exception("设备命令或审计失败，已确认成功 %d 台", ok_n)
+        return JSONResponse({"ok": False, "error": "设备命令已中断，执行记录未保存时暂不下发新命令；请检查机器及数据库状态",
+                             "success": ok_n, "results": results}, status_code=503)
+    finally:
+        SVC._reboot_lock.release()
+    _record_command(user, action, params, results, audited=True)
     ok_n = sum(1 for r in results if r["ok"])
     return {"ok": True, "action": action, "success": ok_n,
             "failed": len(results) - ok_n, "results": results}
@@ -1444,8 +1689,9 @@ def api_machine_state(request: Request, body: dict = Body(...), sess: dict = Dep
 
 
 @app.get("/")
+@app.api_route("/web/index.html", methods=["GET", "HEAD"], include_in_schema=False)
 def index():
-    return FileResponse(os.path.join(WEB_DIR, "index.html"))
+    return HTMLResponse(index_html(WEB_DIR))
 
 
 def _host_name(host_header):
@@ -1553,7 +1799,9 @@ async def _no_cache_static(request: Request, call_next):
     """前端文件禁强缓存(每次向服务器复核, 未变返回304)——否则更新版本后浏览器
     拿旧 JS 渲染新接口, 要手动 Ctrl+F5 才恢复。文件只有几十KB, 代价可忽略。"""
     resp = await call_next(request)
-    if request.url.path.startswith("/web/") or request.url.path == "/":
+    if request.url.path in ("/", "/web/index.html"):
+        resp.headers["Cache-Control"] = "no-store"
+    elif request.url.path.startswith("/web/"):
         resp.headers["Cache-Control"] = "no-cache"
     return resp
 

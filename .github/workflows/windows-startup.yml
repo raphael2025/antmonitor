@@ -42,7 +42,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Turn a GitHub-style ZIP folder into a git deployment with portable Git
+      - name: Recover locked portable Git and repair an old ZIP through PowerShell 5.1
         run: python tests/windows_git_bootstrap.py
   startup:
     runs-on: windows-latest

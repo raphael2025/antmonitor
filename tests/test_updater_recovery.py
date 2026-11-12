@@ -11,6 +11,9 @@ import updater
 def state(tmp_path, monkeypatch):
     p = tmp_path / ".update_state.json"
     monkeypatch.setattr(updater, "STATE_FILE", str(p))
+    # Fake-SHA unit tests isolate recovery; real Git/config/DB checks have their
+    # own end-to-end fixtures in test_update_config_safety.py.
+    monkeypatch.setattr(updater, "_validate_release", lambda target: None)
     return p
 
 
@@ -23,6 +26,9 @@ def _fake_git(calls, head="aaa", remote="bbb", fail_reset=False):
             return ".git"
         if args[:3] == ("rev-parse", "--abbrev-ref", "HEAD"):
             return "dev"
+        if args[:3] == ("remote", "get-url", "origin"):
+            # Non-official remote: keep using origin credentials in unit tests.
+            return "file:///tmp/antmonitor-test-origin.git"
         if args[0] == "fetch":
             return ""
         if args == ("rev-parse", "HEAD"):
@@ -65,19 +71,20 @@ def test_failed_rollback_is_reported_not_500(state, monkeypatch):
 
 def test_new_version_that_keeps_crashing_is_rolled_back(state, monkeypatch):
     calls, restarts = [], []
-    monkeypatch.setattr(updater, "_git", _fake_git(calls))
+    monkeypatch.setattr(updater, "_git", _fake_git(calls, head="bbb"))
     monkeypatch.setattr(updater, "_restart", lambda: restarts.append(1))
     updater._set_pending("aaa", "bbb")
     for _ in range(updater.MAX_BOOT_ATTEMPTS):              # 前几次照常启动(给新版本机会)
         updater.boot_guard()
     assert not any(c[0] == "reset" for c in calls) and not restarts
     updater.boot_guard()                                    # 再起不来 → 回滚并重启
-    assert ("reset", "--hard", "aaa") in calls and restarts == [1]
+    assert ("reset", "--keep", "aaa") in calls and restarts == [1]
     st = json.loads(state.read_text(encoding="utf-8"))
     assert "pending" not in st and "bbb" in st["bad"]
 
 
 def test_healthy_new_version_clears_the_pending_marker(state, monkeypatch):
+    monkeypatch.setattr(updater, "_git", _fake_git([], head="bbb"))
     updater._set_pending("aaa", "bbb")
     updater.boot_guard()
     updater.mark_healthy()
@@ -104,25 +111,27 @@ def test_git_env_does_not_override_site_ssh_setup():
     assert "GIT_SSH_COMMAND" not in updater._GIT_ENV
 
 
-def test_changed_requirements_installed_before_selfcheck(state, monkeypatch, tmp_path):
-    """新版本加了依赖：合并后先 pip install，再自检；否则自检 import 必失败、永远更新不上去。"""
-    calls, order = [], []
-    base = _fake_git(calls)
-
-    def g(*args, **kw):
-        if args[0] == "diff":
-            return "requirements.txt"
-        return base(*args, **kw)
-
-    (tmp_path / "requirements.txt").write_text("newdep\n")
+def test_failed_dependency_install_does_not_touch_running_environment(state, monkeypatch, tmp_path):
+    import subprocess
+    live = tmp_path / "live-env"
+    live.mkdir()
+    marker = live / "packages"
+    marker.write_text("original dependencies")
     monkeypatch.setattr(updater, "BASE", str(tmp_path))
-    monkeypatch.setattr(updater, "_git", g)
-    monkeypatch.setattr(updater.subprocess, "run",
-                        lambda cmd, **kw: order.append(cmd[1:4]) or
-                        updater.subprocess.CompletedProcess(cmd, 0, "", ""))
-    monkeypatch.setattr(updater, "_selfcheck", lambda: order.append("selfcheck") or "")
-    assert updater.apply(restart=False)["ok"]
-    assert order == [["-m", "pip", "install"], "selfcheck"]
+    monkeypatch.setattr(updater, "_git", lambda *a: str(tmp_path / "update-envs"))
+    commands = []
+    def run(command, **kwargs):
+        commands.append(command)
+        if "pip" in command:
+            raise subprocess.CalledProcessError(1, command)
+        return subprocess.CompletedProcess(command, 0)
+    monkeypatch.setattr(updater.subprocess, "run", run)
+    with pytest.raises(subprocess.CalledProcessError):
+        updater._prepare_python(str(tmp_path), "candidate")
+    assert marker.read_text() == "original dependencies"
+    assert not list((tmp_path / "update-envs").iterdir())
+    assert commands[0][2] == "venv"
+    assert commands[1][0].startswith(str(tmp_path / "update-envs"))
 
 
 def test_update_deferred_while_reboot_running(state, monkeypatch):
@@ -224,10 +233,148 @@ def test_boot_guard_rolls_back_a_legacy_switch_to_dev(state, monkeypatch, tmp_pa
     prev = subprocess.run(["git", "rev-parse", "HEAD"], cwd=site, capture_output=True,
                           text=True).stdout.strip()
     assert updater.apply(restart=False)["ok"]
-    updater._set_pending(prev, "new", "dev")
+    updater._set_pending(prev, updater._git("rev-parse", "HEAD"), "dev")
     restarted = []
     monkeypatch.setattr(updater, "_restart", lambda: restarted.append(1))
     for _ in range(updater.MAX_BOOT_ATTEMPTS + 1):
         updater.boot_guard()
     assert restarted == [1]
     assert _head(site) == ("dev", "v = 1\n")
+
+
+def test_official_ssh_alias_is_healed_before_origin_fetch(monkeypatch):
+    """Heal SSH → HTTPS first, then fetch `origin` (same as old updater)."""
+    calls = []
+    state = {"origin": "git@github.com-miner-monitor:raphael2025/antmonitor.git"}
+
+    def fake_git(*args, **kwargs):
+        if args[:3] == ("remote", "get-url", "origin"):
+            return state["origin"]
+        if args[:3] == ("remote", "set-url", "origin"):
+            state["origin"] = args[3]
+            calls.append(args)
+            return ""
+        if args[0] == "config":
+            calls.append(args)
+            return ""
+        calls.append(args)
+        return ""
+
+    monkeypatch.setattr(updater, "_git", fake_git)
+    assert updater._update_fetch_sources() == ["origin", updater.GITEE_HTTPS]
+    assert state["origin"] == updater.GITHUB_HTTPS
+    updater._fetch_update_refs()
+    fetch = [c for c in calls if c and c[0] == "fetch"][0]
+    assert fetch[0:3] == ("fetch", "--quiet", "origin")
+    assert fetch[3] == "+refs/heads/*:refs/remotes/origin/*"
+
+
+def test_official_github_https_falls_back_to_gitee(monkeypatch):
+    attempts = []
+
+    def fake_git(*args, **kwargs):
+        if args[:3] == ("remote", "get-url", "origin"):
+            return updater.GITHUB_HTTPS
+        if args[0] == "config":
+            return ""
+        if args[0] == "fetch":
+            attempts.append(args[2])
+            if len(attempts) == 1:
+                raise RuntimeError("github unavailable")
+            return ""
+        return ""
+
+    monkeypatch.setattr(updater, "_git", fake_git)
+    updater._fetch_update_refs()
+    assert attempts == ["origin", updater.GITEE_HTTPS]
+
+
+def test_custom_origin_keeps_origin_credentials(monkeypatch):
+    def fake_git(*args, **kwargs):
+        if args[:3] == ("remote", "get-url", "origin"):
+            return "git@example.com:operator/private-monitor.git"
+        return ""
+
+    monkeypatch.setattr(updater, "_git", fake_git)
+    assert updater._update_fetch_sources() == ["origin"]
+
+
+def test_ensure_heals_ssh_so_old_fetch_origin_would_work(tmp_path, monkeypatch):
+    """After ensure(), plain `git fetch origin` works — the old updater handoff."""
+    import subprocess
+
+    def g(*a, cwd):
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                       cwd=cwd, check=True, capture_output=True)
+
+    bare, work, site = tmp_path / "bare.git", tmp_path / "work", tmp_path / "site"
+    g("init", "-q", "--bare", "-b", "main", str(bare), cwd=tmp_path)
+    g("clone", "-q", str(bare), str(work), cwd=tmp_path)
+    (work / "a.py").write_text("1\n")
+    g("add", "-A", cwd=work)
+    g("commit", "-q", "-m", "one", cwd=work)
+    g("push", "-q", "origin", "HEAD:main", cwd=work)
+    g("clone", "-q", str(bare), str(site), cwd=tmp_path)
+    # Pretend a broken historical SSH remote while the real objects stay on the bare repo.
+    subprocess.run(["git", "remote", "set-url", "origin",
+                    "git@github.com-miner-monitor:raphael2025/antmonitor.git"],
+                   cwd=site, check=True)
+    # Point insteadOf / set-url heal at the local bare repo by monkeypatching constants.
+    monkeypatch.setattr(updater, "BASE", str(site))
+    monkeypatch.setattr(updater, "GITHUB_HTTPS", str(bare))
+    monkeypatch.setattr(updater, "GITEE_HTTPS", str(bare))
+    assert updater.ensure_public_update_remote() == str(bare)
+    assert subprocess.run(["git", "remote", "get-url", "origin"], cwd=site,
+                          capture_output=True, text=True).stdout.strip() == str(bare)
+    # Old updater behavior: only fetch origin.
+    assert subprocess.run(["git", "fetch", "--quiet", "origin"], cwd=site).returncode == 0
+
+
+@pytest.mark.parametrize("origin", [
+    "git@github.com:raphael2025/antmonitor.git",
+    "ssh://git@github.com/raphael2025/antmonitor.git",
+    "git@github.com-miner-monitor:raphael2025/antmonitor.git",
+    "https://github.com/raphael2025/antmonitor.git",
+])
+def test_github_public_remote_normalization(origin):
+    assert updater._normalize_public_update_remote(origin) == updater.GITHUB_HTTPS
+
+
+def test_only_the_running_revision_can_confirm_a_pending_update(state, monkeypatch):
+    monkeypatch.setattr(updater, '_git', _fake_git([], head='bbb'))
+    updater._set_pending('aaa', 'bbb')
+    updater.mark_healthy(expected_sha='aaa')
+    assert updater._load_state()['pending']['to'] == 'bbb'
+    updater.mark_healthy(expected_sha='bbb')
+    assert 'pending' not in updater._load_state()
+
+
+def test_boot_guard_never_resets_an_unrelated_operator_revision(state, monkeypatch):
+    monkeypatch.setattr(updater, '_git', _fake_git([], head='operator-change'))
+    updater._set_pending('aaa', 'bbb')
+    with pytest.raises(RuntimeError, match='HEAD'):
+        updater.boot_guard()
+    assert updater._load_state()['pending']['attempts'] == 0
+
+
+def test_update_file_lock_blocks_a_second_process(state, monkeypatch):
+    import subprocess
+    import sys
+    import threading
+    from pathlib import Path
+    monkeypatch.setattr(updater, '_apply_lock', threading.Lock())
+    monkeypatch.setattr(updater, '_apply', lambda *a: {'ok':True, 'restarting':True})
+    assert updater.apply()['ok']
+    try:
+        script = ("import sys,json; sys.path.insert(0,sys.argv[1]); import updater; "
+                  "updater.STATE_FILE=sys.argv[2]; "
+                  "updater._apply=lambda *a: {'ok':True}; "
+                  "print(json.dumps(updater.apply(restart=False)))")
+        child = subprocess.run([sys.executable, '-c', script,
+                                str(Path(updater.__file__).resolve().parent), str(state)],
+                               capture_output=True, text=True, timeout=10)
+        assert child.returncode == 0, child.stderr
+        assert json.loads(child.stdout.splitlines()[-1])['ok'] is False
+    finally:
+        updater._restart_file_lock.close()
+        updater._apply_lock.release()

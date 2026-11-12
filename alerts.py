@@ -197,7 +197,6 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     state = state if state is not None else {}
     streak = state.setdefault("low_hr_streak", {})
     zero_since = state.setdefault("zero_since", {})   # ip → 连续零算力起始时间
-    shares = state.setdefault("reject_base", {})   # ip → (accepted, rejected) 拒绝率增量基准
     rebooting = state.setdefault("rebooting", {})   # ip → 下发重启的时间(MonitorService.mark_rebooting 写入)
     # 跨轮次确认用的起始时间/计数。大场地网络抖动(交换机重启、STP 收敛、ARP 表刷新)和矿机
     # 网页服务卡顿一两分钟就过去，单轮判定会"报掉线→几分钟后恢复"反复误报，所以掉线/整段
@@ -218,8 +217,6 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     cooldown = acfg.get("cooldown", 1800)
     seg_ratio = acfg.get("segment_down_ratio", 0.6)
     seg_min = acfg.get("segment_down_min", 5)
-    rej_thresh = acfg.get("reject_pct", 5.0)
-    rej_min = max(1, int(acfg.get("reject_min_shares", 50) or 50))
     grace = acfg.get("zero_grace_sec", 600)
     lo_ratio = acfg.get("low_hashrate_ratio", 0.7)
     lo_rounds = max(1, int(acfg.get("low_hashrate_rounds", 2)))
@@ -369,7 +366,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
         alive_streak.pop(ip, None)
         if r["status"] == "offline":
             hot_reported = (ip, "overheat") in b.active
-            for t in ("zero", "reject", "low_hashrate", "overheat"):
+            for t in ("zero", "low_hashrate", "overheat"):
                 b.resolve(ip, t, recovered=False)   # 掉线了读不到，不代表恢复
             streak.pop(ip, None)
             zero_since.pop(ip, None)
@@ -493,37 +490,9 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
             else:
                 b.resolve(ip, "pool_hijack")
 
-        # 拒绝率（矿池健康）：按两次判定之间的份额增量算。矿机给的是开机以来的累计值，
-        # 直接用累计值的话，跑了 30 天的机器突然全拒要一天多才报，刚重启 12 个份额拒 1 个
-        # 就立刻报。增量不足 reject_min_shares 份额时保留基准继续累积，告警状态不变
-        acc, rej = r.get("accepted"), r.get("rejected")
-        if rej_thresh and rej_thresh > 0 and (acc is not None or rej is not None):
-            a, j = acc or 0, rej or 0
-            base = shares.get(ip)
-            if base is None:
-                shares[ip] = (a, j)            # 首次见到：只记基准
-            else:
-                if a < base[0] or j < base[1]:  # 计数归零(矿机/挖矿程序重启)：当前值就是增量
-                    base = (0, 0)
-                da, dj = a - base[0], j - base[1]
-                if muted:
-                    shares[ip] = (a, j)
-                    b.resolve(ip, "reject")
-                elif da + dj >= rej_min:
-                    shares[ip] = (a, j)
-                    rp = round(dj / (da + dj) * 100, 3)
-                    if rp >= rej_thresh:
-                        b.fire(ip, "reject", "warn",
-                               f"{ip} 拒绝率 {rp}% ≥ {rej_thresh}%(最近 {da + dj} 份额)")
-                    else:
-                        b.resolve(ip, "reject")
-
     for ip in list(streak):     # 已不在本轮样本内的机器(下架/换IP)：别让计数无限增长
         if ip not in cur:
             streak.pop(ip, None)
-    for ip in list(shares):
-        if ip not in cur:
-            shares.pop(ip, None)
     for ip in list(zero_since):
         if ip not in cur:
             zero_since.pop(ip, None)
@@ -534,6 +503,11 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     for ip in list(rebooting):  # 同理：静默期过了还没出现在样本里的(下架/换IP)
         if ip not in cur and rb_expired(ip):
             rebooting.pop(ip, None)
+
+    # Reject-rate alerts are disabled. Resolve legacy active records once so they do not
+    # remain visible forever after upgrading; share counters remain available for metrics.
+    for alert in db.active_alerts_by_type(conn, "reject"):
+        b.resolve(alert["ip"], "reject", recovered=False)
 
     fired = b.commit()
     if fired:
@@ -584,6 +558,8 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
     existing = db.active_alerts_by_type(conn, like="cooler")
 
     for ip, c in cur.items():
+        observed = c.get("observed_fault_flags")
+        observed = set(observed) if isinstance(observed, list) else None
         # 故障位（忽略列表内的不报警，但仍在卡片显示）
         active = {f"cooler:{f['flag']}": f for f in (c.get("faults") or [])
                   if f["flag"] not in ignore}
@@ -624,23 +600,34 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
         for a in existing:      # 消除已恢复的该箱冷却告警
             if a["ip"] != ip or not a["type"].startswith("cooler:") or a["type"] in active:
                 continue
+            k = (ip, a["type"])
+            flag = a["type"].split(":", 1)[1]
+            software_pressure = a["type"] in {"cooler:supply_pressure_low", "cooler:return_pressure_low_th"}
+            if not software_pressure and observed is not None and flag not in observed and flag not in ignore:
+                clean.pop(k, None)  # 缺测打断“连续正常”，不能把间隔两端拼成恢复证据。
+                continue
             # 压力阈值开着但这轮读不到压力：不是"恢复"的证据，保持原状
             if (a["type"] == "cooler:supply_pressure_low" and sp_min and sp is None) or \
                     (a["type"] == "cooler:return_pressure_low_th" and rp_min and rp is None):
+                clean.pop(k, None)
                 continue
             # 压力还在 hold 确认中：等同"条件仍可能成立"，不要提前消已有告警
             if a["type"] in pending_pressure:
                 continue
-            k = (ip, a["type"])
             need = press_clear if a["type"] in _PRESSURE_ALERT_TYPES else COOLER_CLEAR_SEC
             first_ok = clean.setdefault(k, now)    # 从第一次读到正常开始计时
             if now - first_ok >= need:
                 clean.pop(k, None)
                 b.resolve(ip, a["type"])
-        b.resolve(ip, "cooler_offline")   # 箱体恢复在线
+        if c.get("status") != "unknown":
+            b.resolve(ip, "cooler_offline")   # 取得有效状态，恢复监测。
 
     for ip in known_before:              # 已记住的箱、本次未采到
         if ip not in cur:
+            for timer in (clean, low_since):
+                for key in list(timer):
+                    if key[0] == ip:
+                        timer.pop(key, None)
             # force：与其他冷却 crit 一致不受冷却限制。控制器离线 = 漏液监测失效，
             # 短暂掉线恢复后 30 分钟内再次掉线，不能被冷却推迟
             b.fire(ip, "cooler_offline", "crit", f"集装箱 {ip} 控制器离线", force=True)

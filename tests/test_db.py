@@ -23,14 +23,17 @@ def test_save_scan_keep_ips_drops_dead_addresses(conn):
 
 
 def test_customer_report_worker_attribution_is_deterministic(conn):
-    """机器中途换客户时，归属必须取"区间内最后一次非空矿工名"并且稳定。
-    旧实现依赖 SELECT 的返回顺序，同样的数据可能算给不同客户——这是出账数据。"""
+    """当前统计保留每轮真实客户，旧口径另列，不能把历史倒算给后来的客户。"""
     h = now_hour(-2)
     insert_scan(conn, h + 60, "quick", [rec("10.2.0.1", worker="老客户")])
     insert_scan(conn, h + 120, "quick", [rec("10.2.0.1", worker="新客户")])
     for _ in range(3):
         rows = {r["worker"]: r for r in db.customer_report(conn, hours=6)}
-        assert set(rows) == {"新客户"}
+        assert set(rows) == {"老客户", "新客户"}
+        assert rows["老客户"]["delivered_th_h"] == 1.667
+        assert rows["新客户"]["delivered_th_h"] > 0
+        assert rows["老客户"]["legacy_delivered_th_h"] is None
+        assert rows["老客户"]["avg_hashrate_ths"] > 0
 
 
 def test_customer_report_counts_offline_time_against_uptime(conn):
@@ -115,7 +118,10 @@ def test_remove_miners_clears_roster_snapshot_and_alerts(conn):
     db.raise_alert(conn, "10.4.0.1", "offline", "crit", "x")
     db.remove_miners(conn, ["10.4.0.1"])
     assert "10.4.0.1" not in db.roster_ips(conn)
-    assert [r["ip"] for r in db.scan_records(conn, sid)] == ["10.4.0.2"]
+    assert {r["ip"] for r in db.scan_records(conn, sid)} == {"10.4.0.1", "10.4.0.2"}
+    latest = db.latest_scan(conn)
+    assert latest["kind"] == "inventory"
+    assert [r["ip"] for r in db.scan_records(conn, latest["scan_id"])] == ["10.4.0.2"]
     assert db.active_alert(conn, "10.4.0.1", "offline") is None
 
 
@@ -130,27 +136,32 @@ def test_segment_down_cleared_only_when_segment_emptied(conn):
     assert db.active_alert(conn, "10.5.0.x", "segment_down") is None
 
 
-def test_hourly_boundary_uses_full_hour(conn):
-    """一小时内首次扫描要回补到整点，避免每小时开头出现计费空洞。"""
+def test_hourly_archive_uses_observed_interval_and_never_regenerates_legacy(conn):
+    """首次采样前没有观测；只归档有效区间，不再生成旧摊分账本。"""
     h = now_hour(-2)
     insert_scan(conn, h + 1800, "quick", [rec("10.6.0.1", worker="F", hr=3600.0)])
     db.rollup_hours(conn)
-    row = conn.execute("SELECT th_h FROM worker_hourly WHERE hour=? AND worker='F'",
+    assert conn.execute("SELECT COUNT(*) FROM worker_hourly").fetchone()[0] == 0
+    row = conn.execute("SELECT th_h FROM worker_metrics_hourly WHERE hour=? AND worker='F'",
                        (h,)).fetchone()
-    assert row is not None and row["th_h"] > 0
+    assert row["th_h"] == 900
 
 
-def test_unknown_samples_are_not_billed_as_customer_downtime(conn):
-    """扫描拥堵时本轮没探到的机器(unknown)不能算成客户停机：一小时里一半轮次拥堵，
-    一台一直在挖的机器可用率会变成 50%、交付算力也少一半，客户会拿这个索赔。"""
+def test_unknown_samples_are_not_billed_as_customer_downtime(conn, monkeypatch):
+    """缺测既不计停机，也不能沿用旧读数充当实测交付；数值须同时给出覆盖。"""
     h = now_hour(-1)
     for i in range(12):                  # 对照机 C 一直在线；U 一半轮次拥堵成 unknown
         u = rec("10.2.5.1", worker="U", hr=100.0) if i % 2 == 0 else \
             rec("10.2.5.1", status="unknown", worker="")
         insert_scan(conn, h + i * 300, "quick", [u, rec("10.2.5.2", worker="C", hr=100.0)])
+    monkeypatch.setattr(db.time, "time", lambda: h + 3600)
     rows = {r["worker"]: r for r in db.customer_report(conn, hours=6)}
     assert rows["U"]["uptime_pct"] == 100.0
-    assert rows["U"]["delivered_th_h"] == rows["C"]["delivered_th_h"]
+    assert rows["U"]["delivered_th_h"] == 50.0
+    assert rows["C"]["delivered_th_h"] == 100.0
+    assert rows["U"]["delivery_observed_hours"] == 0.5
+    assert rows["U"]["delivery_coverage_pct"] < rows["C"]["delivery_coverage_pct"]
+    assert rows["U"]["legacy_delivered_th_h"] == rows["C"]["legacy_delivered_th_h"]
 
 
 def test_report_window_does_not_bill_an_extra_hour(conn, monkeypatch):

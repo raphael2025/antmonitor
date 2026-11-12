@@ -96,6 +96,7 @@ let lastScanTs = 0;          // 服务器最近一次完成扫描的时间戳
 let staleAfter = 900;        // 多久没有新扫描算过期：取服务端看门狗阈值(随巡检间隔变)
 let _staleOn = false;
 let _staleTimer = null;
+let _scanRunning = false, _scanProgressTs = 0;
 
 async function jget(u) {
   const r = await fetch(u);
@@ -135,7 +136,8 @@ function checkStale() {
   let cls = "", msg = "";
   if (noContact > 90) {
     cls = "lost"; msg = t("stale.disconnected", { n: noContact });
-  } else if (lastScanTs && scanAge > staleAfter) {
+  } else if (lastScanTs && scanAge > staleAfter &&
+      !(_scanRunning && _scanProgressTs > 0 && now / 1000 - _scanProgressTs <= staleAfter)) {
     cls = "stale"; msg = t("stale.scan_old", { n: Math.round(scanAge / 60) });
   }
   if (cls) {
@@ -174,14 +176,17 @@ function ago(ts) {
   if (s < 3600) return t("time.min_ago", { n: Math.floor(s / 60) });
   return t("time.hour_ago", { n: Math.floor(s / 3600) });
 }
-function fmtPower(w) {   // 功率 W → kW/MW
-  if (w == null) return "-";
-  const v = Number(w);
-  return v >= 1e6 ? (v / 1e6).toFixed(2) + " MW" : (v / 1000).toFixed(1) + " kW";
+function fmtPower(w) {   // 矿机/配电原始读数为 W；界面固定用 kW 表示当前功率。
+  const v = AntDataQuality.number(w);
+  return v == null ? "-" : (v / 1000).toLocaleString(undefined, { maximumFractionDigits: 3 }) + " kW";
+}
+function fmtEnergy(kwh) {   // 累计电量固定用 kWh，避免与当前负荷混淆。
+  const v = AntDataQuality.number(kwh);
+  return v == null ? "-" : v.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " kWh";
 }
 function boxPower(c) {   // 集装箱总功耗 = 两路配电之和(W)
-  if (c.power1 == null && c.power2 == null) return null;
-  return (c.power1 || 0) + (c.power2 || 0);
+  const p1 = AntDataQuality.number(c.power1), p2 = AntDataQuality.number(c.power2);
+  return p1 == null || p2 == null ? null : p1 + p2;
 }
 function fmtDT(ts) {   // 告警时间戳: MM-DD HH:MM
   if (!ts) return "";
@@ -194,25 +199,48 @@ function fmtUptime(sec) {
   if (h) return t("time.h_m", { h, m });
   return t("time.m_only", { m });
 }
-const KIND_LABEL = { get full(){return t("kind.full");}, get quick(){return t("kind.quick");}, get manual(){return t("kind.manual");} };
+const KIND_LABEL = { get full(){return t("kind.full");}, get quick(){return t("kind.quick");}, get manual(){return t("kind.manual");}, get inventory(){return t("kind.inventory");} };
+
+function currentMetric(id, full, known, complete, count, total) {
+  const value = AntDataQuality.number(full) ?? AntDataQuality.number(known);
+  $(id).textContent = value == null ? "—" : AntDataQuality.short(value);
+  const measured = AntDataQuality.number(count), machines = AntDataQuality.number(total);
+  $(id).title = complete === false && value != null ? (measured != null && machines != null
+    ? t("power.coverage", { known: measured, total: machines }) : t("power.partial")) : "";
+}
+
+let _summarySeq = 0;
 
 async function refreshSummary() {
+  const seq = ++_summarySeq;
   const s = await jget("/api/summary");
+  if (seq !== _summarySeq) return;
   updateProgress(s.progress);
   if (s.scan_ts) lastScanTs = s.scan_ts;   // 记录服务器最近完成扫描时间(失联自检用)
   if (s.stale_after) staleAfter = s.stale_after;
-  if (!s.scanned) { $("lastScan").textContent = t("scan.none_wait"); return; }
+  if (!s.scanned) {
+    lastScanTs = 0;
+    $("lastScan").textContent = t("scan.none_wait");
+    ["cOnline", "cTotalHr", "cAvgHr", "cOffline", "cAlerts", "cFw", "cPower", "cEff", "cContainers"].forEach(id => { $(id).textContent = "—"; });
+    ["cOnline", "cPower", "cEff"].forEach(id => { $(id).title = ""; });
+    return;
+  }
   $("cOnline").textContent = `${s.online} / ${s.total}`;
-  $("cTotalHr").textContent = fmtHash(s.total_hashrate_th);
+  $("cOnline").title = s.unknown ? t("quality.unknown_count", { n: s.unknown }) : "";
+  $("cTotalHr").innerHTML = AntDataQuality.partial(s.total_hashrate_th, s.known_hashrate_ths, s.hashrate_complete, t, n => fmtHash(n, "/s"));
   $("cAvgHr").textContent = fmtHash(s.avg_hashrate_th);
+  $("cAvgHr").title = t("quality.avg_machine_help");
   $("cOffline").textContent = s.offline;
   $("cAlerts").textContent = s.active_alerts;
   const fw = s.by_firmware || {};
   $("cFw").textContent = `${fw.stock || 0} / ${fw.uniplus || 0}`;
-  $("cPower").textContent = (s.total_power_kw || 0).toLocaleString();
-  $("cEff").textContent = s.avg_efficiency || 0;
-  $("cContainers").textContent = `${s.containers || 0}`
-    + ((s.containers_faulty || s.containers_offline) ? ` (${(s.containers_faulty || 0) + (s.containers_offline || 0)})` : "");
+  currentMetric("cPower", s.total_power_kw, s.known_power_kw,
+    s.power_complete, s.power_known_machines, s.total);
+  currentMetric("cEff", s.avg_efficiency, s.known_efficiency,
+    s.efficiency_complete, s.efficiency_known_machines, s.total);
+  $("cContainers").innerHTML = `${s.containers || 0}`
+    + ((s.containers_faulty || s.containers_offline) ? ` (${(s.containers_faulty || 0) + (s.containers_offline || 0)})` : "")
+    + (s.containers_unknown ? AntDataQuality.note(t("quality.unknown_count", { n: s.containers_unknown }), true) : "");
   $("lastScan").textContent = t("scan.last", { ago: ago(s.scan_ts), kind: KIND_LABEL[s.scan_kind] || s.scan_kind });
 }
 
@@ -381,46 +409,80 @@ document.addEventListener("click", () => {
 function trendYScale(data) {
   // 小幅正常抖动(约±1%)不拉满图高；真实大跌/大涨仍清晰可见。
   // 量程至少覆盖均值的 8%，再在数据上下各留一点边。
+  data = data.filter(v => v != null && Number.isFinite(v));
   if (!data.length) return {};
   const lo = Math.min(...data), hi = Math.max(...data);
-  const mid = (lo + hi) / 2 || 1;
-  const span = Math.max(hi - lo, Math.abs(mid) * 0.08);
+  const mid = (lo + hi) / 2;
+  const span = Math.max(hi - lo, (Math.abs(mid) || 1) * 0.08);
   const pad = span * 0.15;
-  return { min: mid - span / 2 - pad, max: mid + span / 2 + pad };
+  return { min: Math.max(0, mid - span / 2 - pad), max: mid + span / 2 + pad };
 }
 
 async function refreshTrend() {
   const d = await jget("/api/trend?points=288");
-  // 注意：不可用局部变量名 t —— 会遮蔽全局 i18n 的 t()，导致标题赋值抛错、整段趋势图画不出
   const pts = d.trend || [];
-  const loc = uiLocale();
-  const labels = pts.map(x => new Date(x.ts * 1000).toLocaleTimeString(loc, { hour12: false }));
-  const raw = pts.map(x => x.total_hr);
-  const { div, unit } = hashUnit(raw.length ? Math.max(...raw) : 0);
-  const data = raw.map(v => v / div);
-  const yScale = trendYScale(data);
-  const tt = $("trendTitle"); if (tt) tt.textContent = t("trend.title_u", { unit });
-  if (!window.Chart) return;   // Chart.js 未加载时跳过，不拖垮整页
-  const canvas = $("trendChart");
-  if (!canvas) return;
+  const measurements = pts.map(p => {
+    const full = p.data_quality === "legacy" ? null : AntDataQuality.number(p.total_hr);
+    const known = AntDataQuality.number(p.known_total_hr);
+    const count = AntDataQuality.number(p.hashrate_known_machines), total = AntDataQuality.number(p.total);
+    const partial = p.data_quality !== "legacy" && full == null && known != null &&
+      Number.isInteger(count) && Number.isInteger(total) && count > 0 && count < total;
+    return { x: p.ts, y: full ?? (partial ? known : null), partial,
+      known: count, total };
+  });
+  const values = measurements.map(p => p.y).filter(v => v != null);
+  const { div, unit } = hashUnit(values.length ? Math.max(...values) : 0);
+  const observed = [];
+  measurements.forEach((p, i) => {
+    if (i && p.x - measurements[i - 1].x > 900) {
+      observed.push({ x: measurements[i - 1].x + 900, y: null, partial: false });
+    }
+    observed.push({ ...p, y: p.y == null ? null : p.y / div });
+  });
+  const data = observed.map(p => ({ ...p, y: p.partial ? null : p.y }));
+  const hasPartial = observed.some(p => p.partial);
+  const isolatedRadius = points => c => points[c.dataIndex]?.y != null &&
+    points[c.dataIndex - 1]?.y == null && points[c.dataIndex + 1]?.y == null ? 2 : 0;
+  const datasets = [{ label: t("card.total_hr"), data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: 0, pointRadius: isolatedRadius(data), borderWidth: 2 }];
+  if (hasPartial) datasets.push({ label: t("trend.partial"), data: observed, trendPartial: true,
+    borderColor: "#d97706", backgroundColor: "#d97706", borderDash: [5, 4], fill: false,
+    tension: 0, borderWidth: 2, pointRadius: c => c.raw?.partial ? 2 : 0,
+    pointHoverRadius: c => c.raw?.partial ? 4 : 0,
+    // Complete samples anchor adjacent partial segments. Their own segments stay
+    // transparent and their tooltip rows are filtered, so totals are drawn once.
+    segment: { borderColor: c => observed[c.p0DataIndex]?.partial || observed[c.p1DataIndex]?.partial
+      ? "#d97706" : "transparent" } });
+  const yScale = trendYScale(observed.map(p => p.y));
+  const tt = $("trendTitle"); if (tt) tt.textContent = t("trend.title_u", { unit: unit + "/s" });
+  if (!window.Chart || !$("trendChart")) return;
+  const tick = ts => new Date(ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false });
+  const tooltipFilter = c => !c.dataset.trendPartial || c.raw?.partial === true;
+  const tooltip = c => {
+    const value = c.parsed.y == null ? "—" : AntDataQuality.short(c.parsed.y) + " " + unit + "/s";
+    return c.dataset.trendPartial ? [t("trend.partial") + ": " + value,
+      t("power.coverage", { known: c.raw.known, total: c.raw.total }), t("trend.partial_tooltip")] : value;
+  };
   if (!trendChart) {
-    trendChart = new Chart(canvas, {
-      type: "line",
-      data: { labels, datasets: [{ data, borderColor: "#1f6feb", backgroundColor: "rgba(31,111,235,.1)", fill: true, tension: .3, pointRadius: 0, borderWidth: 2 }] },
+    trendChart = new Chart($("trendChart"), {
+      type: "line", data: { datasets },
       options: {
-        interaction: { mode: "index", intersect: false },   // 鼠标放在图上任意处即显示数值
-        plugins: { legend: { display: false }, tooltip: { callbacks: {
-          title: (items) => items.length ? items[0].label : "",
-          label: (c) => c.parsed.y.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " " + unit } } },
+        spanGaps: false, animation: false,
+        interaction: { mode: "nearest", axis: "x", intersect: false },
+        plugins: { legend: { display: hasPartial }, tooltip: { filter: tooltipFilter, callbacks: {
+          title: items => items.length ? new Date(items[0].parsed.x * 1000).toLocaleString(uiLocale()) : "",
+          label: tooltip } } },
         scales: {
-          x: { ticks: { color: "#6e7681", maxTicksLimit: 8 } },
+          x: { type: "linear", ticks: { color: "#6e7681", maxTicksLimit: 8, callback: tick } },
           y: { ticks: { color: "#6e7681" }, min: yScale.min, max: yScale.max }
         }
       }
     });
   } else {
-    trendChart.data.labels = labels; trendChart.data.datasets[0].data = data;
-    trendChart.options.plugins.tooltip.callbacks.label = (c) => c.parsed.y.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " " + unit;
+    trendChart.data.datasets = datasets;
+    trendChart.options.plugins.legend.display = hasPartial;
+    trendChart.options.plugins.tooltip.filter = tooltipFilter;
+    trendChart.options.plugins.tooltip.callbacks.label = tooltip;
+    trendChart.options.scales.x.ticks.callback = tick;
     trendChart.options.scales.y.min = yScale.min;
     trendChart.options.scales.y.max = yScale.max;
     trendChart.update("none");
@@ -442,10 +504,11 @@ function tempCell(r) {
 }
 const REJECT_HI = 5;
 function rejCell(r) {
-  if (r.accepted == null && r.rejected == null) return `<td>-</td>`;
-  const tot = (r.accepted || 0) + (r.rejected || 0);
+  const accepted = AntDataQuality.number(r.accepted), rejected = AntDataQuality.number(r.rejected);
+  if (accepted == null || rejected == null) return `<td>-</td>`;
+  const tot = accepted + rejected;
   if (tot === 0) return `<td>0%</td>`;
-  const p = Math.round((r.rejected || 0) / tot * 1000) / 10;
+  const p = Math.round(rejected / tot * 1000) / 10;
   return `<td class="${p >= REJECT_HI ? "hot" : ""}">${p}%</td>`;
 }
 
@@ -474,7 +537,14 @@ async function refreshMiners() {
   }
   $("minerCount").textContent = d.count != null ? d.count : lastMiners.length;
   const a = d.agg || {};
-  $("segStat").textContent = t("seg.stat", { seg: seg ? seg + ".x ｜ " : "", online: a.online || 0, hr: fmtHash(a.total_hr), pw: fmtPower(a.total_power) });
+  const power = fmtPower(a.total_power ?? a.known_power);
+  $("segStat").title = "";
+  if (a.power_complete === false && AntDataQuality.number(a.known_power) != null) {
+    const known = AntDataQuality.number(a.power_known_machines);
+    $("segStat").title = known == null ? t("power.partial")
+      : t("power.coverage", { known, total: d.count ?? lastMiners.length });
+  }
+  $("segStat").textContent = t("seg.stat", { seg: seg ? seg + ".x ｜ " : "", online: a.online || 0, hr: fmtHash(a.total_hr), pw: power });
 
   const rows = showAllRows ? lastMiners : lastMiners.slice(0, RENDER_CAP);
   $("minerBody").innerHTML = rows.map(r => {
@@ -486,7 +556,7 @@ async function refreshMiners() {
       + `<td>${r.firmware ? `<span class="pill ${esc(r.firmware)}">${esc(r.firmware)}</span>` : "-"}</td>`
       + `<td>${esc(r.model) || "-"}</td>`
       + hrCell(r) + `<td>${r.hr_avg != null ? fmtHash(r.hr_avg) : "-"}</td>`
-      + `<td>${r.power != null ? safeVal(r.power) + " W" : "-"}</td>`
+      + `<td>${fmtPower(r.power)}</td>`
       + `<td>${r.eff != null ? esc(r.eff) : "-"}</td>`
       + rejCell(r)
       + tempCell(r)
@@ -546,43 +616,54 @@ async function refreshRacks() {
   }).join("");
 }
 
+let _workerSeq = 0;
 async function refreshWorkers() {
   if (view !== "worker") return;
+  const seq = ++_workerSeq;
   const period = parseInt($("workerPeriod").value) || 0;
   $("btnExportCsv").classList.toggle("hidden", period === 0);   // 仅周期报表可导出CSV
+  const d = await jget(period === 0 ? "/api/workers" : `/api/reports/customers?hours=${period}`);
+  if (seq !== _workerSeq || view !== "worker" || period !== (parseInt($("workerPeriod").value) || 0)) return;
   if (period === 0) {
-    const d = await jget("/api/workers");
     $("workerList").innerHTML = (d.workers || []).map(w => {
       const models = Object.entries(w.models).sort((a, b) => b[1] - a[1])
         .map(([m, c]) => `<div class="wmodel">${esc(t("worker.models", { m, c }).replace(String(c), "") )}<b>${c}</b></div>`).join("");
       return `<div class="worker"><div class="worker-head">`
         + `<span class="wname">${esc(w.worker)}</span>`
-        + `<span class="wstat">${t("worker.stat", { n: w.total, hr: fmtHash(w.hashrate) })}</span></div>`
+        + `<span class="wstat">${t("worker.stat", { n: w.total, hr: fmtHash(w.hashrate, "/s") })}</span></div>`
+        + (w.hashrate_complete === false && w.known_hashrate_ths != null ? `<div class="muted">${esc(t("quality.known_part", { value: fmtHash(w.known_hashrate_ths, "/s") }))}</div>` : "")
         + `<div class="wmodels">${models}</div></div>`;
     }).join("") || `<div class="muted">${esc(t("worker.none"))}</div>`;
   } else {
-    const d = await jget(`/api/reports/customers?hours=${period}`);
     // 周期超过可用数据被截断时给出提示
     const note = d.truncated
       ? `<div class="muted" style="margin-bottom:8px">${esc(t("worker.cover_warn", { d: (d.covered_hours / 24).toFixed(1) }))}</div>`
       : "";
     $("workerList").innerHTML = note + ((d.customers || []).map(c => {
-      const up = c.uptime_pct;
-      const upCls = up >= 99 ? "res-ok" : up >= 95 ? "" : "res-fail";
       return `<div class="worker"><div class="worker-head">`
         + `<span class="wname">${esc(c.worker)}</span>`
-        + `<span class="wstat">${t("worker.machines", { n: c.machines })}</span></div>`
+        + `<span class="wstat">${AntCustomerRates.machines(c, t)} ${esc(t("rate.machines_unit"))}</span></div>`
         + `<div class="wmodels">`
-        + `${esc(t("worker.uptime"))} <b class="${upCls}">${up}%</b><br>`
-        + `${esc(t("worker.delivered"))} <b>${fmtHashH(c.delivered_th_h)}</b><br>`
-        + `${esc(t("worker.kwh"))} <b>${c.power_kwh.toLocaleString()}</b> kWh`
+        + `<div class="worker-rates"><div><span>${esc(t("rate.current"))}</span>${AntCustomerRates.cell(c, "current", t, fmtHash, rateAgo)}</div>`
+        + `<div><span>${esc(AntCustomerRates.header([c], t))}</span>${AntCustomerRates.cell(c, "average", t, fmtHash, rateAgo)}</div></div>`
+        + `${esc(t("worker.uptime"))}${AntDataQuality.billing(c, "uptime", t, n => AntDataQuality.short(n) + "%")}`
+        + `${esc(t("worker.kwh"))}${AntDataQuality.billing(c, "power", t, fmtEnergy)}`
+        + `<details class="worker-billing"><summary>${esc(t("rate.billing"))}</summary>${esc(t("worker.delivered"))}${AntDataQuality.billing(c, "delivery", t, fmtHashH)}</details>`
+        + (c.period_end_ts ? `<div class="muted">${esc(t("quality.period_end", { time: fmtTime(c.period_end_ts) }))}</div>` : "")
         + `</div></div>`;
     }).join("") || `<div class="muted">${esc(t("worker.none_period"))}</div>`);
   }
 }
 
+function rateAgo(seconds) {
+  if (seconds < 60) return t("time.sec_ago", { n: Math.floor(seconds) });
+  if (seconds < 3600) return t("time.min_ago", { n: Math.floor(seconds / 60) });
+  return t("time.hour_ago", { n: Math.floor(seconds / 3600) });
+}
+
 let view = "list";   // list | rack | worker
 function setView(v) {
+  _workerSeq++;   // 离开视图也作废仍在途的报表请求。
   view = v;
   $("listView").classList.toggle("hidden", v !== "list");
   $("rackView").classList.toggle("hidden", v !== "rack");
@@ -598,6 +679,8 @@ function setView(v) {
 
 function updateProgress(p) {
   if (!p) return;
+  _scanRunning = p.running === true;
+  _scanProgressTs = Number(p.progress_ts || p.started) || 0;
   const bar = $("progressBar"), btnF = $("btnFull"), btnQ = $("btnQuick");
   if (p.running) {
     bar.classList.remove("hidden");
@@ -647,7 +730,7 @@ async function openMiner(ip) {
   $("mInfo").innerHTML =
     t("miner.detail_fw", { fw: esc(c.firmware) || "-", st: esc(c.status) || "-", sn: esc(c.sn) || "-" }) + "<br>"
     + t("miner.detail_mac", { mac: esc(c.mac) || "-" }) + "<br>"
-    + t("miner.detail_hr", { hr: c.hr_rt == null ? t("td.no_hr") : fmtHash(c.hr_rt), avg: fmtHash(c.hr_avg), pw: safeVal(c.power) }) + "<br>"
+    + t("miner.detail_hr", { hr: c.hr_rt == null ? t("td.no_hr") : fmtHash(c.hr_rt), avg: fmtHash(c.hr_avg), pw: fmtPower(c.power) }) + "<br>"
     + t("miner.detail_eff", { eff: safeVal(c.eff), temp: safeVal(c.temp), up: fmtUptime(c.uptime) }) + "<br>"
     + t("miner.detail_worker", { w: esc(c.worker) || "-", a: safeVal(c.accepted), r: safeVal(c.rejected), s: safeVal(c.stale) })
     + (c.note ? "<br>" + t("miner.detail_note", { n: esc(c.note) }) : "");
@@ -692,6 +775,15 @@ function containerFaultLabel(fault) {
   return t("cbox.fault_generic", { fault: readable });
 }
 
+function containerQuality(c) {
+  return c.data_status === "unknown" || c.data_stale || (c.online && c.data_complete !== 1 && c.data_complete !== true);
+}
+
+function containerFaultBadge(f, ignored = false) {
+  return `<span class="fbadge ${ignored ? "info" : esc(f.sev)}">${esc(containerFaultLabel(f))}`
+    + (f.observed === false ? ` · ${esc(t("quality.last_fault", { time: f.measured_ts ? fmtTime(f.measured_ts) : t("rate.time_unknown") }))}` : "") + `</span>`;
+}
+
 async function refreshContainers() {
   const d = await jget("/api/containers");
   const cs = d.containers || [];
@@ -699,9 +791,10 @@ async function refreshContainers() {
   const spMin = d.supply_pressure_min || 0, rpMin = d.return_pressure_min || 0;
   $("containerPanel").style.display = cs.length ? "" : "none";
   $("containerCount").textContent = `${cs.length}`
-    + (d.faulty ? t("cbox.faulty", { n: d.faulty }) : "") + (d.offline ? t("cbox.offline", { n: d.offline }) : "");
+    + (d.faulty ? t("cbox.faulty", { n: d.faulty }) : "") + (d.offline ? t("cbox.offline", { n: d.offline }) : "")
+    + (d.unknown ? " · " + t("quality.unknown_count", { n: d.unknown }) : "");
   $("containerList").innerHTML = cs.map(c => {
-    if (!c.online) {
+    if (!c.online && !containerQuality(c)) {
       return `<div class="cbox offline" onclick="openContainer('${esc(c.ip)}')">`
         + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
         + `<span class="fbadge crit">${esc(t("cbox.ctrl_off"))}</span></div>`
@@ -710,13 +803,14 @@ async function refreshContainers() {
     const dt = (c.supply_temp != null && c.return_temp != null) ? (c.return_temp - c.supply_temp).toFixed(1) : "-";
     const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `<span class="pump ${v ? "on" : ""}">${esc(containerPumpLabel(k))}</span>`).join("");
     // 忽略列表内的故障置灰(info)，其余按严重级；按阈值标红低压力
-    const faults = (c.faults || []).map(f => `<span class="fbadge ${ign.has(f.flag) ? "info" : esc(f.sev)}">${esc(containerFaultLabel(f))}</span>`).join("");
+    const faults = (c.faults || []).map(f => containerFaultBadge(f, ign.has(f.flag))).join("");
     const spLow = spMin && c.supply_pressure != null && c.supply_pressure < spMin;
     const rpLow = rpMin && c.return_pressure != null && c.return_pressure < rpMin;
     const realFault = (c.faults || []).some(f => !ign.has(f.flag)) || spLow || rpLow;
     return `<div class="cbox ${realFault ? "fault" : ""}" onclick="openContainer('${esc(c.ip)}')">`
       + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
       + `<span class="cbox-meta">${esc(t("cbox.miners_line", { n: safeVal(c.miner_num) }))} ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span></div>`
+      + (containerQuality(c) ? AntDataQuality.note(t(c.data_stale ? "quality.stale" : "quality.partial"), true) : "")
       + `<div class="cbox-temps"><div>${esc(t("cbox.supply"))} <span class="v in">${safeVal(c.supply_temp)}℃</span></div>`
       + `<div>${esc(t("cbox.return"))} <span class="v out">${safeVal(c.return_temp)}℃</span></div><div>ΔT <span class="v">${safeVal(dt)}℃</span></div></div>`
       + `<div class="cbox-meta">${esc(t("cbox.meta_env", { t: safeVal(c.internal_temp), h: safeVal(c.internal_humidity), f: safeVal(c.flow) }))} `
@@ -732,23 +826,36 @@ async function openContainer(ip) {
   const c = d.current || {};
   $("mTitle").textContent = t("cbox.title", { ip });
   const h = d.history || [];
-  const labels = h.map(x => new Date(x.ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false }));
+  const maxGap = Math.max(60, Number(d.stale_after) || 60);
+  const series = key => {
+    const out = [];
+    h.forEach((r, i) => {
+      if (i && r.ts - h[i - 1].ts > maxGap) out.push({ x: h[i - 1].ts + maxGap, y: null });
+      const n = typeof r[key] === "number" && Number.isFinite(r[key]) ? r[key] : null;
+      out.push({ x: r.ts, y: n }); // Temperatures may be negative; don't use nonnegative power validation.
+    });
+    return out;
+  };
   if (modalChart) modalChart.destroy();
   if (window.Chart) modalChart = new Chart($("mChart"), {
     type: "line",
     data: {
-      labels, datasets: [
-        { label: t("chart.supply"), data: h.map(x => x.supply_temp), borderColor: "#56d4dd", pointRadius: 0, tension: .3 },
-        { label: t("chart.return"), data: h.map(x => x.return_temp), borderColor: "#f0883e", pointRadius: 0, tension: .3 },
-        { label: t("chart.internal"), data: h.map(x => x.internal_temp), borderColor: "#3fb950", pointRadius: 0, tension: .3 }]
+      datasets: [
+        { label: t("chart.supply"), data: series("supply_temp"), borderColor: "#56d4dd", pointRadius: 0, tension: 0 },
+        { label: t("chart.return"), data: series("return_temp"), borderColor: "#f0883e", pointRadius: 0, tension: 0 },
+        { label: t("chart.internal"), data: series("internal_temp"), borderColor: "#3fb950", pointRadius: 0, tension: 0 }]
     },
-    options: { interaction: { mode: "index", intersect: false },
-      scales: { x: { ticks: { color: "#6e7681", maxTicksLimit: 6 } }, y: { ticks: { color: "#6e7681" } } }, plugins: { legend: { labels: { color: "#adbac7" } } } }
+    options: { spanGaps: false, interaction: { mode: "nearest", axis: "x", intersect: false },
+      scales: { x: { type: "linear", ticks: { color: "#6e7681", maxTicksLimit: 6,
+        callback: ts => new Date(ts * 1000).toLocaleTimeString(uiLocale(), { hour12: false }) } }, y: { ticks: { color: "#6e7681" } } },
+      plugins: { legend: { labels: { color: "#adbac7" } }, tooltip: { callbacks: {
+        title: items => items.length ? fmtTime(items[0].parsed.x) : "" } } } }
   });
-  const faults = (c.faults || []).map(f => `<span class="fbadge ${esc(f.sev)}">${esc(containerFaultLabel(f))}</span>`).join("") || t("cbox.none_fault");
+  const faults = (c.faults || []).map(f => containerFaultBadge(f)).join("") || t(containerQuality(c) ? "quality.partial" : "cbox.none_fault");
   const pumps = Object.entries(c.pumps || {}).map(([k, v]) => `${esc(containerPumpLabel(k))}:${v ? t("cmd.open") : t("cmd.close")}`).join(" ｜ ");
   $("mInfo").innerHTML =
-    `${esc(t("cbox.detail_temps", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp), set: safeVal(c.set_temp) }))}<br>`
+    (containerQuality(c) ? AntDataQuality.note(t(c.data_stale ? "quality.stale" : "quality.partial"), true) : "")
+    + `${esc(t("cbox.detail_temps", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp), set: safeVal(c.set_temp) }))}<br>`
     + `${esc(t("cbox.detail_press", { sp: safeVal(c.supply_pressure), rp: safeVal(c.return_pressure), f: safeVal(c.flow), ti: safeVal(c.tower_inlet_temp) }))}<br>`
     + `${esc(t("cbox.detail_box", { t: safeVal(c.internal_temp), h: safeVal(c.internal_humidity), n: safeVal(c.miner_num), chip: safeVal(c.chip_max_temp) }))}<br>`
     + `${esc(t("cbox.detail_power", { total: fmtPower(boxPower(c)), p1: fmtPower(c.power1), p2: fmtPower(c.power2) }))}<br>`
@@ -757,10 +864,12 @@ async function openContainer(ip) {
 }
 
 function refreshAll() {
-  refreshSummary(); refreshAlerts(); refreshTrend(); refreshContainers();
-  if (view === "rack") refreshRacks();
-  else if (view === "worker") refreshWorkers();
-  else refreshMiners();
+  const requests = [refreshSummary(), refreshAlerts(), refreshTrend(), refreshContainers()];
+  if (view === "rack") requests.push(refreshRacks());
+  else if (view === "worker") requests.push(refreshWorkers());
+  else requests.push(refreshMiners());
+  // 会话失效时 jget 会弹登录，已发出的并行请求仍需接住各自的 rejection。
+  return Promise.allSettled(requests);
 }
 
 /* ---------------- 选择 + 远程命令 ---------------- */
@@ -920,9 +1029,11 @@ async function pollCmdProgress(onlyIfRunning) {
       _cmdPollTimer = setTimeout(pollCmdProgress, 3000);
     } else if (p.total) {
       document.title = t("doc.title");
-      let msg = t("cmd.batch_done", { ok: p.success, fail: p.failed, total: p.total });
+      let msg = p.error
+        ? `${p.error}\n${t("cmd.result", { act: p.action, ok: p.success, fail: p.failed })}`
+        : t("cmd.batch_done", { ok: p.success, fail: p.failed, total: p.total });
       if (p.fail_ips && p.fail_ips.length) msg += t("cmd.fail_ips", { ips: p.fail_ips.slice(0, 8).join(", ") });
-      toast(msg, p.failed ? "fail" : "ok");
+      toast(msg, p.failed || p.error ? "fail" : "ok");
       refreshMiners();
     }
   } catch (e) { if (!_wsStop) _cmdPollTimer = setTimeout(pollCmdProgress, 5000); }
@@ -943,7 +1054,7 @@ function toast(text, kind) {
   setTimeout(() => t.remove(), 6000);
 }
 
-/* ---------------- 设置(网段/扫描/云端上报) ---------------- */
+/* ---------------- 网段与扫描设置 ---------------- */
 async function openSeg() {
   const d = await jget("/api/segments");
   $("segText").value = (d.segments || []).join("\n");
@@ -952,89 +1063,8 @@ async function openSeg() {
   $("setInterval").value = s.scan_interval;
   if ($("setFullInterval")) $("setFullInterval").value = s.full_interval;
   $("setPps").value = s.max_pps;
-  if (s.cloud) {   // 云端上报配置(仅 admin 下发；token 不回传明文，留空保存=沿用)
-    $("cloudEnabled").checked = !!s.cloud.enabled;
-    $("cloudName").value = s.cloud.site_name || "";
-    $("cloudType").value = s.cloud.site_type || "air";
-    $("cloudUrl").value = s.cloud.url || "";
-    $("cloudToken").value = "";
-    $("cloudToken").placeholder = s.cloud.token_set
-      ? t("seg.token_saved_ph", { hint: s.cloud.token_hint || "****" }) : "ingest token";
-    $("cloudFp").value = s.cloud.tls_fingerprint || "";
-    $("cloudSiteId").textContent = s.site_id || "-";
-    cloudSiteIdOverride = "";
-  }
-  $("cloudCode").value = "";
-  $("cloudToken").type = "password";   // 每次打开都回到遮蔽态
-  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = t("seg.token_eye");
   $("segModal").classList.remove("hidden");
-  if (s.cloud) refreshCloudStatus();
 }
-
-// 云端「场地接入」生成的接入码：AMC1-<base64url(JSON {u:地址, t:token, f:证书指纹, s:场地ID})>
-let cloudSiteIdOverride = "";
-function parseConnectCode(code) {
-  const m = String(code || "").trim().match(/^AMC1-([A-Za-z0-9_-]+)$/);
-  if (!m) return null;
-  try {
-    const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
-    const d = JSON.parse(atob(b64 + "===".slice((b64.length + 3) % 4)));
-    return d && typeof d.u === "string" && typeof d.t === "string" ? d : null;
-  } catch (e) { return null; }
-}
-$("cloudCodeApply").onclick = () => {
-  const d = parseConnectCode($("cloudCode").value);
-  if (!d) { toast(t("toast.connect_bad"), "fail"); return; }
-  $("cloudUrl").value = d.u;
-  $("cloudToken").value = d.t;
-  $("cloudFp").value = d.f || "";
-  if (d.s) { cloudSiteIdOverride = d.s; $("cloudSiteId").textContent = d.s; }
-  $("cloudCode").value = "";
-  $("cloudEnabled").checked = true;
-  toast(t("toast.connect_applied"), "ok");
-};
-function cloudForm() {
-  const c = {
-    enabled: $("cloudEnabled").checked,
-    site_name: $("cloudName").value.trim(),
-    site_type: $("cloudType").value,
-    url: $("cloudUrl").value.trim(),
-    token: $("cloudToken").value.trim(),
-    tls_fingerprint: $("cloudFp").value.trim(),
-  };
-  if (cloudSiteIdOverride) c.site_id = cloudSiteIdOverride;
-  return c;
-}
-function agoText(ts) {
-  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
-  return s < 90 ? t("cloud.ago_s", { n: s }) : t("cloud.ago_m", { n: Math.round(s / 60) });
-}
-async function refreshCloudStatus() {
-  const el = $("cloudStatus");
-  try {
-    const st = await jget("/api/cloud/status");
-    el.className = "muted";
-    if (!st.enabled) { el.textContent = t("cloud.st_disabled"); return; }
-    if (st.fails && st.last_err) {
-      el.className = "res-fail";
-      el.textContent = t("cloud.st_fail", { n: st.fails, err: st.last_err });
-    } else if (st.last_ok) {
-      el.className = "res-ok";
-      el.textContent = t("cloud.st_ok", { ago: agoText(st.last_ok) });
-    } else {
-      el.textContent = st.last_err || t("cloud.st_wait");
-    }
-  } catch (e) { el.textContent = ""; }
-}
-$("cloudTest").onclick = async () => {
-  const el = $("cloudStatus");
-  el.className = "muted"; el.textContent = t("cloud.testing");
-  try {
-    const d = await jpost("/api/cloud/test", { cloud: cloudForm() });
-    el.className = d.ok ? "res-ok" : "res-fail";
-    el.textContent = d.message || d.error || "";
-  } catch (e) { el.textContent = ""; }
-};
 async function saveSeg(scan) {
   const segs = $("segText").value.split(/[\n,\s]+/).map(s => s.trim()).filter(Boolean);
   try {
@@ -1049,32 +1079,328 @@ async function saveSeg(scan) {
     const body = {
       scan_interval: num("setInterval"),
       max_pps: num("setPps"),
-      cloud: cloudForm(),
     };
     if ($("setFullInterval")) body.full_interval = num("setFullInterval");
     Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
     const d2 = await jpost("/api/settings", body);
     if (!d2.ok) { toast(t("toast.save_fail", { msg: d2.error || "" })); return; }
     $("segModal").classList.add("hidden");
-    toast(t("toast.saved_settings") + ($("cloudEnabled").checked ? t("toast.cloud_on") : ""), "ok");
+    toast(t("toast.saved_settings"), "ok");
     if (scan) { await jpost("/api/scan?kind=full", {}); toast(t("toast.full_triggered"), "ok"); setTimeout(pollProgress, 500); }
   } catch (e) {}
 }
 $("btnSeg").onclick = openSeg;
-// 上报token 默认按密码框遮住（机房里投屏/旁人围观是常态），需要核对时点👁临时显示
-if ($("cloudTokenEye")) $("cloudTokenEye").onclick = () => {
-  const el = $("cloudToken"), show = el.type === "password";
-  el.type = show ? "text" : "password";
-  $("cloudTokenEye").textContent = show ? t("seg.token_hide") : t("seg.token_eye");
-};
 $("segClose").onclick = $("segCancel").onclick = () => {
   $("segModal").classList.add("hidden");
-  const el = $("cloudToken");   // 关窗即复位成遮蔽态，别下次打开还明晃晃亮着
-  if (el) el.type = "password";
-  if ($("cloudTokenEye")) $("cloudTokenEye").textContent = t("seg.token_eye");
 };
 $("segSave").onclick = () => saveSeg(false);
 $("segSaveScan").onclick = () => saveSeg(true);
+
+/* ---------------- 独立云端连接：测试成功才保存，仅提交 cloud ---------------- */
+let cloudSiteIdOverride = "", _cloudAppliedCode = "";
+let _cloudSaved = null, _cloudSnapshot = null, _cloudStatusUnavailable = false;
+let _cloudBusy = false, _cloudTimer = null, _cloudPollEpoch = 0, _cloudOpenEpoch = 0;
+let _cloudFeedback = null, _cloudCodeHintKey = "cloud.code_hint";
+let _cloudReadingClipboard = false, _cloudAwaitingPaste = false;
+
+function cloudFeedback(key, vars = {}, kind = "muted") {
+  _cloudFeedback = key ? { key, vars, kind } : null;
+  const el = $("cloudFeedback");
+  el.className = "cloud-feedback " + (key ? kind : "hidden");
+  el.textContent = key ? t(key, vars) : "";
+}
+function renderCloudLabels() {
+  $("cloudCodeHint").textContent = t(_cloudCodeHintKey);
+  $("cloudDestination").textContent = $("cloudUrl").value.trim();
+  $("cloudDestinationRow").classList.toggle("hidden",
+    !_cloudAppliedCode || $("cloudCode").value.trim() !== _cloudAppliedCode);
+  $("cloudTokenEye").textContent = t($("cloudToken").type === "password" ? "seg.token_eye" : "seg.token_hide");
+  $("cloudToken").placeholder = _cloudSaved && _cloudSaved.token_set
+    ? t("seg.token_saved_ph", { hint: _cloudSaved.token_hint || "****" }) : "ingest token";
+  $("cloudConnect").textContent = t(_cloudBusy ? "cloud.working" : "header.cloud");
+  $("cloudPaste").textContent = t(_cloudReadingClipboard ? "cloud.reading_clipboard" : "cloud.paste_connect");
+  $("cloudPaste").disabled = _cloudBusy || _cloudReadingClipboard;
+  $("cloudSiteSummary").textContent = $("cloudName").value.trim();
+  $("cloudClose").setAttribute("aria-label", t("cloud.close"));
+  if (_cloudFeedback) cloudFeedback(_cloudFeedback.key, _cloudFeedback.vars, _cloudFeedback.kind);
+}
+function fillCloudSettings(c) {
+  _cloudSaved = { ...c };
+  $("cloudName").value = c.site_name || "";
+  $("cloudType").value = c.site_type || "air";
+  $("cloudUrl").value = c.url || "";
+  $("cloudFp").value = c.tls_fingerprint || "";
+  $("cloudSiteId").textContent = c.site_id || "-";
+  $("cloudToken").value = "";
+  $("cloudToken").type = "password";
+  $("cloudCode").value = "";
+  $("cloudSiteDetails").open = false;
+  _cloudAwaitingPaste = false;
+  $("cloudPause").classList.toggle("hidden", !c.enabled);
+  cloudSiteIdOverride = "";
+  _cloudAppliedCode = "";
+  _cloudCodeHintKey = "cloud.code_hint";
+  renderCloudLabels();
+}
+async function openCloud() {
+  if (myRole !== "admin") return;
+  const epoch = ++_cloudOpenEpoch;
+  $("cloudModal").classList.remove("hidden");
+  $("cloudClose").focus();
+  if (!_cloudBusy) {
+    cloudFeedback("cloud.loading");
+    $("cloudFields").disabled = true;
+    $("cloudConnect").disabled = true;
+    try {
+      const s = await jget("/api/settings");
+      if (epoch !== _cloudOpenEpoch) return;
+      if (!s.cloud) throw new Error("settings");
+      fillCloudSettings({ ...s.cloud, site_id: s.site_id });
+      $("cloudAdvanced").open = false;
+      cloudFeedback("");
+    } catch (e) {
+      if (epoch === _cloudOpenEpoch) cloudFeedback("cloud.load_failed", {}, "res-fail");
+    } finally {
+      if (epoch === _cloudOpenEpoch) {
+        $("cloudFields").disabled = false;
+        $("cloudConnect").disabled = false;
+        $("cloudCode").focus();
+      }
+    }
+  }
+  startCloudPolling();
+}
+function closeCloud() {
+  _cloudOpenEpoch++;
+  _cloudAwaitingPaste = false;
+  $("cloudModal").classList.add("hidden");
+  $("cloudToken").type = "password";
+  renderCloudLabels();
+  startCloudPolling();
+  $("btnCloud").focus();
+}
+function applyCloudCode(showError = false) {
+  const raw = $("cloudCode").value.trim();
+  if (!raw) {
+    _cloudAppliedCode = "";
+    _cloudCodeHintKey = "cloud.code_hint";
+    renderCloudLabels();
+    return true; // 手动配置和已保存的连接不需要接入码
+  }
+  const d = AntMonitorCloud.parseCode(raw);
+  if (!d) {
+    _cloudCodeHintKey = "cloud.code_hint";
+    if (showError) cloudFeedback(raw.startsWith("AMC1-") ? "toast.connect_bad" : "cloud.token_only", {}, "res-fail");
+    renderCloudLabels();
+    return false;
+  }
+  if (raw !== _cloudAppliedCode) {
+    $("cloudUrl").value = d.u;
+    $("cloudToken").value = d.t;
+    $("cloudFp").value = d.f;
+    $("cloudName").value = d.n || (_cloudSaved && _cloudSaved.site_name) || "";
+    $("cloudType").value = d.y || (_cloudSaved && _cloudSaved.site_type) || "air";
+    cloudSiteIdOverride = d.s;
+    $("cloudSiteId").textContent = d.s || (_cloudSaved && _cloudSaved.site_id) || "-";
+    _cloudAppliedCode = raw;
+  }
+  _cloudCodeHintKey = d.n ? "cloud.code_ready" : "cloud.code_needs_name";
+  $("cloudSiteDetails").open = !d.n;
+  renderCloudLabels();
+  return true;
+}
+function cloudForm() {
+  const c = { enabled: true, site_name: $("cloudName").value.trim(),
+    site_type: $("cloudType").value, url: $("cloudUrl").value.trim(),
+    token: $("cloudToken").value.trim(), tls_fingerprint: $("cloudFp").value.trim() };
+  if (cloudSiteIdOverride) c.site_id = cloudSiteIdOverride;
+  return c;
+}
+function cloudHasSavedToken(c) {
+  const fp = v => String(v || "").trim().toLowerCase().replace(/^sha256:/, "").replace(/[:\s]/g, "");
+  return !!(_cloudSaved && _cloudSaved.token_set
+    && c.url.replace(/\/+$/, "") === (_cloudSaved.url || "").replace(/\/+$/, "")
+    && fp(c.tls_fingerprint) === fp(_cloudSaved.tls_fingerprint));
+}
+function setCloudBusy(busy) {
+  _cloudBusy = busy;
+  $("cloudFields").disabled = busy;
+  $("cloudConnect").disabled = busy;
+  $("cloudBindingForm").setAttribute("aria-busy", String(busy));
+  renderCloudLabels();
+}
+async function connectCloud(event) {
+  event.preventDefault();
+  if (_cloudBusy || myRole !== "admin") return;
+  cloudFeedback("");
+  if (!applyCloudCode(true)) { $("cloudCode").focus(); return; }
+  const c = cloudForm(), missing = AntMonitorCloud.validate(c, cloudHasSavedToken(c));
+  if (missing) {
+    cloudFeedback("cloud.required_" + missing, {}, "res-fail");
+    if (missing === "site_name") $("cloudSiteDetails").open = true;
+    else $("cloudAdvanced").open = true;
+    $({ site_name: "cloudName", url: "cloudUrl", token: "cloudToken" }[missing]).focus();
+    return;
+  }
+  setCloudBusy(true);
+  try {
+    const saved = await AntMonitorCloud.connect(c, jpost, phase => cloudFeedback("cloud." + phase));
+    fillCloudSettings({ ...saved.cloud, site_id: saved.site_id || (saved.cloud || {}).site_id
+      || cloudSiteIdOverride || (_cloudSaved && _cloudSaved.site_id) });
+    // 丢弃保存前已经发出的状态查询，避免旧连接的成功短暂覆盖新连接。
+    _cloudSnapshot = null;
+    _cloudStatusUnavailable = false;
+    renderCloudStatus();
+    cloudFeedback("cloud.saved", {}, "res-ok");
+    startCloudPolling();
+  } catch (e) {
+    const keys = { test: "cloud.test_failed", test_network: "cloud.test_network",
+      save: "cloud.save_failed", save_network: "cloud.save_unknown" };
+    cloudFeedback(keys[e.step] || "cloud.save_unknown", { error: e.message || "" }, "res-fail");
+    startCloudPolling(); // 输入保持不动；同时显示原来已保存连接的真实状态
+  } finally { setCloudBusy(false); }
+}
+async function pasteCloudAndConnect() {
+  if (_cloudBusy || _cloudReadingClipboard || myRole !== "admin") return;
+  const epoch = _cloudOpenEpoch;
+  _cloudAwaitingPaste = false;
+  _cloudReadingClipboard = true;
+  renderCloudLabels();
+  let text;
+  try {
+    if (!navigator.clipboard || typeof navigator.clipboard.readText !== "function") throw new Error("clipboard");
+    text = await navigator.clipboard.readText();
+  } catch (e) {
+    if (epoch === _cloudOpenEpoch && !$("cloudModal").classList.contains("hidden")) {
+      _cloudAwaitingPaste = true;
+      cloudFeedback("cloud.paste_manual");
+      $("cloudCode").focus();
+      $("cloudCode").select();
+    }
+    return;
+  } finally {
+    _cloudReadingClipboard = false;
+    renderCloudLabels();
+  }
+  if (epoch !== _cloudOpenEpoch || $("cloudModal").classList.contains("hidden")) return;
+  $("cloudCode").value = String(text || "").trim();
+  if (!$("cloudCode").value) {
+    cloudFeedback("cloud.clipboard_empty", {}, "res-fail");
+    $("cloudCode").focus();
+    return;
+  }
+  await connectCloud({ preventDefault() {} });
+}
+async function pauseCloud() {
+  if (_cloudBusy || !_cloudSaved) return;
+  setCloudBusy(true);
+  cloudFeedback("cloud.saving");
+  try {
+    const c = { enabled: false, url: _cloudSaved.url, token: "",
+      site_name: _cloudSaved.site_name, site_type: _cloudSaved.site_type,
+      tls_fingerprint: _cloudSaved.tls_fingerprint, site_id: _cloudSaved.site_id };
+    const d = await jpost("/api/settings", { cloud: c });
+    if (!d.ok) { cloudFeedback("cloud.save_failed", { error: d.error || "" }, "res-fail"); return; }
+    _cloudSaved.enabled = false;
+    $("cloudPause").classList.add("hidden");
+    cloudFeedback("cloud.paused", {}, "res-ok");
+    _cloudSnapshot = null;
+  } catch (e) { cloudFeedback("cloud.save_unknown", {}, "res-fail"); }
+  finally { setCloudBusy(false); startCloudPolling(); }
+}
+function agoText(ts) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  return s < 90 ? t("cloud.ago_s", { n: s }) : t("cloud.ago_m", { n: Math.round(s / 60) });
+}
+function renderCloudStatus() {
+  const el = $("cloudStatus"), badge = $("cloudHeaderState"), st = _cloudSnapshot;
+  el.className = "muted";
+  $("btnCloud").classList.toggle("needs-connection", !!(st && !st.enabled));
+  if (_cloudStatusUnavailable || !st) {
+    el.textContent = t(_cloudStatusUnavailable ? "cloud.status_unavailable" : "cloud.loading");
+    badge.textContent = _cloudStatusUnavailable ? t("cloud.badge_unknown") : "…";
+    return;
+  }
+  if (!st.enabled) {
+    el.textContent = t("cloud.disconnected");
+    badge.textContent = t("cloud.badge_off");
+    return;
+  }
+  if (st.state === "error" || st.fails || st.running === false) {
+    el.className = "res-fail";
+    el.textContent = t("cloud.retrying", { error: st.last_err || t("cloud.worker_stopped") });
+    badge.textContent = t("cloud.badge_retry");
+  } else if (st.state === "waiting_scan") {
+    el.textContent = t("cloud.waiting_scan");
+    badge.textContent = t("cloud.badge_wait");
+  } else if (st.last_ok) {
+    el.className = "res-ok";
+    el.textContent = t("cloud.st_ok", { ago: agoText(st.last_ok) });
+    badge.textContent = t("cloud.badge_ok");
+  } else {
+    el.textContent = t("cloud.waiting_report");
+    badge.textContent = t("cloud.badge_wait");
+  }
+}
+function stopCloudPolling() {
+  _cloudPollEpoch++;
+  if (_cloudTimer) { clearTimeout(_cloudTimer); _cloudTimer = null; }
+}
+function startCloudPolling() {
+  stopCloudPolling();
+  if (myRole !== "admin" || _wsStop) return;
+  const epoch = _cloudPollEpoch;
+  async function poll() {
+    try {
+      const st = await jget("/api/cloud/status");
+      if (epoch !== _cloudPollEpoch) return;
+      if (!st.ok) throw new Error("status");
+      _cloudSnapshot = st;
+      _cloudStatusUnavailable = false;
+    } catch (e) {
+      if (epoch !== _cloudPollEpoch) return;
+      _cloudStatusUnavailable = true;
+    }
+    renderCloudStatus();
+    if (epoch === _cloudPollEpoch) {
+      _cloudTimer = setTimeout(poll, $("cloudModal").classList.contains("hidden") ? 30000 : 3000);
+    }
+  }
+  poll();
+}
+$("btnCloud").onclick = openCloud;
+$("cloudClose").onclick = $("cloudCancel").onclick = closeCloud;
+$("cloudBindingForm").onsubmit = connectCloud;
+$("cloudPaste").onclick = pasteCloudAndConnect;
+$("cloudPause").onclick = pauseCloud;
+$("cloudName").addEventListener("input", renderCloudLabels);
+$("cloudUrl").addEventListener("input", renderCloudLabels);
+$("cloudCode").addEventListener("input", () => { cloudFeedback(""); applyCloudCode(); });
+$("cloudCode").addEventListener("paste", event => {
+  // On a LAN HTTP page browsers may forbid clipboard reads. After the operator
+  // requests paste-and-connect, their explicit Ctrl+V gesture completes it.
+  if (!_cloudAwaitingPaste || _cloudBusy || !event.clipboardData) return;
+  const text = event.clipboardData.getData("text");
+  if (!text) return;
+  event.preventDefault();
+  _cloudAwaitingPaste = false;
+  $("cloudCode").value = text.trim();
+  return connectCloud({ preventDefault() {} });
+});
+$("cloudTokenEye").onclick = () => {
+  $("cloudToken").type = $("cloudToken").type === "password" ? "text" : "password";
+  renderCloudLabels();
+};
+$("cloudModal").addEventListener("keydown", e => {
+  if (e.key === "Escape") { e.preventDefault(); closeCloud(); }
+  if (e.key === "Tab") {
+    const items = [...$("cloudBindingForm").querySelectorAll("button, input, select, summary, a[href]")]
+      .filter(el => !el.matches(":disabled") && el.getClientRects().length);
+    const first = items[0], last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  }
+});
 
 /* ---------------- 顶部：零算力自动重启设置 ---------------- */
 async function loadRebootSettings() {
@@ -1207,6 +1533,7 @@ $("pwdNew2").addEventListener("keydown", e => { if (e.key === "Enter") savePwd()
 function applyRole() {
   const canCtl = myRole === "ops" || myRole === "admin";
   document.body.classList.toggle("viewer", !canCtl);
+  $("btnCloud").classList.toggle("hidden", myRole !== "admin");
   $("btnSeg").style.display = myRole === "admin" ? "" : "none";  // 网段设置仅 admin
   $("btnUpdate").style.display = myRole === "admin" ? "" : "none";  // 版本更新仅 admin
   $("btnPwd").style.display = myUser && myUser !== "anonymous" ? "" : "none";
@@ -1250,8 +1577,15 @@ function renderUpdate(d) {
   _updForce = false;
   if (!d) { b.innerHTML = `<div class="upd-err">${esc(t("upd.check_fail_net"))}</div>`; return; }
   if (d.git === false) {
+    const hint = d.windows_repair ? "upd.windows_repair" :
+      (d.reason === "git_missing" ? "upd.install_git" : "upd.need_git");
     b.innerHTML = `<div class="upd-err">${esc(d.error || t("upd.not_git"))}</div>
-      <div class="upd-note">${esc(t("upd.need_git"))}</div>`;
+      <div class="upd-note">${esc(t(hint))}</div>`;
+    if (d.windows_repair) {
+      b.innerHTML += `<div class="upd-note">${esc(t("upd.repair_docs"))}:
+        <a href="https://github.com/raphael2025/antmonitor#windows-web-update-recovery" target="_blank" rel="noopener noreferrer">GitHub</a>
+        · <a href="https://gitee.com/raphael01/antmonitor#windows-web-update-recovery" target="_blank" rel="noopener noreferrer">Gitee</a></div>`;
+    }
     return;
   }
   if (d.error) {
@@ -1374,6 +1708,9 @@ function connectWS() {
 }
 function stopDashboard() {   // 会话失效/登出：停轮询与 WS 重连，避免登录页后台空转
   _wsStop = true;
+  stopCloudPolling();
+  _cloudOpenEpoch++;
+  $("cloudModal").classList.add("hidden");
   if (_timer) { clearInterval(_timer); _timer = null; }
   if (_wsRetryTimer) { clearTimeout(_wsRetryTimer); _wsRetryTimer = null; }
   if (_ws) { const w = _ws; _ws = null; try { w.close(); } catch (e) {} }
@@ -1391,6 +1728,7 @@ function startDashboard() {
   if (!_staleTimer) _staleTimer = setInterval(checkStale, 10000);  // 失联自检，每10秒
   if (myRole === "ops" || myRole === "admin") pollCmdProgress(true);   // 刷新页面后接上在跑的分批重启
   if (myRole === "admin") {   // 新版本提示：进来查一次，之后每 30 分钟(后端有 10 分钟缓存)
+    startCloudPolling();
     checkUpdate(false);
     if (!_updTimer) _updTimer = setInterval(() => checkUpdate(false), 1800000);
   }
@@ -1463,12 +1801,18 @@ init();
     wireSelect("langSelect");
     wireSelect("langSelectLogin");
     syncSelects();
+    renderCloudLabels();
+    renderCloudStatus();
     document.addEventListener("i18n:change", () => {
       syncSelects();
+      renderCloudLabels();
+      renderCloudStatus();
       try { setVoice(voiceOn, false); } catch (e) {}
       try { updateSelCount(); } catch (e) {}
-      // 动态渲染的列表/卡片/趋势不走 data-i18n，必须整页刷新文案
-      try { if (typeof refreshAll === "function") refreshAll(); } catch (e) {}
+      // 登录页只更新控件语言，不发需要登录的请求。已登录时刷新动态内容。
+      if (!_wsStop && myUser && $("loginOverlay").classList.contains("hidden")) {
+        refreshAll().catch(() => {});
+      }
     });
   }
 })();

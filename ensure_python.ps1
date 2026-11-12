@@ -66,9 +66,19 @@ function Install-ProjectPython($RuntimeDirectory) {
     $installer = Join-Path $temporary 'python-installer.exe'
     $log = Join-Path $parent 'python-install.log'
     try {
-        Write-Host "No compatible Python 3.8-3.14 found. Downloading Python $PythonVersion from python.org..."
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $installer -TimeoutSec 120
+        $localInstaller = $env:MINER_PYTHON_INSTALLER
+        if (-not $localInstaller) {
+            $bundled = Join-Path $PSScriptRoot "offline\python-$PythonVersion$suffix.exe"
+            if (Test-Path -LiteralPath $bundled -PathType Leaf) { $localInstaller = $bundled }
+        }
+        if ($localInstaller) {
+            Write-Host 'Using the local Python installer (its publisher signature will be verified)...'
+            Copy-Item -LiteralPath $localInstaller -Destination $installer
+        } else {
+            Write-Host "No compatible Python 3.8-3.14 found. Downloading Python $PythonVersion from python.org..."
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $installer -TimeoutSec 120
+        }
         # A parent PowerShell 7 can leave its module paths in the environment;
         # Windows PowerShell 5.1 must load its own signature-checking module.
         Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1')
@@ -82,7 +92,12 @@ function Install-ProjectPython($RuntimeDirectory) {
                      'InstallLauncherAllUsers=0 PrependPath=0 Shortcuts=0 Include_test=0 ' +
                      'Include_doc=0 Include_tcltk=0 ' +
                      ('TargetDir="{0}" /log "{1}"' -f $RuntimeDirectory, $log)
-        $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $installer
+        $startInfo.Arguments = $arguments
+        $startInfo.UseShellExecute = $false
+        $process = [Diagnostics.Process]::Start($startInfo)
+        $process.WaitForExit()
         if ($process.ExitCode -notin @(0, 3010)) {
             throw "Python installation failed (code $($process.ExitCode)). Installer log: $log"
         }
@@ -117,7 +132,7 @@ try {
     exit $LASTEXITCODE
 } catch {
     Write-Host "AntMonitor could not start: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host 'Check internet access and the errors above, then double-click run.bat again.'
+    Write-Host 'Check internet access and the errors above, then double-click run.bat again. A local signed Python installer can be supplied with MINER_PYTHON_INSTALLER; dependency wheels can be supplied in offline\wheels.'
     if (-not $env:MINER_NO_PAUSE -and -not [Console]::IsInputRedirected) {
         Read-Host 'Press Enter to close' | Out-Null
     }

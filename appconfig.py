@@ -73,9 +73,8 @@ DEFAULTS = {
         "container_interval": 10,
     },
     "alerts": {
-        "enabled": True, "cooldown": 1800, "zero_grace_sec": 600, "reject_pct": 5.0,
+        "enabled": True, "cooldown": 1800, "zero_grace_sec": 600,
         "push_recovery": True,          # 掉线/整段掉线/高温/矿池篡改/集装箱故障恢复时推送
-        "reject_min_shares": 50,        # 拒绝率至少按这么多份额的增量判断(防样本太少误报)
         "segment_down_ratio": 0.6, "segment_down_min": 5,
         "low_hashrate_ratio": 0.7,      # 低于同型号中位数的此比例 → 掉算力告警；0=关
         "low_hashrate_rounds": 2,       # 需连续 N 轮成立才报(防单轮读数抖动)
@@ -281,8 +280,6 @@ def _validate(cfg):
     clamp("alerts", "unresponsive_rounds", 1, 1000, int)
     clamp("alerts", "container_offline_rounds", 1, 100, int)
     clamp("scan", "reconfirm_delay_sec", 0, 300)
-    clamp("alerts", "reject_pct", 0, 100)
-    clamp("alerts", "reject_min_shares", 1, 1000000, int)
     clamp("alerts", "zero_grace_sec", 0, 86400, int)
     clamp("alerts", "container_pressure_hold_sec", 0, 3600, int)
     clamp("alerts", "container_pressure_clear_sec", 0, 3600, int)
@@ -478,6 +475,7 @@ SETTINGS_FILE = _file_from_env("MINER_SETTINGS", "settings.json")
 # 整段覆盖掉(lost update)且无人知晓。用 update_settings() 才能真正避免。
 # 用 RLock 是因为 update_settings() 在持锁状态下会再调用 load_settings()。
 _SETTINGS_LOCK = threading.RLock()
+_SETTINGS_SEEN = set()
 
 
 class SettingsError(RuntimeError):
@@ -486,24 +484,29 @@ class SettingsError(RuntimeError):
 
 
 def _read_settings():
-    if not os.path.exists(SETTINGS_FILE):
-        return {}
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
+    except FileNotFoundError as e:
+        if not os.path.lexists(SETTINGS_FILE) and os.path.abspath(SETTINGS_FILE) not in _SETTINGS_SEEN:
+            return {}
+        raise SettingsError("已有 settings.json 丢失或链接失效，已停止使用默认设置") from e
     except (OSError, ValueError) as e:
+        _SETTINGS_SEEN.add(os.path.abspath(SETTINGS_FILE))
         raise SettingsError(f"settings.json 读取失败({e})：常见原因是用 sudo/root 改过它、"
                             f"服务账号读不了，改回属主后重试") from e
-    return d if isinstance(d, dict) else {}
+    if not isinstance(d, dict):
+        _SETTINGS_SEEN.add(os.path.abspath(SETTINGS_FILE))
+        raise SettingsError("settings.json 根节点必须是对象，已保留原文件")
+    if "cloud" in d and not isinstance(d["cloud"], dict):
+        raise SettingsError("settings.json 的 cloud 必须是对象，已保留原文件")
+    _SETTINGS_SEEN.add(os.path.abspath(SETTINGS_FILE))
+    return d
 
 
 def load_settings():
     with _SETTINGS_LOCK:
-        try:
-            return _read_settings()
-        except SettingsError as e:
-            log.warning("%s；本次按空设置处理", e)
-            return {}
+        return _read_settings()
 
 
 def save_settings(s):
@@ -513,7 +516,11 @@ def save_settings(s):
     没有互斥，并发保存仍可能丢更新。这种场景请改用 update_settings()。
     """
     with _SETTINGS_LOCK:
+        _read_settings()  # 禁止完整保存路径绕过损坏/丢失配置检查。
+        if not isinstance(s, dict):
+            raise SettingsError("settings.json 根节点必须是对象")
         _atomic_json(SETTINGS_FILE, s)
+        _SETTINGS_SEEN.add(os.path.abspath(SETTINGS_FILE))
 
 
 def update_settings(patch):
@@ -525,6 +532,7 @@ def update_settings(patch):
     with _SETTINGS_LOCK:
         merged = {**_read_settings(), **(patch or {})}   # 读失败直接抛错，不覆盖原文件
         _atomic_json(SETTINGS_FILE, merged)
+        _SETTINGS_SEEN.add(os.path.abspath(SETTINGS_FILE))
         return merged
 
 
@@ -538,6 +546,8 @@ def _atomic_json(path, data):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     except BaseException:
         try:

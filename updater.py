@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""git 检测/更新器（云端与场地端同一份文件，自我更新自己所在目录的仓库）。
+"""场地端 Git 更新器：候选检查、配置保护、已有库迁移预演与依赖环境回退。
 
 - check():  git fetch 后对比本地/远端，返回落后多少个提交 + 更新内容
 - apply():  仅快进合并(ff-only) → 自检(全部 *.py 编译 + 子进程 import server)，
@@ -13,6 +13,8 @@
 约定：
 - 部署机以 git clone 方式部署，config.yaml/数据库等本机文件已被 .gitignore 排除，
   更新永远不会碰配置和数据。
+- 官方 GitHub/Gitee 仓库的网页更新走匿名 HTTPS（SSH deploy key 不是必需的）；
+  一端不可达时自动试另一端。自定义/私有 origin 仍用原凭证。
 - 生产建议跟踪专用 release 分支(update.branch)，开发分支随便推不影响线上。
 - Docker 部署不用本更新器（重建镜像），见 docs/DEPLOY.md。
 """
@@ -43,6 +45,16 @@ HEALTHY_AFTER_SEC = 60
 # 轻则 index.lock 报错，重则一个线程正在 reset --hard 回滚、另一个线程正在编译/导入
 # 同一份工作区(TOCTOU)，自检结果不可信。取不到锁就直接拒绝，绝不排队等待。
 _apply_lock = threading.Lock()
+
+
+def is_applying():
+    """包含已安排重启的阶段。重启命令须在持有自己的共享锁时检查此状态。
+
+    apply 先持更新锁，再由 BUSY_CHECK 检查重启锁；新重启先持重启锁，再检查这里。
+    两个方向一起约束，避免更新通过一次忙碌检查后又插入新的分批重启任务。
+    """
+    return _apply_lock.locked()
+
 
 # 由 server 注册：返回非空字符串 = 现在不宜更新(例如分批重启正在执行)，本次更新推迟。
 # 更新会重启进程，分批重启跑到一半被打断，后面几批就不执行了
@@ -95,11 +107,14 @@ def _restart():
         os._exit(42)
     try:
         env = dict(os.environ, MINER_NO_BROWSER="1", MINER_WAIT_PORT_FREE="1")
-        subprocess.Popen([sys.executable, os.path.join(BASE, "server.py")],
+        subprocess.Popen([runtime_python(), os.path.join(BASE, "server.py")],
                          cwd=os.getcwd(), env=env)
     except Exception as e:  # noqa: BLE001
         # 拉不起新进程就别退出：新代码已在磁盘上，旧进程继续服务，人工重启即可生效
         log.error("自动重启失败(新版本已就位，请手动重启服务生效): %s", e)
+        lock = globals().pop("_restart_file_lock", None)
+        if lock:
+            lock.close()
         try:   # apply 为"即将退出"保留了更新锁；不退出就得放掉，否则之后每次更新都被拒
             _apply_lock.release()
         except RuntimeError:
@@ -121,19 +136,25 @@ def _load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             st = json.load(f)
-        return st if isinstance(st, dict) else {}
-    except (OSError, ValueError):
+        if not isinstance(st, dict):
+            raise RuntimeError("更新恢复状态格式异常，请先恢复原文件")
+        return st
+    except FileNotFoundError:
         return {}
 
 
 def _save_state(st):
+    fd, tmp = tempfile.mkstemp(prefix=".update-state-", suffix=".tmp",
+                               dir=os.path.dirname(STATE_FILE))
     try:
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(st, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, STATE_FILE)
-    except OSError as e:
-        log.warning("写更新状态失败: %s", e)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def _mark_bad(sha):
@@ -143,23 +164,25 @@ def _mark_bad(sha):
     _save_state(st)
 
 
-def _set_pending(prev, to, branch=""):
+def _set_pending(prev, to, branch="", database_backup=None):
     st = _load_state()
     st["pending"] = {"prev": prev, "to": to, "branch": branch, "attempts": 0,
-                     "ts": int(time.time())}
+                     "ts": int(time.time()), "database_backup": database_backup}
     _save_state(st)
 
 
 def _rollback(prev, branch=""):
     """回到更新前：先切回更新前所在的分支(dev → main 迁移失败时要回到 dev)，再 reset 到原提交。"""
+    if _git("status", "--porcelain", "--untracked-files=normal"):
+        raise RuntimeError("工作区有现场改动，已停止自动回滚")
     if branch:
         try:
             cur = _git("rev-parse", "--abbrev-ref", "HEAD")
         except Exception:  # noqa: BLE001
             cur = ""
         if cur != branch:
-            _git("checkout", "-f", branch)
-    _git("reset", "--hard", prev)
+            _git("checkout", branch)
+    _git("reset", "--keep", prev)
 
 
 def boot_guard():
@@ -173,6 +196,15 @@ def boot_guard():
     p = st.get("pending")
     if not isinstance(p, dict) or not p.get("prev"):
         return
+    current = _git("rev-parse", "HEAD")
+    if current == p["prev"]:
+        if p.get("previous_python"):
+            st["active_python"] = p["previous_python"]
+        st.pop("pending", None)  # 更新准备完成，但代码尚未切换就中断。
+        _save_state(st)
+        return
+    if current != p.get("to"):
+        raise RuntimeError("更新后 HEAD 已被其它操作改变，保留现场并停止自动回退")
     p["attempts"] = int(p.get("attempts", 0)) + 1
     if p["attempts"] <= MAX_BOOT_ATTEMPTS:
         _save_state(st)
@@ -187,18 +219,23 @@ def boot_guard():
     try:
         _rollback(p["prev"], p.get("branch") or "")
     except Exception as e:  # noqa: BLE001
-        log.error("自动回滚失败，需要人工处理: git reset --hard %s (%s)", p["prev"], e)
+        log.error("自动回滚失败，需要人工处理: git reset --keep %s (%s)", p["prev"], e)
         return
     st.pop("pending", None)
+    if p.get("previous_python"):
+        st["active_python"] = p["previous_python"]
     _save_state(st)
     if p.get("to"):
         _mark_bad(p["to"])
     _restart()
 
 
-def mark_healthy():
+def mark_healthy(expected_sha=None):
     """新版本稳定运行 HEALTHY_AFTER_SEC 秒后调用：更新确认成功，清掉 pending。"""
     st = _load_state()
+    if expected_sha and ((st.get("pending") or {}).get("to") != expected_sha or
+                         _git("rev-parse", "HEAD") != expected_sha):
+        return
     if st.pop("pending", None) is not None:
         _save_state(st)
         log.info("新版本已稳定运行，更新确认完成")
@@ -228,17 +265,145 @@ def _can_leave_legacy():
         return False
 
 
+GITHUB_HTTPS = "https://github.com/raphael2025/antmonitor.git"
+GITEE_HTTPS = "https://gitee.com/raphael01/antmonitor.git"
+
+
+def _normalize_public_update_remote(url):
+    """Official public mirrors must never require an SSH key for read-only updates."""
+    raw = str(url or "").strip()
+    comparable = raw.rstrip("/")
+    if comparable.endswith(".git"):
+        comparable = comparable[:-4]
+
+    # Standard official URLs.
+    official = {
+        "https://github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "http://github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "git@github.com:raphael2025/antmonitor": GITHUB_HTTPS,
+        "ssh://git@github.com/raphael2025/antmonitor": GITHUB_HTTPS,
+        "https://gitee.com/raphael01/antmonitor": GITEE_HTTPS,
+        "http://gitee.com/raphael01/antmonitor": GITEE_HTTPS,
+        "git@gitee.com:raphael01/antmonitor": GITEE_HTTPS,
+        "ssh://git@gitee.com/raphael01/antmonitor": GITEE_HTTPS,
+    }
+    if comparable in official:
+        return official[comparable]
+
+    # Historical deployments used SSH Host aliases such as
+    # github.com-miner-monitor. They still point at the same public project but
+    # fail as soon as the corresponding deploy key disappears.
+    if comparable.startswith("git@github.com-") and comparable.endswith(
+            ":raphael2025/antmonitor"):
+        return GITHUB_HTTPS
+    if comparable.startswith("ssh://git@github.com-") and comparable.endswith(
+            "/raphael2025/antmonitor"):
+        return GITHUB_HTTPS
+    if comparable.startswith("git@gitee.com-") and comparable.endswith(
+            ":raphael01/antmonitor"):
+        return GITEE_HTTPS
+    if comparable.startswith("ssh://git@gitee.com-") and comparable.endswith(
+            "/raphael01/antmonitor"):
+        return GITEE_HTTPS
+    return raw
+
+
+def ensure_public_update_remote():
+    """Rewrite official SSH remotes to anonymous HTTPS.
+
+    Must run before fetch so:
+      1) this process can update without a deploy key;
+      2) after one successful heal, even an *old* updater that only runs
+         `git fetch origin` can pull the next release (old → new handoff).
+    Custom/private remotes are left untouched.
+    Returns the HTTPS URL when an official remote was healed/confirmed, else "".
+    """
+    try:
+        origin = _git("remote", "get-url", "origin", timeout=15)
+    except Exception:  # noqa: BLE001
+        return ""
+    normalized = _normalize_public_update_remote(origin)
+    if normalized not in (GITHUB_HTTPS, GITEE_HTTPS):
+        return ""
+    if origin != normalized:
+        try:
+            _git("remote", "set-url", "origin", normalized, timeout=15)
+            log.info("官方仓库 origin 已改为匿名 HTTPS，网页更新不再依赖 SSH key")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("改写 origin 为 HTTPS 失败(不影响尝试其它更新源): %s", exc)
+            return normalized
+    # Belt-and-suspenders: if anything still passes an old SSH URL to git,
+    # rewrite it to the same HTTPS endpoint (helps mixed tooling / old scripts).
+    for ssh_prefix in (
+        "git@github.com:raphael2025/antmonitor",
+        "git@github.com:raphael2025/antmonitor.git",
+        "ssh://git@github.com/raphael2025/antmonitor",
+        "ssh://git@github.com/raphael2025/antmonitor.git",
+        "git@gitee.com:raphael01/antmonitor",
+        "git@gitee.com:raphael01/antmonitor.git",
+        "ssh://git@gitee.com/raphael01/antmonitor",
+        "ssh://git@gitee.com/raphael01/antmonitor.git",
+    ):
+        target = GITHUB_HTTPS if "github.com" in ssh_prefix else GITEE_HTTPS
+        try:
+            _git("config", f"url.{target}.insteadOf", ssh_prefix, timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+    # Host-alias forms used by historical Ubuntu deploy keys.
+    if normalized == GITHUB_HTTPS:
+        try:
+            _git("config", f"url.{GITHUB_HTTPS}.insteadOf",
+                 "git@github.com-miner-monitor:raphael2025/antmonitor.git", timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+    return normalized
+
+
+def _update_fetch_sources():
+    """Prefer healed `origin` (old-updater compatible), then the other public mirror."""
+    ensure_public_update_remote()
+    try:
+        origin = _git("remote", "get-url", "origin", timeout=15)
+    except Exception:  # noqa: BLE001
+        origin = ""
+    normalized = _normalize_public_update_remote(origin)
+    if normalized == GITHUB_HTTPS:
+        # origin first: after ensure(), this is anonymous HTTPS and matches what
+        # legacy updater.py did (`git fetch origin`).
+        return ["origin", GITEE_HTTPS]
+    if normalized == GITEE_HTTPS:
+        return ["origin", GITHUB_HTTPS]
+    return ["origin"]
+
+
+def _fetch_update_refs():
+    errors = []
+    # Match the normal origin refspec behavior because legacy dev -> main
+    # migration needs origin/main to be available after the fetch.
+    refspec = "+refs/heads/*:refs/remotes/origin/*"
+    for source in _update_fetch_sources():
+        try:
+            _git("fetch", "--quiet", source, refspec, timeout=120)
+            return
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{source}: {str(exc)[-500:]}")
+    raise RuntimeError("公开更新源均不可达: " + " | ".join(errors)[-1200:])
+
+
 def check(branch=None):
     """返回 {git, branch, local, remote, behind, changes[], checked_ts} 或 {git:False/error}。"""
     try:
         _git("rev-parse", "--git-dir", timeout=15)
     except FileNotFoundError:
-        return {"git": False, "error": "找不到 git 命令：请安装 Git 并确认它在系统 PATH 里"
-                                      "(以服务方式运行时要装成所有用户可用)"}
+        return {"git": False, "reason": "git_missing", "windows_repair": os.name == "nt",
+                "error": "当前运行账号找不到 git 命令，网页更新暂不可用；监控可继续运行。"}
     except Exception as e:  # noqa: BLE001
         # 不一定是"不是仓库"：服务账号与 clone 账号不同会报 dubious ownership 等
-        return {"git": False, "error": f"git 无法读取本目录: {str(e)[:200]}"}
+        return {"git": False, "reason": "repository_unavailable",
+                "windows_repair": os.name == "nt",
+                "error": f"git 无法读取本目录: {str(e)[:200]}"}
     try:
+        ensure_public_update_remote()
         cur = _git("rev-parse", "--abbrev-ref", "HEAD")
         if branch and cur != "HEAD" and cur != branch:
             return {"git": True, "error": f"配置跟踪分支 {branch}，但本地当前在 {cur} 分支；"
@@ -248,7 +413,7 @@ def check(branch=None):
         if branch == "HEAD":   # detached HEAD(按 tag/提交部署)：别悄悄跟到远端默认分支
             return {"git": True, "error": "当前不在任何分支上(detached HEAD)，"
                                           "请在 config.yaml 配置 update.branch 或先 git checkout 分支"}
-        _git("fetch", "--quiet", "origin", timeout=120)
+        _fetch_update_refs()
         switch_from = ""
         if legacy and _can_leave_legacy():
             # 旧版 install.sh 默认装在 dev 分支，dev 早已不再更新：这些现场按当前分支跟踪
@@ -268,7 +433,7 @@ def check(branch=None):
         return {"git": True, "error": str(e)[:300]}
 
 
-def _import_check():
+def _import_check(directory=None, interpreter=None):
     """子进程真正 import 一遍主入口 server，返回 "" 通过 / 失败原因字符串。
 
     为什么必须是子进程而不是 importlib.import_module：
@@ -283,7 +448,9 @@ def _import_check():
     数据库、生产日志和真实设备。server 顶层没有 uvicorn.run/端口绑定(启动代码都在
     if __name__ == "__main__" 里)，单纯 import 不会把 HTTP 服务跑起来。
     """
-    if not os.path.exists(os.path.join(BASE, "server.py")):
+    directory = directory or BASE
+    interpreter = interpreter or sys.executable
+    if not os.path.exists(os.path.join(directory, "server.py")):
         return ""      # 云端等没有 server.py 的部署：跳过，只保留编译自检，别误报
     tmp = tempfile.mkdtemp(prefix="update-selfcheck-")
     try:
@@ -293,8 +460,11 @@ def _import_check():
             f.write('db:\n  path: ":memory:"\n'
                     'schedule:\n  enabled: false\n'
                     f'logging:\n  file: "{log_path}"\n  level: "ERROR"\n')
-        env = dict(os.environ, MINER_CONFIG=cfg_path, PYTHONIOENCODING="utf-8")
-        r = subprocess.run([sys.executable, "-c", "import server"], cwd=BASE, env=env,
+        env = dict(os.environ, MINER_CONFIG=cfg_path, MINER_SETTINGS=os.path.join(tmp, "settings.json"),
+                   MINER_SEGMENTS=os.path.join(tmp, "segments.json"), PYTHONIOENCODING="utf-8")
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+        r = subprocess.run([interpreter, "-c", "import server"], cwd=directory, env=env,
                            capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=SELFCHECK_TIMEOUT)
         if r.returncode != 0:
@@ -327,29 +497,84 @@ def _selfcheck():
     return _import_check()
 
 
-def _install_requirements(prev):
-    """requirements.txt 在 prev..HEAD 之间有变化时，用当前解释器(项目 venv)装依赖。
-    装失败只记日志：已装的旧依赖可能够用，由随后的自检(子进程 import server)最终判断。"""
-    req = os.path.join(BASE, "requirements.txt")
+def runtime_python():
+    state = _load_state()
+    interpreter = state.get("active_python") or sys.executable
+    pending = state.get("pending") or {}
+    if pending.get("python") and _git("rev-parse", "HEAD") == pending.get("to"):
+        interpreter = pending["python"]  # 切换代码后、保存 active_python 前断电也能恢复。
+    if not os.path.isfile(interpreter):
+        raise RuntimeError("更新运行环境不存在，请恢复原环境: " + interpreter)
+    return interpreter
+
+
+def select_runtime():
+    """Re-exec before third-party imports; existing systemd/NSSM entries stay valid."""
+    interpreter = runtime_python()
+    if os.path.abspath(interpreter) != os.path.abspath(sys.executable):
+        os.execv(interpreter, [interpreter, os.path.join(BASE, "server.py"), *sys.argv[1:]])
+
+
+def _prepare_python(candidate, target):
+    """Dependency changes never pip-install into the running environment."""
+    parent = os.path.abspath(os.path.join(BASE, _git("rev-parse", "--git-path", "update-envs")))
+    os.makedirs(parent, exist_ok=True)
+    environment = tempfile.mkdtemp(prefix=target[:12] + "-", dir=parent)
+    interpreter = os.path.join(environment, "Scripts" if os.name == "nt" else "bin",
+                               "python.exe" if os.name == "nt" else "python")
     try:
-        if not os.path.exists(req) or not _git("diff", "--name-only", prev, "HEAD",
-                                               "--", "requirements.txt"):
-            return
-    except Exception as e:  # noqa: BLE001
-        log.warning("无法判断依赖是否变化: %s", e)
-        return
-    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "-r", req]
-    if os.name == "nt":   # 与 windows_launcher 一致：Windows 上只装预编译包，避免现场编译
-        cmd.insert(-2, "--only-binary=:all:")
-    log.info("依赖有变化，安装中: %s", " ".join(cmd[3:]))
-    try:
-        r = subprocess.run(cmd, cwd=BASE, capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=PIP_TIMEOUT)
-        if r.returncode:
-            log.warning("依赖安装失败(退出码 %d): %s", r.returncode,
-                        ((r.stderr or "") + (r.stdout or "")).strip()[-500:])
-    except Exception as e:  # noqa: BLE001
-        log.warning("依赖安装失败: %s", e)
+        env = dict(os.environ)
+        env.pop("PYTHONPATH", None)
+        env.pop("PYTHONHOME", None)
+        subprocess.run([sys.executable, "-m", "venv", environment], env=env,
+                       capture_output=True, check=True, timeout=120)
+        wheels = os.environ.get("ANTMONITOR_WHEELHOUSE")
+        if not wheels and os.path.isdir(os.path.join(BASE, "offline", "wheels")):
+            wheels = os.path.join(BASE, "offline", "wheels")
+        options = []
+        if wheels:
+            wheels = os.path.abspath(os.path.join(BASE, wheels))
+            if not os.path.isdir(wheels):
+                raise RuntimeError("离线依赖目录不存在")
+            options = ["--no-index", "--find-links", wheels]
+        if os.name == "nt":
+            options.append("--only-binary=:all:")
+        subprocess.run([interpreter, "-m", "pip", "install", "--disable-pip-version-check",
+                        *options, "-r", os.path.join(candidate, "requirements.txt")],
+                       env=env, capture_output=True, check=True, timeout=PIP_TIMEOUT)
+        return interpreter
+    except BaseException:
+        shutil.rmtree(environment, ignore_errors=True)
+        raise
+
+
+def _validate_release(target):
+    import update_guard
+    update_guard.validate_target(BASE, target)
+    with tempfile.TemporaryDirectory(prefix="antmonitor-candidate-") as candidate:
+        update_guard.export_candidate(BASE, target, candidate)
+        previous_python = runtime_python()
+        interpreter = previous_python
+        changed = _git("diff", "--name-only", "HEAD", target, "--", "requirements.txt")
+        try:
+            if changed:
+                interpreter = _prepare_python(candidate, target)
+            for directory, _subdirs, files in os.walk(candidate):
+                for filename in files:
+                    if filename.endswith(".py"):
+                        py_compile.compile(os.path.join(directory, filename), doraise=True)
+            error = _import_check(candidate, interpreter)
+            if error:
+                raise RuntimeError(error)
+            recovery = _git("rev-parse", "--git-path", "update-backups")
+            backup = update_guard.database_preflight(BASE, candidate, interpreter, "local",
+                         os.path.abspath(os.path.join(BASE, recovery)))
+            return {"database_backup": backup, "python": interpreter,
+                    "previous_python": previous_python}
+        except BaseException:
+            if interpreter != previous_python:
+                shutil.rmtree(os.path.dirname(os.path.dirname(interpreter)), ignore_errors=True)
+            raise
 
 
 def apply(branch=None, restart=True, force=False):
@@ -359,19 +584,44 @@ def apply(branch=None, restart=True, force=False):
     if not _apply_lock.acquire(blocking=False):
         return {"ok": False, "msg": "已有更新任务正在执行，请稍后重试"}
     release = True
+    file_lock = None
     try:
+        file_lock = open(STATE_FILE + ".lock", "a+b")
+        if os.name == "nt":
+            import msvcrt
+            file_lock.seek(0)
+            if not file_lock.read(1):
+                file_lock.write(b"0")
+                file_lock.flush()
+            file_lock.seek(0)
+            msvcrt.locking(file_lock.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(file_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         r = _apply(branch, restart, force)
         # 已排定退出(1.5秒后 os._exit)：这段窗口期继续持锁，挡住"进程正要死"时
         # 又开一次 git 操作把仓库停在半路的情况。进程退出后锁自然随进程消失。
         release = not r.get("restarting")
         return r
+    except Exception as exc:
+        return {"ok": False, "msg": "更新已停止，保留现场与恢复状态: %s" % exc}
     finally:
         if release:
+            if file_lock:
+                file_lock.close()
             _apply_lock.release()
+        else:
+            globals()["_restart_file_lock"] = file_lock
 
 
 def _apply(branch=None, restart=True, force=False):
     """更新到远端最新：ff-only 合并 → 自检(失败回滚) → 退出进程交给守护重启。"""
+    pending = _load_state().get("pending")
+    if pending:
+        ready = (_git("rev-parse", "HEAD") == pending.get("to") and
+                 not _git("status", "--porcelain", "--untracked-files=normal"))
+        return {"ok": False, "pending": ready,
+                "msg": "已有更新等待重启健康确认，请先重启服务"}
     try:
         dirty = _git("status", "--porcelain", "--untracked-files=normal", timeout=15)
     except Exception as e:
@@ -383,7 +633,8 @@ def _apply(branch=None, restart=True, force=False):
         return {"ok": False, "msg": f"{busy}，本次更新推迟，稍后再试"}
     st = check(branch)
     if st.get("error") or not st.get("behind"):
-        return {"ok": False, "msg": st.get("error") or "已是最新版本", "check": st}
+        return {"ok": False, "unchanged": not bool(st.get("error")),
+                "msg": st.get("error") or "已是最新版本", "check": st}
     if st.get("known_bad") and force:   # 人工重试：先把它从坏版本记录里拿掉
         s2 = _load_state()
         s2["bad"] = [b for b in s2.get("bad", []) if b != st.get("remote_full")]
@@ -394,34 +645,68 @@ def _apply(branch=None, restart=True, force=False):
     prev = _git("rev-parse", "HEAD")
     prev_branch = st.get("switch_from") or st["branch"]
     try:
+        validation = _validate_release(st["remote_full"])
+        backup = (validation or {}).get("database_backup")
+    except Exception as exc:
+        return {"ok": False, "msg": "更新前保护检查失败，代码/配置/数据库未改变: %s" % exc}
+    if _git("rev-parse", "HEAD") != prev or _git("status", "--porcelain", "--untracked-files=normal"):
+        return {"ok": False, "msg": "检查期间工作区发生变化，已停止更新并保留现场"}
+    _set_pending(prev, st["remote_full"], prev_branch, backup)
+    if validation:
+        saved = _load_state()
+        saved["pending"].update(validation)
+        _save_state(saved)
+    if backup:
+        try:
+            import update_guard
+            recovery = _git("rev-parse", "--git-path", "update-backups")
+            backup_dir = os.path.abspath(os.path.join(BASE, recovery))
+            update_guard.prune_database_backups(backup_dir, keep=10, protected=[backup])
+        except Exception as exc:
+            log.warning("清理旧更新恢复点失败(保留全部备份，不影响本次更新): %s", exc)
+    try:
         if st.get("switch_from"):   # 旧现场从 dev 改跟 main：dev 分支原样留着，回滚时切回去
-            _git("checkout", "-B", st["branch"], "--track", f"origin/{st['branch']}")
+            _git("checkout", "-B", st["branch"], st["remote_full"])
+            _git("branch", "--set-upstream-to", f"origin/{st['branch']}", st["branch"])
             log.info("更新分支 %s → %s", st["switch_from"], st["branch"])
         else:
-            _git("merge", "--ff-only", f"origin/{st['branch']}")
+            _git("merge", "--ff-only", st["remote_full"])
     except Exception as e:
+        if _git("rev-parse", "HEAD") == prev:
+            saved = _load_state()
+            saved.pop("pending", None)
+            _save_state(saved)
         return {"ok": False, "msg": f"合并失败(本地有改动或分叉?): {e}"}
-    _install_requirements(prev)   # 新版本加了依赖：先装上，否则自检 import 必然失败、永远更新不上去
-    err = _selfcheck()   # 自检不过就立刻回滚，绝不带病重启
+    try:
+        err = "" if validation else _selfcheck()
+    except Exception as exc:
+        err = str(exc)
     if err:
         _mark_bad(st.get("remote_full") or "")
         for attempt in (1, 2):
             try:
                 _rollback(prev, prev_branch)
+                saved = _load_state()
+                saved.pop("pending", None)
+                _save_state(saved)
                 break
             except Exception as e:  # noqa: BLE001 - 文件被占用/index.lock 时再试一次
                 if attempt == 2:
                     log.error("新代码自检失败且回滚失败，磁盘上是坏版本，下次重启会加载它！"
-                              "请人工执行 git reset --hard %s (%s)", prev, e)
+                              "请人工执行 git reset --keep %s (%s)", prev, e)
                     return {"ok": False, "msg": f"新代码自检失败，且回滚失败(需人工执行 git reset "
-                                                f"--hard {prev[:10]}): {e}"[:300]}
+                                                f"--keep {prev[:10]}): {e}"[:300]}
                 time.sleep(2)
         return {"ok": False, "msg": f"新代码自检失败，已回滚到 {prev[:10]}: {err}"[:300]}
     new = _git("rev-parse", "HEAD")
+    if validation:
+        saved = _load_state()
+        saved["active_python"] = validation["python"]
+        _save_state(saved)
     if restart:
-        _set_pending(prev, new, prev_branch)     # 新版本若一启动就崩，boot_guard 会自动回滚
         threading.Timer(1.5, _restart).start()   # 等响应发出去再退
     return {"ok": True, "from": prev[:10], "to": new[:10],
+            "database_backup": backup,
             "changes": st.get("changes"), "restarting": restart,
             "restart_mode": restart_mode() if restart else ""}
 

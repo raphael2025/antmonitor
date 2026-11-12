@@ -4,7 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title data-i18n="doc.title">矿机监控面板</title>
+  <script src="/web/theme.js" data-storage-key="antmonitor_theme"></script>
   <link rel="stylesheet" href="/web/style.css">
+  <link rel="stylesheet" href="/web/theme.css">
   <!-- Chart.js 本地托管：矿场监控机常无外网/CDN，CDN 失败时 window.Chart 缺失导致趋势图空白 -->
   <script src="/web/vendor/chart.umd.min.js"></script>
   <script src="/web/i18n/i18n.js"></script>
@@ -30,6 +32,9 @@
           <option value="ar">العربية</option>
         </select>
       </div>
+      <div class="theme-row"><label class="theme-label" for="themeSelectLogin">界面主题</label>
+        <select id="themeSelectLogin" class="theme-select" aria-label="界面主题"><option value="system">跟随系统</option><option value="time">按时间自动</option><option value="light">日间</option><option value="dark">夜间</option></select>
+      </div>
       <h2 data-i18n="login.h2">⛏ 矿机监控 · 登录</h2>
       <input id="loginUser" data-i18n-placeholder="login.user_ph" placeholder="用户名" autocomplete="username">
       <input id="loginPass" type="password" data-i18n-placeholder="login.pass_ph" placeholder="密码" autocomplete="current-password">
@@ -49,6 +54,7 @@
         <option value="de">Deutsch</option>
         <option value="ar">العربية</option>
       </select>
+      <select id="themeSelect" class="theme-select" aria-label="界面主题"><option value="system">跟随系统</option><option value="time">按时间自动</option><option value="light">日间</option><option value="dark">夜间</option></select>
       <span id="lastScan" class="muted" data-i18n="header.last_scan_none">尚未扫描</span>
       <span id="userBadge" class="badge" data-i18n-title="header.role_title" title="当前角色"></span>
       <span id="rebootBar" class="reboot-bar" data-i18n-title="header.reboot_bar_title"
@@ -63,6 +69,7 @@
       <button id="btnVoice" data-i18n="header.voice_off" data-i18n-title="header.voice_title" title="掉线/告警语音播报">🔇 语音告警: 关</button>
       <button id="btnTestVoice" data-i18n="header.test_voice" data-i18n-title="header.test_voice_title" title="测试语音播报">🔉 测试</button>
       <button id="btnUpdate" data-i18n="header.update" data-i18n-title="header.update_title" title="检查 / 更新程序版本（仅 admin）">⬆ 版本</button>
+      <button id="btnCloud" class="cloud-entry hidden" type="button"><span data-i18n="header.cloud">☁ 连接云端</span><span id="cloudHeaderState" class="cloud-badge"></span></button>
       <button id="btnSeg" data-i18n="header.seg" data-i18n-title="header.seg_title" title="网段设置">⚙ 网段</button>
       <button id="btnQuick" data-i18n="header.quick">快巡检</button>
       <button id="btnFull" class="primary" data-i18n="header.full">全网扫描</button>
@@ -71,7 +78,7 @@
 
   <div id="segModal" class="modal hidden">
     <div class="modal-box">
-      <div class="modal-head"><span data-i18n="seg.title">⚙ 设置（网段 / 扫描 / 云端上报）</span><button id="segClose">×</button></div>
+      <div class="modal-head"><span data-i18n="seg.title">⚙ 网段与扫描设置</span><button id="segClose">×</button></div>
       <div id="segBody">
         <div class="muted" data-i18n="seg.hint">每行一个网段（如 172.16.119 或 172.16.119.x）。</div>
         <textarea id="segText" rows="8" placeholder="172.16.101&#10;172.16.102&#10;..."></textarea>
@@ -81,24 +88,6 @@
         <div class="seg-host"><span data-i18n="seg.full_interval">全网发现间隔(秒)</span> <input id="setFullInterval" type="number" min="60">
           <span class="muted" data-i18n="seg.full_hint">展开全部网段找新机(慢)，建议 3600</span></div>
         <div class="seg-host"><span data-i18n="seg.pps">ARP限速 max_pps</span> <input id="setPps" type="number" min="1" max="500"> <span class="muted" data-i18n="seg.pps_hint">(三层CoPP限制下，建议≤500的一半)</span></div>
-        <hr class="seg-divider">
-        <div class="muted"><span data-i18n="seg.cloud_hint">☁ 云端上报（多场地总览）。保存即时生效，无需重启。本场地ID：</span><code id="cloudSiteId">-</code></div>
-        <div class="seg-host"><label style="display:flex;align-items:center;gap:6px;cursor:pointer"><input id="cloudEnabled" type="checkbox"> <span data-i18n="seg.cloud_enable">启用上报</span></label>
-          <span class="muted" data-i18n="seg.cloud_enable_hint">场地在NAT后也不需要端口映射，本地每分钟主动推</span></div>
-        <div class="seg-host"><span data-i18n="seg.site_name">场地名</span> <input id="cloudName" type="text" data-i18n-placeholder="seg.site_name_ph" placeholder="云端显示名，如 内蒙一场">
-          <span data-i18n="seg.site_type">类型</span> <select id="cloudType">
-            <option value="air" data-i18n="seg.type_air">❄ 风冷</option>
-            <option value="hydro" data-i18n="seg.type_hydro">💧 水冷</option>
-            <option value="mixed" data-i18n="seg.type_mixed">🌀 混合</option>
-          </select></div>
-        <div class="seg-host"><span data-i18n="seg.connect_code">接入码</span> <input id="cloudCode" type="password" autocomplete="off" data-i18n-placeholder="seg.connect_code_ph" placeholder="从云端面板「场地接入」复制，一次填好地址/token/指纹">
-          <button id="cloudCodeApply" type="button" class="mini-btn" data-i18n="seg.connect_apply">填入</button></div>
-        <div class="seg-host"><span data-i18n="seg.cloud_url">云端地址</span> <input id="cloudUrl" type="text" placeholder="https://overview.example.com  /  https://1.2.3.4:8900"></div>
-        <div class="seg-host"><span data-i18n="seg.cloud_token">上报token</span> <input id="cloudToken" type="password" autocomplete="off" placeholder="ingest token">
-          <button id="cloudTokenEye" type="button" class="mini-btn" data-i18n="seg.token_eye" data-i18n-title="seg.token_eye">👁 显示</button></div>
-        <div class="seg-host"><span data-i18n="seg.cloud_fp">证书指纹</span> <input id="cloudFp" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="seg.cloud_fp_ph" placeholder="云端无域名(https://IP)时必填；有域名留空"></div>
-        <div class="seg-host"><button id="cloudTest" type="button" class="mini-btn" data-i18n="seg.cloud_test">🔌 测试连接</button>
-          <span id="cloudStatus" class="muted" role="status"></span></div>
       </div>
       <div class="modal-foot">
         <button id="segCancel" data-i18n="seg.cancel">取消</button>
@@ -106,6 +95,46 @@
         <button id="segSaveScan" class="primary" data-i18n="seg.save_scan">保存并全网扫描</button>
       </div>
     </div>
+  </div>
+
+  <div id="cloudModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="cloudTitle">
+    <form id="cloudBindingForm" class="modal-box cloud-box" novalidate>
+      <div class="modal-head"><span id="cloudTitle" data-i18n="header.cloud">☁ 连接云端</span><button id="cloudClose" type="button" data-i18n-title="cloud.close" aria-label="Close">×</button></div>
+      <div class="cloud-body">
+        <p class="muted" data-i18n="cloud.intro">复制云端的完整接入信息（AMC1- 开头），点击「粘贴接入信息并连接」。其中已包含上报地址、上报密钥和场地信息，系统会自动拆分。</p>
+        <fieldset id="cloudFields">
+          <button id="cloudPaste" type="button" class="primary cloud-paste" data-i18n="cloud.paste_connect">粘贴接入信息并连接</button>
+          <label class="cloud-field" for="cloudCode"><span data-i18n="cloud.connection_info">完整接入信息（地址 + 上报密钥）</span>
+            <input id="cloudCode" type="password" autocomplete="off" spellcheck="false" maxlength="16384" placeholder="AMC1-…" aria-describedby="cloudCodeHint"></label>
+          <p id="cloudCodeHint" class="cloud-hint muted"></p>
+          <p id="cloudDestinationRow" class="cloud-hint muted hidden"><span data-i18n="cloud.destination">将上报到：</span><code id="cloudDestination"></code></p>
+          <details id="cloudSiteDetails" class="cloud-site-details">
+            <summary><span data-i18n="cloud.site_details">场地信息（自动填写）</span> <strong id="cloudSiteSummary"></strong></summary>
+            <div class="cloud-site-row">
+            <label class="cloud-field" for="cloudName"><span data-i18n="seg.site_name">场地名</span>
+              <input id="cloudName" type="text" maxlength="64" autocomplete="off" data-i18n-placeholder="seg.site_name_ph" placeholder="云端显示名，如 内蒙一场"></label>
+            <label class="cloud-field" for="cloudType"><span data-i18n="seg.site_type">类型</span>
+              <select id="cloudType"><option value="air" data-i18n="seg.type_air">❄ 风冷</option><option value="hydro" data-i18n="seg.type_hydro">💧 水冷</option><option value="mixed" data-i18n="seg.type_mixed">🌀 混合</option></select></label>
+            </div>
+          </details>
+          <details id="cloudAdvanced" class="cloud-advanced">
+            <summary data-i18n="cloud.advanced">高级设置 / 手动填写</summary>
+            <label class="cloud-field" for="cloudUrl"><span data-i18n="seg.cloud_url">云端地址</span><input id="cloudUrl" type="url" autocomplete="off" placeholder="https://overview.example.com"></label>
+            <label class="cloud-field" for="cloudToken"><span data-i18n="seg.cloud_token">上报 token</span>
+              <span class="cloud-token-row"><input id="cloudToken" type="password" autocomplete="off" placeholder="ingest token"><button id="cloudTokenEye" type="button" class="mini-btn" data-i18n="seg.token_eye">👁 显示</button></span></label>
+            <label class="cloud-field" for="cloudFp"><span data-i18n="seg.cloud_fp">证书指纹</span><input id="cloudFp" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="seg.cloud_fp_ph" placeholder="自签名证书需要指纹；公共 CA 证书留空"></label>
+            <p class="muted"><span data-i18n="cloud.site_id">场地 ID：</span><code id="cloudSiteId">-</code></p>
+            <button id="cloudPause" type="button" class="mini-btn hidden" data-i18n="cloud.pause">暂停当前上报</button>
+          </details>
+        </fieldset>
+        <p id="cloudFeedback" class="cloud-feedback hidden" role="status" aria-live="polite"></p>
+        <div class="cloud-status-card">
+          <strong data-i18n="cloud.current_status">当前上报状态</strong>
+          <p id="cloudStatus" class="muted" role="status" aria-live="polite"></p>
+        </div>
+      </div>
+      <div class="modal-foot"><button id="cloudCancel" type="button" data-i18n="cloud.close">关闭</button><button id="cloudConnect" type="submit" class="primary" data-i18n="header.cloud">☁ 连接云端</button></div>
+    </form>
   </div>
 
   <div id="pwdModal" class="modal hidden">
@@ -150,8 +179,8 @@
     <div class="card"><div class="num" id="cOffline">–</div><div class="lbl" data-i18n="card.offline">离线</div></div>
     <div class="card alert"><div class="num" id="cAlerts">–</div><div class="lbl" data-i18n="card.alerts">活跃告警</div></div>
     <div class="card"><div class="num" id="cFw">–</div><div class="lbl" data-i18n="card.fw">原厂 / 第三方</div></div>
-    <div class="card"><div class="num" id="cPower">–</div><div class="lbl" data-i18n="card.power">总功耗 (kW)</div></div>
-    <div class="card"><div class="num" id="cEff">–</div><div class="lbl" data-i18n="card.eff">平均能效 (J/TH)</div></div>
+    <div class="card" data-i18n-title="power.total_help" title="矿机当前功率按有效读数相加；集装箱配电读数单独展示，不重复加总。此数值不是全场电表读数。"><div class="num" id="cPower">–</div><div class="lbl" data-i18n="card.power">总功耗 (kW)</div></div>
+    <div class="card" data-i18n-title="quality.eff_help"><div class="num" id="cEff">–</div><div class="lbl" data-i18n="card.eff">能耗比 (J/TH)</div></div>
     <div class="card alert"><div class="num" id="cContainers">–</div><div class="lbl" data-i18n="card.containers">集装箱(故障)</div></div>
   </section>
 
@@ -185,14 +214,14 @@
       <div class="wbar"><span data-i18n="worker.period">周期</span>
         <select id="workerPeriod">
           <option value="0" data-i18n="worker.p0">当前快照</option>
-          <option value="24" data-i18n="worker.p24">近 24 小时</option>
+          <option value="24" selected data-i18n="worker.p24">近 24 小时</option>
           <option value="72" data-i18n="worker.p72">近 3 天</option>
           <option value="168" data-i18n="worker.p168">近 7 天</option>
           <option value="720" data-i18n="worker.p720">近 30 天</option>
           <option value="2160" data-i18n="worker.p2160">近 90 天</option>
         </select>
         <button id="btnExportCsv" class="hidden" data-i18n="worker.export">⬇ 导出CSV</button>
-        <span class="muted" data-i18n="worker.hint">报表含可用率 / 交付算力 / 耗电</span>
+        <span class="muted" data-i18n="worker.hint">实时算力 / 周期平均算力 / 可用率 / 统计期耗电 (kWh)；累计交付可展开或导出</span>
       </div>
       <div id="workerList"></div>
     </div>
@@ -239,8 +268,8 @@
         <thead><tr>
           <th class="cbcol"><input type="checkbox" id="cbAll" data-i18n-title="cmd.select_page" title="全选本页"></th>
           <th data-k="ip">IP</th><th data-k="status" data-i18n="th.status">状态</th><th data-k="firmware" data-i18n="th.fw">固件</th>
-          <th data-k="model" data-i18n="th.model">机型</th><th data-k="hr_rt" data-i18n="th.hr_rt">实时算力</th><th data-k="hr_avg" data-i18n="th.hr_avg">平均算力</th>
-          <th data-k="power" data-i18n="th.power">功耗</th><th data-k="eff" data-i18n="th.eff">能效</th><th data-i18n="th.reject">拒绝率</th><th data-k="temp" data-i18n="th.temp">芯片温</th>
+          <th data-k="model" data-i18n="th.model">机型</th><th data-k="hr_rt" data-i18n="th.hr_rt">实时算力</th><th data-k="hr_avg" data-i18n="th.hr_avg" data-i18n-title="rate.firmware_help" title="矿机固件返回的平均值，统计周期由固件决定，不等同于本系统近 24 小时平均。">固件平均</th>
+          <th data-k="power" data-i18n="th.power">当前功率 (kW)</th><th data-k="eff" data-i18n="th.eff">能效</th><th data-i18n="th.reject">拒绝率</th><th data-k="temp" data-i18n="th.temp">芯片温</th>
           <th data-k="uptime" data-i18n="th.uptime">运行时长</th><th data-k="worker" data-i18n="th.worker">矿工名</th><th data-k="sn">SN</th><th data-i18n="th.note">备注</th>
         </tr></thead>
         <tbody id="minerBody"></tbody>
@@ -270,6 +299,9 @@
   </div>
 
   <footer class="muted" data-i18n="footer">实时推送 + 每 30 秒兜底刷新 · 数据来自最近一次扫描</footer>
+  <script src="/web/cloud-connect.js"></script>
+  <script src="/web/customer-rates.js"></script>
+  <script src="/web/data-quality.js"></script>
   <script src="/web/app.js"></script>
 </body>
 </html>
