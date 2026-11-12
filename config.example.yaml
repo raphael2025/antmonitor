@@ -82,13 +82,14 @@ alerts:
   container_offline_rounds: 3 # 集装箱控制器连续 N 轮(每轮约10秒)没采到才判离线
   # 集装箱：以下故障位不报警(仍在卡片显示)
   # supply_liquid_flow_low=供液流量低 liquid_level_high=液位高 supply_liquid_pressure_high=供液压力高
-  # ⚠ 注意 leakage_fault(漏液) 属于 crit 级安全故障，除非确认是误报，否则不建议加进忽略列表
+  # ⚠ leakage_fault / freezing_alarm 等安全故障即使写进忽略列表也会强制报警
   container_faults_ignore: ["supply_liquid_flow_low", "liquid_level_high", "supply_liquid_pressure_high"]
   container_supply_pressure_min: 0.2   # 供液压 < 此值(MPa) → 告警；0=关
   container_return_pressure_min: 0.05  # 回液压 < 此值(MPa) → 告警；0=关
   # 自动补水时回液压常瞬间掉一下(1 个采样点)：持续偏低满 hold 秒才报，恢复后 clear 秒消警
   container_pressure_hold_sec: 60
   container_pressure_clear_sec: 30
+  container_stale_sec: 180    # 集装箱采样超过此秒数未更新仍显示在线 → 报「数据停更」；0=关
 
 telegram:
   enabled: false        # 填好 token/chat_id 并改 true 才推送(推送走独立线程，不阻塞扫描)

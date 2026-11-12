@@ -549,8 +549,12 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
     b = _Batch(conn, acfg.get("cooldown", 1800), now)
 
     ignore = set(acfg.get("container_faults_ignore", []))
+    # 安全类故障位：即使误配进忽略列表也必须报警（漏液/冻结等）
+    _NEVER_IGNORE = {"leakage_fault", "freezing_alarm", "emergency_stop", "leakage"}
+    ignore -= _NEVER_IGNORE
     sp_min = acfg.get("container_supply_pressure_min", 0) or 0
     rp_min = acfg.get("container_return_pressure_min", 0) or 0
+    stale_sec = int(acfg.get("container_stale_sec", 180) or 0)
     # 0=立即报(旧行为)；默认 60s 覆盖补水瞬时掉压
     hold = int(acfg.get("container_pressure_hold_sec", 60) or 0)
     press_clear = int(acfg.get("container_pressure_clear_sec", COOLER_PRESSURE_CLEAR_SEC)
@@ -597,7 +601,24 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
             clean.pop((ip, type_), None)
             # crit(漏液/断流/冻结…)不受冷却限制：真恢复后又复发必须立刻再报
             b.fire(ip, type_, f["sev"], f"集装箱 {ip} {f['label']}", force=f["sev"] == "crit")
-        for a in existing:      # 消除已恢复的该箱冷却告警
+
+        # 数据停更：状态仍像在线，但采样时间过旧 → 值班会以为水温还是绿的
+        if stale_sec > 0 and c.get("status") == "online":
+            measured = c.get("measured_ts") or c.get("ts") or 0
+            try:
+                age = now - int(float(measured))
+            except (TypeError, ValueError):
+                age = stale_sec + 1
+            if age >= stale_sec:
+                active["cooler_stale"] = {"label": f"数据停更约 {age // 60} 分钟", "sev": "warn"}
+                clean.pop((ip, "cooler_stale"), None)
+                b.fire(ip, "cooler_stale", "warn",
+                       f"集装箱 {ip} 冷却数据已约 {age // 60} 分钟未更新", force=True)
+            else:
+                if any(a["ip"] == ip and a["type"] == "cooler_stale" for a in existing):
+                    b.resolve(ip, "cooler_stale")
+
+        for a in existing:      # 消除已恢复的该箱冷却告警（仅 cooler:故障位；cooler_stale/offline 另处理）
             if a["ip"] != ip or not a["type"].startswith("cooler:") or a["type"] in active:
                 continue
             k = (ip, a["type"])
