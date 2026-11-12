@@ -1267,6 +1267,10 @@ class MonitorService:
         if now - self._last_rollup >= 300:          # 每5分钟归档一次已结束的小时
             self._last_rollup = now
             db.rollup_hours(self.conn)
+            try:
+                db.rollup_customer_daily(self.conn, day_offsets=(0, 1, 2))
+            except Exception:
+                log.exception("客户日汇总归档失败")
             db.prune(self.conn, dbc.get("retention_days", 3),
                      roster_days=self.cfg["scan"].get("roster_retention_days", 7),
                      rollup_days=dbc.get("rollup_retention_days", 400))

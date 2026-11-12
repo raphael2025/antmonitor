@@ -73,8 +73,11 @@ MAIN_LOOP = None
 
 def _start_cloud_report():
     """(重新)启动云端上报线程，供启动、设置热更新、看门狗自愈共用同一套参数。"""
+    def _daily(days=14):
+        return db.customer_daily_report(SVC.conn, days).get("customers_daily") or []
+
     return cloud_report.start(CFG, _build_cloud_summary,
-                              _customer_report_packet)
+                              _customer_report_packet, get_daily=_daily)
 
 
 @contextlib.asynccontextmanager
@@ -830,6 +833,13 @@ def api_workers(_: dict = Depends(require_viewer)):
                  hashrate_complete=stats["hashrate_complete"])
     out = sorted(agg.values(), key=lambda x: x["total"], reverse=True)
     return {"workers": out, "count": len(out)}
+
+
+@app.get("/api/reports/customers/daily")
+def api_report_customers_daily(days: int = 30, _: dict = Depends(require_viewer)):
+    """客户日汇总（UTC+8），服务月底对账；基于小时归档，缺日自动补算。"""
+    days = max(1, min(400, int(days or 30)))
+    return {"ok": True, "ts": int(time.time()), **db.customer_daily_report(SVC.conn, days)}
 
 
 @app.get("/api/reports/customers")
