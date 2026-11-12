@@ -619,12 +619,14 @@ def api_public_health(request: Request):
             "active_alerts": n_alerts}
 
 
-def _filter_recs(recs, status="", fw="", seg="", q="", repair=None):
+def _filter_recs(recs, status="", fw="", seg="", q="", repair=None, powercut=None):
     out = recs
     if seg:
         out = [r for r in out if r["ip"].rsplit(".", 1)[0] == seg]
     if status == "repair":
         out = [r for r in out if repair and r["ip"] in repair]
+    elif status == "powercut":
+        out = [r for r in out if powercut and r["ip"] in powercut]
     elif status:
         out = [r for r in out if r["status"] == status]
     if fw:
@@ -772,7 +774,8 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
     # 的机器静默移出选择集 → 漏命令
     _, recs = _latest_records()
     repair = db.repair_ips(SVC.conn)
-    out = _filter_recs(recs, status, fw, seg, q, repair=repair)
+    powercut = db.powercut_ips(SVC.conn)
+    out = _filter_recs(recs, status, fw, seg, q, repair=repair, powercut=powercut)
     stats = data_metrics.aggregate(out)
     agg = {"count": len(out), "online": stats["online"], "offline": stats["offline"],
            "unknown": stats["unknown"], "total_hr": stats["total_hashrate_th"],
@@ -795,10 +798,17 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
     else:
         nn.sort(key=lambda r: r.get(sort), reverse=rev)
     page = (nn + nul)[:limit]
+
+    def _mstate(ip):
+        if ip in repair:
+            return "repair"
+        if ip in powercut:
+            return "powercut"
+        return "active"
+
     # 拷贝后再挂 mstate：recs 是所有请求共享的内存快照，绝不能原地改
     return {"count": len(out), "agg": agg,
-            "miners": [dict(r, mstate=("repair" if r["ip"] in repair else "active"))
-                       for r in page]}
+            "miners": [dict(r, mstate=_mstate(r["ip"])) for r in page]}
 
 
 @app.get("/api/workers")
@@ -1715,9 +1725,9 @@ def api_commands(limit: int = 100, _: dict = Depends(require_admin)):
 
 @app.post("/api/machine-state")
 def api_machine_state(request: Request, body: dict = Body(...), sess: dict = Depends(require_ops)):
-    """标记维修/取消维修/下架移除：{ips:[...], action:"repair"|"active"|"remove"}"""
+    """标记维修/限电/取消/下架：{ips:[...], action:"repair"|"powercut"|"active"|"remove"}"""
     action = body.get("action")
-    if action not in ("repair", "active", "remove"):
+    if action not in ("repair", "powercut", "active", "remove"):
         return JSONResponse({"ok": False, "error": "参数错误"}, status_code=400)
     ips, ip_error = control.normalize_ips(
         body.get("ips"), CFG.get("control", {}).get("max_batch", 1000))

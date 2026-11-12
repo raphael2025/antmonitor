@@ -756,11 +756,11 @@ def known_identity(conn):
 
 
 def roster_ips(conn, max_age_days=7):
-    """机器名册：max_age_days 内在线过的 + 维修中的全部矿机 IP（快巡检目标）。"""
+    """机器名册：max_age_days 内在线过的 + 维修/限电中的全部矿机 IP（快巡检目标）。"""
     cutoff = int(time.time()) - max_age_days * 86400
     return [r["ip"] for r in _r(conn).execute(
         "SELECT ip FROM known_miners WHERE (state='active' AND last_online>=?) "
-        "OR state='repair'", (cutoff,)).fetchall()]
+        "OR state IN ('repair','powercut')", (cutoff,)).fetchall()]
 
 
 def repair_ips(conn):
@@ -768,9 +768,25 @@ def repair_ips(conn):
                _r(conn).execute("SELECT ip FROM known_miners WHERE state='repair'").fetchall())
 
 
+def powercut_ips(conn):
+    """限电/计划停机：掉线与零算力不报警（仍巡检，便于恢复后自动回到正常）。"""
+    return set(r["ip"] for r in
+               _r(conn).execute("SELECT ip FROM known_miners WHERE state='powercut'").fetchall())
+
+
+def quiet_ips(conn):
+    """告警静音集合：维修中 ∪ 限电/计划停机。"""
+    return set(r["ip"] for r in
+               _r(conn).execute(
+                   "SELECT ip FROM known_miners WHERE state IN ('repair','powercut')"
+               ).fetchall())
+
+
 def set_machine_state(conn, ips, state):
     if not ips:
         return
+    if state not in ("active", "repair", "powercut"):
+        raise ValueError("invalid machine state")
     with _wlock, conn:
         conn.executemany("UPDATE known_miners SET state=? WHERE ip=?", [(state, ip) for ip in ips])
 

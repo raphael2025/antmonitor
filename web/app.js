@@ -585,7 +585,9 @@ async function refreshMiners() {
       + `<td class="cbcol"><input type="checkbox" data-ip="${esc(r.ip)}" ${ck}></td>`
       + `<td class="ip-link"><span onclick="openMiner('${esc(r.ip)}')">${esc(r.ip)}</span>`
       + `<button type="button" class="console-link" onclick="${consoleClick(r.ip)}" title="${esc(t("alert.open_console"))}">↗</button></td>`
-      + `<td>${r.mstate === "repair" ? `<span class="pill repair">${esc(t("status.repair"))}</span>` : `<span class="pill ${esc(r.status)}" title="${r.status === "unknown" ? esc(t("pill.unknown_title")) : ""}">${esc(statusLabel(r.status))}</span>`}</td>`
+      + `<td>${r.mstate === "repair" ? `<span class="pill repair">${esc(t("status.repair"))}</span>`
+        : r.mstate === "powercut" ? `<span class="pill powercut">${esc(t("status.powercut"))}</span>`
+        : `<span class="pill ${esc(r.status)}" title="${r.status === "unknown" ? esc(t("pill.unknown_title")) : ""}">${esc(statusLabel(r.status))}</span>`}</td>`
       + `<td>${r.firmware ? `<span class="pill ${esc(r.firmware)}">${esc(r.firmware)}</span>` : "-"}</td>`
       + `<td>${esc(r.model) || "-"}</td>`
       + hrCell(r) + `<td>${r.hr_avg != null ? fmtHash(r.hr_avg) : "-"}</td>`
@@ -946,6 +948,7 @@ document.querySelector(".cmdbar").addEventListener("click", (e) => {
   }
   if (cmd === "clear") { selected.clear(); refreshMiners(); return; }
   if (cmd === "repair") return doMachineState("repair");
+  if (cmd === "powercut") return doMachineState("powercut");
   if (cmd === "unrepair") return doMachineState("active");
   if (cmd === "remove") return doMachineState("remove");
   openCmdDialog(cmd);
@@ -957,9 +960,12 @@ async function doMachineState(action) {
   // 单次上限 control.max_batch 是安全闸：超了直接提示分批，别在确认之后才被后端拒绝，
   // 也别在前端悄悄分批绕过它(下架 5000 台只需确认两次)
   if (ips.length > maxBatch) { toast(t("toast.batch_max", { n: maxBatch })); return; }
-  // 维修/下架影响大(停告警/删名册)，二次确认把后果讲清；大批量再确认一次
+  // 维修/限电/下架影响大(停告警/删名册)，二次确认把后果讲清；大批量再确认一次
   if (action === "repair" && !confirm(t("confirm.repair", { n: ips.length }))) return;
+  if (action === "powercut" && !confirm(t("confirm.powercut", { n: ips.length }))) return;
   if (action === "remove" && !confirm(t("confirm.remove", { n: ips.length }))) return;
+  if (ips.length > 200 && (action === "repair" || action === "powercut" || action === "remove")
+      && !confirm(t("confirm.bulk_state", { n: ips.length }))) return;
   if (ips.length > 500 && !confirm(t("confirm.bulk", { n: ips.length }))) return;
   try {
     const d = await jpost("/api/machine-state", { ips, action });

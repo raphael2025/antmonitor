@@ -190,7 +190,7 @@ class MonitorService:
         acfg = self.cfg.get("alerts") or {}
         states = db.zero_reboot_states(self.conn)
         thermal = self._zero_reboot_thermal_blocks(records)
-        repair = db.repair_ips(self.conn)
+        repair = db.quiet_ips(self.conn)  # 维修 + 限电：都不自动重启
         active_segments = {a["ip"][:-2] for a in db.active_alerts_by_type(self.conn, "segment_down")
                            if a["ip"].endswith(".x")}
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
@@ -385,7 +385,7 @@ class MonitorService:
         scan_ts = (meta or {}).get("ts")
         current = {r["ip"]: r for r in records}
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
-        repair = db.repair_ips(self.conn)
+        repair = db.quiet_ips(self.conn)  # 维修 + 限电：都不自动重启
         states = db.zero_reboot_states(self.conn)
         thermal = self._zero_reboot_thermal_blocks(records)
         # A later batch may see heat that was absent at candidate selection. Do
@@ -405,7 +405,7 @@ class MonitorService:
             seg = ".".join(ip.split(".")[:3])
             reason = ""
             if ip in repair:
-                reason = "机器已标记维修"
+                reason = "机器已标记维修或限电停机"
             elif ip not in roster:
                 reason = "机器已移出监控名册"
             elif not row or not db.record_freshness(row, scan_ts, now):

@@ -235,7 +235,7 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     now = int(time.time())
 
     cur = {r["ip"]: r for r in records}
-    repair = db.repair_ips(conn)          # 维修中的机器：不报警
+    repair = db.quiet_ips(conn)           # 维修中 / 限电计划停机：不报单机掉线·零算力等
     roster = set(db.roster_ips(conn, roster_age))   # 已知真机(算网段比例的分母)
     # 掉线告警按状态判，不按"上一轮 online → 本轮 offline"的跳变判：跳变那一轮只要没报出来
     # (冷却期/上一轮是 unknown/被网段事件或维修静音)，之后上一轮已是 offline 就永远不再报。
