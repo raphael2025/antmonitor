@@ -99,6 +99,8 @@ DEFAULTS = {
         "container_pressure_hold_sec": 60,
         # 压力恢复后多久消警(秒)；漏液等触点故障仍用 alerts.COOLER_CLEAR_SEC=300
         "container_pressure_clear_sec": 30,
+        # 集装箱采样超过此秒数未更新仍显示在线 → cooler_stale；0=关
+        "container_stale_sec": 180,
     },
     "telegram": {"enabled": False, "bot_token": "", "chat_id": ""},
     "cloud": {

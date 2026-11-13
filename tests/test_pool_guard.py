@@ -134,6 +134,30 @@ def test_set_pools_blocked_without_allowlist_and_outside_it(monkeypatch):
     c.close()
 
 
+def test_set_pools_requires_ack_when_cross_customer(monkeypatch):
+    server, c = _client(monkeypatch)
+    sent = []
+    monkeypatch.setattr(server.control, "_run_group", lambda t, a, p, cfg: (
+        sent.append(p) or [{"ip": ip, "ok": True, "msg": "pools updated"} for ip, _ in t]))
+    monkeypatch.setitem(server.CFG["control"], "pool_allowlist", ["f2pool.com"])
+    now = int(time.time())
+    db.upsert_known_miners(server.SVC.conn, [
+        rec("10.0.0.1", worker="alice.1"),
+        rec("10.0.0.2", worker="bob.1"),
+    ], now)
+    body = {
+        "ips": ["10.0.0.1", "10.0.0.2"], "action": "set_pools", "confirm": True,
+        "params": {"pools": [{"url": "stratum+tcp://btc.f2pool.com:3333",
+                              "user": "alice.1", "pass": "x"}]},
+    }
+    r = c.post("/api/command", json=body)
+    assert r.status_code == 400 and r.json().get("need_cross_customer_ack") and not sent
+    body["acknowledge_cross_customer"] = True
+    r = c.post("/api/command", json=body)
+    assert r.status_code == 200 and len(sent) == 1
+    c.close()
+
+
 def test_run_one_refuses_pool_outside_allowlist_even_if_called_directly(cfg):
     cfg["control"].update(enabled=True, pool_allowlist=["f2pool.com"])
     r = control.run_one("10.0.0.1", "stock", "set_pools",

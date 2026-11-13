@@ -266,6 +266,27 @@ CREATE TABLE IF NOT EXISTS known_miners (
     firmware    TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_known_last ON known_miners(last_online);
+-- SN 锚定客户台账：矿工名会漂，序列号相对稳定；对账优先用台账归属。
+CREATE TABLE IF NOT EXISTS asset_ledger (
+    sn         TEXT PRIMARY KEY,
+    worker     TEXT NOT NULL,
+    updated_ts INTEGER NOT NULL,
+    source     TEXT DEFAULT 'scan'
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_worker ON asset_ledger(worker);
+-- 客户日汇总（UTC+8 切日），月底对账不必再扫整月小时明细。
+CREATE TABLE IF NOT EXISTS customer_daily (
+    day               TEXT NOT NULL,   -- YYYY-MM-DD (UTC+8)
+    worker            TEXT NOT NULL,
+    machines          INTEGER DEFAULT 0,
+    delivered_th_h    REAL,
+    power_kwh         REAL,
+    online_machine_s  REAL,
+    known_machine_s   REAL,
+    observed_s        REAL,
+    PRIMARY KEY (day, worker)
+);
+CREATE INDEX IF NOT EXISTS idx_cust_daily_day ON customer_daily(day);
 CREATE TABLE IF NOT EXISTS containers (
     ip          TEXT PRIMARY KEY,
     last_online INTEGER,
@@ -609,6 +630,36 @@ def mark_containers_offline(conn, ips):
                      f"WHERE ip IN ({qm})", (time.time(), *ips))
 
 
+def _resolve_container_alerts(conn, ips, ts):
+    """消掉这些箱上的冷却告警（offline / stale / cooler:故障位）。调用方持有 _wlock。"""
+    if not ips:
+        return
+    qm = ",".join("?" * len(ips))
+    conn.execute(
+        f"UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 AND ip IN ({qm}) "
+        f"AND (type IN ('cooler_offline','cooler_stale') OR type LIKE 'cooler:%')",
+        (ts, *ips))
+
+
+def remove_containers(conn, ips):
+    """运维手动删除集装箱：立刻从监控记忆剔除并消冷却告警。历史快照保留。返回实际删除的 IP。"""
+    if not ips:
+        return []
+    ips = list(dict.fromkeys(str(ip).strip() for ip in ips if str(ip or "").strip()))
+    if not ips:
+        return []
+    ts = int(time.time())
+    with _wlock, conn:
+        qm = ",".join("?" * len(ips))
+        victims = [r["ip"] for r in conn.execute(
+            f"SELECT ip FROM containers WHERE ip IN ({qm})", ips).fetchall()]
+        if not victims:
+            return []
+        _resolve_container_alerts(conn, victims, ts)
+        conn.execute(f"DELETE FROM containers WHERE ip IN ({qm})", victims)
+        return victims
+
+
 def kick_offline_containers(conn, max_offline_sec=86400):
     """离线超过 max_offline_sec 的箱子从记忆中踢除，并清掉其残留冷却告警。返回被踢除的 IP 列表。"""
     cutoff = int(time.time()) - max_offline_sec
@@ -618,9 +669,7 @@ def kick_offline_containers(conn, max_offline_sec=86400):
             "SELECT ip FROM containers WHERE online=0 AND last_online < ?", (cutoff,)).fetchall()]
         if victims:
             qm = ",".join("?" * len(victims))
-            conn.execute(f"UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 "
-                         f"AND ip IN ({qm}) AND (type='cooler_offline' OR type LIKE 'cooler:%')",
-                         (ts, *victims))
+            _resolve_container_alerts(conn, victims, ts)
             conn.execute(f"DELETE FROM containers WHERE ip IN ({qm})", victims)
         return victims
 
@@ -746,6 +795,17 @@ def upsert_known_miners(conn, recs, ts):
             "firmware=CASE WHEN excluded.firmware!='' THEN excluded.firmware "
             "ELSE known_miners.firmware END",
             updates)
+        # SN→客户台账：有可靠 SN + 矿工名时写入/刷新，换矿工名即更新归属。
+        ledger = []
+        for _ip, measured, _model, sn, _mac, worker, _fw in rows:
+            if sn and worker and worker != "(未知)":
+                ledger.append((sn, worker, int(measured)))
+        if ledger:
+            conn.executemany(
+                "INSERT INTO asset_ledger(sn,worker,updated_ts,source) VALUES(?,?,?,'scan') "
+                "ON CONFLICT(sn) DO UPDATE SET worker=excluded.worker, "
+                "updated_ts=excluded.updated_ts, source='scan'",
+                ledger)
 
 
 def known_identity(conn):
@@ -755,12 +815,32 @@ def known_identity(conn):
     return {r["ip"]: dict(r) for r in rows}
 
 
+def asset_ledger_map(conn):
+    """{sn: worker} 客户台账；对账归属优先于瞬时矿工名。"""
+    return {r["sn"]: r["worker"] for r in _r(conn).execute(
+        "SELECT sn,worker FROM asset_ledger").fetchall() if r["sn"] and r["worker"]}
+
+
+def ledger_worker_for_ip(conn, identities=None):
+    """按 SN 台账覆盖 IP→矿工名；无 SN/无台账时保留原名册 worker。"""
+    ids = identities if identities is not None else known_identity(conn)
+    ledger = asset_ledger_map(conn)
+    out = {}
+    for ip, info in ids.items():
+        sn = (info.get("sn") or "").strip()
+        if sn and sn in ledger:
+            out[ip] = ledger[sn]
+        elif info.get("worker"):
+            out[ip] = info["worker"]
+    return out
+
+
 def roster_ips(conn, max_age_days=7):
-    """机器名册：max_age_days 内在线过的 + 维修中的全部矿机 IP（快巡检目标）。"""
+    """机器名册：max_age_days 内在线过的 + 维修/限电中的全部矿机 IP（快巡检目标）。"""
     cutoff = int(time.time()) - max_age_days * 86400
     return [r["ip"] for r in _r(conn).execute(
         "SELECT ip FROM known_miners WHERE (state='active' AND last_online>=?) "
-        "OR state='repair'", (cutoff,)).fetchall()]
+        "OR state IN ('repair','powercut')", (cutoff,)).fetchall()]
 
 
 def repair_ips(conn):
@@ -768,9 +848,25 @@ def repair_ips(conn):
                _r(conn).execute("SELECT ip FROM known_miners WHERE state='repair'").fetchall())
 
 
+def powercut_ips(conn):
+    """限电/计划停机：掉线与零算力不报警（仍巡检，便于恢复后自动回到正常）。"""
+    return set(r["ip"] for r in
+               _r(conn).execute("SELECT ip FROM known_miners WHERE state='powercut'").fetchall())
+
+
+def quiet_ips(conn):
+    """告警静音集合：维修中 ∪ 限电/计划停机。"""
+    return set(r["ip"] for r in
+               _r(conn).execute(
+                   "SELECT ip FROM known_miners WHERE state IN ('repair','powercut')"
+               ).fetchall())
+
+
 def set_machine_state(conn, ips, state):
     if not ips:
         return
+    if state not in ("active", "repair", "powercut"):
+        raise ValueError("invalid machine state")
     with _wlock, conn:
         conn.executemany("UPDATE known_miners SET state=? WHERE ip=?", [(state, ip) for ip in ips])
 
@@ -1364,6 +1460,13 @@ def _customer_metric_window(conn, start, end):
             scans[-1][2].append(dict(row))
     observed_s, workers = 0.0, {}
     identities = _past_customer_identities(conn, scans)
+    # SN 台账覆盖瞬时矿工名；维修/限电机不计入客户可用率分母（不算客户停机）。
+    ledger = asset_ledger_map(conn)
+    sn_by_ip = {ip: (info.get("sn") or "") for ip, info in known_identity(conn).items()}
+    for ip, sn in sn_by_ip.items():
+        if sn and sn in ledger:
+            identities[ip] = ledger[sn]
+    quiet = quiet_ips(conn)
     following_real, next_real = {}, None
     for scan in reversed(scans):
         following_real[scan[0]] = next_real
@@ -1375,6 +1478,11 @@ def _customer_metric_window(conn, start, end):
                 identities[r["ip"]] = r["worker"]
             elif r.get("status") == "online":
                 identities.setdefault(r["ip"], "(未知)")
+            sn = sn_by_ip.get(r["ip"]) or ""
+            if sn and sn in ledger:
+                identities[r["ip"]] = ledger[sn]
+        # 维修/限电：从计费样本剔除，避免压低客户可用率
+        billing_records = [r for r in records if r["ip"] not in quiet] if quiet else records
         started = _measurement(starts[sid])
         source_ts = sources[sid]
         completed_round = started is not None and 0 < started <= source_ts <= ts
@@ -1393,13 +1501,13 @@ def _customer_metric_window(conn, start, end):
             # Only measurements from this scan may support its completed result.
             # This never changes raw timestamps or relaxes automatic-action checks.
             checked = []
-            for r in records:
+            for r in billing_records:
                 stamp = record_measured_ts(r, ts)
                 checked.append(r if stamp is not None and started - 60 <= stamp <= source_ts + 60
                                else dict(r, status="unknown"))
             sample = _customer_metric_sample(checked, identities, scan_ts=ts)
         else:
-            sample = _customer_metric_sample(records, identities, begin, ts, interval=True)
+            sample = _customer_metric_sample(billing_records, identities, begin, ts, interval=True)
         observed_s += dt
         for worker, a in sample.items():
             valid_dt = dt if completed_round else (max(0.0, min(stop, a["oldest_ts"] + MAX_SAMPLE_GAP) - begin)
@@ -1654,7 +1762,11 @@ def customer_report(conn, hours=24, hashrate_hours=None, until_ts=None):
     observed_s, rates = _customer_metric_stats(conn, rate_hours, now)
     billing_s, billing = (observed_s, rates) if hours == rate_hours else _customer_metric_stats(conn, hours, now)
     latest = latest_scan(conn)
-    identities = {ip: a.get("worker") or "(未知)" for ip, a in known_identity(conn).items()}
+    known = known_identity(conn)
+    identities = {ip: a.get("worker") or "(未知)" for ip, a in known.items()}
+    # SN 台账优先：换矿工名后仍按序列号归属对账
+    for ip, worker in ledger_worker_for_ip(conn, known).items():
+        identities[ip] = worker
     previous_id = prev_scan_id(conn, latest["scan_id"]) if latest else None
     if previous_id:
         for r in scan_records(conn, previous_id):
@@ -1704,6 +1816,67 @@ def customer_report(conn, hours=24, hashrate_hours=None, until_ts=None):
     return out
 
 
+def _day_key_utc8(ts):
+    """UTC+8 切日键 YYYY-MM-DD。"""
+    return time.strftime("%Y-%m-%d", time.gmtime(int(ts) + 8 * 3600))
+
+
+def rollup_customer_daily(conn, day_offsets=(0, 1), now=None):
+    """把已归档的小时客户指标幂等汇总进 customer_daily（今天+昨天默认）。"""
+    now = int(now or time.time())
+    # UTC+8 今天 0 点对应的 unix
+    local = now + 8 * 3600
+    today0 = (local - local % 86400) - 8 * 3600
+    n = 0
+    for off in day_offsets:
+        day_start = today0 - int(off) * 86400
+        day_end = day_start + 86400
+        if day_end > now:
+            day_end = now
+        if day_end <= day_start:
+            continue
+        hours = max(1, int((day_end - day_start + HOUR - 1) // HOUR))
+        observed_s, workers = _customer_metric_stats(conn, hours, day_end)
+        # 窗口可能略长于一天：只取落入该日的小时归档再加总更准；这里用截止到 day_end 的 hours 近似。
+        day = _day_key_utc8(day_start)
+        with _wlock, conn:
+            conn.execute("DELETE FROM customer_daily WHERE day=?", (day,))
+            conn.executemany(
+                "INSERT INTO customer_daily(day,worker,machines,delivered_th_h,power_kwh,"
+                "online_machine_s,known_machine_s,observed_s) VALUES(?,?,?,?,?,?,?,?)",
+                [(day, w, a.get("machines", 0), round(a.get("th_h", 0.0), 3),
+                  round(a.get("power_kwh", 0.0), 3), a.get("online_machine_s", 0.0),
+                  a.get("known_machine_s", 0.0), observed_s)
+                 for w, a in workers.items()])
+        n += 1
+    return n
+
+
+def customer_daily_report(conn, days=30, until_ts=None):
+    """近 N 天客户日汇总（优先读 customer_daily；缺日则现场补算）。"""
+    now = int(until_ts or time.time())
+    days = max(1, min(400, int(days)))
+    rollup_customer_daily(conn, day_offsets=tuple(range(days)), now=now)
+    local = now + 8 * 3600
+    today0 = (local - local % 86400) - 8 * 3600
+    start_day = _day_key_utc8(today0 - (days - 1) * 86400)
+    rows = _r(conn).execute(
+        "SELECT day,worker,machines,delivered_th_h,power_kwh,online_machine_s,known_machine_s,observed_s "
+        "FROM customer_daily WHERE day>=? ORDER BY day DESC, machines DESC",
+        (start_day,)).fetchall()
+    out = []
+    for r in rows:
+        uptime = None
+        if (r["known_machine_s"] or 0) > 0:
+            uptime = round(r["online_machine_s"] / r["known_machine_s"] * 100, 2)
+        out.append({
+            "day": r["day"], "worker": r["worker"], "machines": r["machines"],
+            "delivered_th_h": r["delivered_th_h"], "power_kwh": r["power_kwh"],
+            "uptime_pct": uptime, "observed_s": r["observed_s"],
+        })
+    return {"days": days, "tz": "UTC+8", "customers_daily": out}
+
+
 # ---- 清理与维护 ----
 def prune(conn, retention_days, roster_days=7, rollup_days=400):
     """删过期数据。
@@ -1745,6 +1918,8 @@ def prune(conn, retention_days, roster_days=7, rollup_days=400):
         conn.execute("DELETE FROM hashrate_hourly WHERE hour<?", (rollup_cut,))
         conn.execute("DELETE FROM worker_metrics_hourly WHERE hour<?", (rollup_cut,))
         conn.execute("DELETE FROM customer_metrics_hourly WHERE hour<?", (rollup_cut,))
+        cut_day = _day_key_utc8(rollup_cut)
+        conn.execute("DELETE FROM customer_daily WHERE day<?", (cut_day,))
         # 审计：定位灯/维修标记这类高频低价值记录按条数只留最近 5000；重启/换矿池/下架/
         # 被拒绝的命令按时间长期保留——否则批量点几次"维修中"就能把换矿池记录冲掉
         low = "action IN ('locate','state:repair','state:active')"

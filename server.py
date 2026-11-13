@@ -73,8 +73,11 @@ MAIN_LOOP = None
 
 def _start_cloud_report():
     """(重新)启动云端上报线程，供启动、设置热更新、看门狗自愈共用同一套参数。"""
+    def _daily(days=14):
+        return db.customer_daily_report(SVC.conn, days).get("customers_daily") or []
+
     return cloud_report.start(CFG, _build_cloud_summary,
-                              _customer_report_packet)
+                              _customer_report_packet, get_daily=_daily)
 
 
 @contextlib.asynccontextmanager
@@ -619,12 +622,14 @@ def api_public_health(request: Request):
             "active_alerts": n_alerts}
 
 
-def _filter_recs(recs, status="", fw="", seg="", q="", repair=None):
+def _filter_recs(recs, status="", fw="", seg="", q="", repair=None, powercut=None):
     out = recs
     if seg:
         out = [r for r in out if r["ip"].rsplit(".", 1)[0] == seg]
     if status == "repair":
         out = [r for r in out if repair and r["ip"] in repair]
+    elif status == "powercut":
+        out = [r for r in out if powercut and r["ip"] in powercut]
     elif status:
         out = [r for r in out if r["status"] == status]
     if fw:
@@ -772,7 +777,8 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
     # 的机器静默移出选择集 → 漏命令
     _, recs = _latest_records()
     repair = db.repair_ips(SVC.conn)
-    out = _filter_recs(recs, status, fw, seg, q, repair=repair)
+    powercut = db.powercut_ips(SVC.conn)
+    out = _filter_recs(recs, status, fw, seg, q, repair=repair, powercut=powercut)
     stats = data_metrics.aggregate(out)
     agg = {"count": len(out), "online": stats["online"], "offline": stats["offline"],
            "unknown": stats["unknown"], "total_hr": stats["total_hashrate_th"],
@@ -795,10 +801,17 @@ def api_miners(status: str = "", fw: str = "", q: str = "", seg: str = "",
     else:
         nn.sort(key=lambda r: r.get(sort), reverse=rev)
     page = (nn + nul)[:limit]
+
+    def _mstate(ip):
+        if ip in repair:
+            return "repair"
+        if ip in powercut:
+            return "powercut"
+        return "active"
+
     # 拷贝后再挂 mstate：recs 是所有请求共享的内存快照，绝不能原地改
     return {"count": len(out), "agg": agg,
-            "miners": [dict(r, mstate=("repair" if r["ip"] in repair else "active"))
-                       for r in page]}
+            "miners": [dict(r, mstate=_mstate(r["ip"])) for r in page]}
 
 
 @app.get("/api/workers")
@@ -820,6 +833,13 @@ def api_workers(_: dict = Depends(require_viewer)):
                  hashrate_complete=stats["hashrate_complete"])
     out = sorted(agg.values(), key=lambda x: x["total"], reverse=True)
     return {"workers": out, "count": len(out)}
+
+
+@app.get("/api/reports/customers/daily")
+def api_report_customers_daily(days: int = 30, _: dict = Depends(require_viewer)):
+    """客户日汇总（UTC+8），服务月底对账；基于小时归档，缺日自动补算。"""
+    days = max(1, min(400, int(days or 30)))
+    return {"ok": True, "ts": int(time.time()), **db.customer_daily_report(SVC.conn, days)}
 
 
 @app.get("/api/reports/customers")
@@ -872,6 +892,23 @@ def api_containers(_: dict = Depends(require_viewer)):
 def api_containers_scan(_: dict = Depends(require_ops)):
     """手动立即刷新集装箱（后台执行，秒回）。"""
     threading.Thread(target=SVC.scan_containers, daemon=True).start()
+
+
+@app.post("/api/containers/remove")
+def api_containers_remove(request: Request, body: dict = Body(...),
+                          sess: dict = Depends(require_ops)):
+    """运维删除集装箱（换网段/整箱退役）：{ips:[...]}。控制器恢复且仍在扫描范围内会再被发现。"""
+    ips, ip_error = control.normalize_ips(
+        body.get("ips"), CFG.get("control", {}).get("max_batch", 1000))
+    if ip_error:
+        return JSONResponse({"ok": False, "error": ip_error}, status_code=400)
+    gone = db.remove_containers(SVC.conn, ips)
+    if gone:
+        db.log_commands(SVC.conn, f'{sess.get("user", "?")}@{_client_ip(request)}',
+                        "container:remove",
+                        [{"ip": ip, "ok": True, "msg": "remove"} for ip in gone])
+        log.info("删除集装箱 %d 台: %s, 操作人 %s", len(gone), gone[:8], sess.get("user", "?"))
+    return {"ok": True, "count": len(gone), "removed": gone}
     return {"ok": True}
 
 
@@ -944,6 +981,52 @@ def api_miner(ip: str, _: dict = Depends(require_viewer)):
     history = [data_metrics.live_record(h, db.record_freshness(h, h["ts"], h["ts"]))
                for h in db.ip_history(SVC.conn, ip)]
     return {"current": cur, "history": history}
+
+
+@app.get("/api/miner/{ip}/console")
+def api_miner_console(ip: str, live: bool = True, _: dict = Depends(require_viewer)):
+    """返回打开矿机官方/第三方网页的方案（不代替浏览器跨域登录限制）。"""
+    import miner_web
+    try:
+        ip = miner_web.validate_miner_ip(ip)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    _, recs = _latest_records()
+    cur = next((r for r in recs if r["ip"] == ip), None) or {}
+    cfg = SVC.cfg if hasattr(SVC, "cfg") else {}
+    passwords = cfg.get("passwords") or [["root", "root"]]
+    stock_user, stock_pwd = (passwords[0] + ["", ""])[:2] if passwords else ("root", "root")
+    control = cfg.get("control") or {}
+    uni_pwd = control.get("uniplus_password") or "admin"
+    try:
+        plan = miner_web.console_plan(
+            ip,
+            firmware_hint=str(cur.get("firmware") or ""),
+            stock_user=str(stock_user or "root"),
+            stock_password=str(stock_pwd or "root"),
+            uniplus_password=str(uni_pwd or "admin"),
+            live=bool(live),
+        )
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    plan["ok"] = True
+    plan["firmware_hint"] = cur.get("firmware")
+    if plan.get("kind") == "uniplus":
+        plan["bridge_path"] = f"/api/miner/{ip}/console/bridge"
+    return plan
+
+
+@app.get("/api/miner/{ip}/console/bridge")
+def api_miner_console_bridge(ip: str, _: dict = Depends(require_viewer)):
+    """UniPlus：新窗口 POST pwd 写入 cookie 后跳转 /dashboard。"""
+    import miner_web
+    try:
+        ip = miner_web.validate_miner_ip(ip)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    cfg = SVC.cfg if hasattr(SVC, "cfg") else {}
+    uni_pwd = (cfg.get("control") or {}).get("uniplus_password") or "admin"
+    return HTMLResponse(miner_web.uniplus_bridge_html(ip, str(uni_pwd or "admin")))
 
 
 @app.post("/api/alerts/ack")
@@ -1518,6 +1601,22 @@ def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(r
             return JSONResponse({"ok": False, "error":
                                  f"矿池不在白名单，已拒绝: {', '.join(bad)[:200]}"},
                                 status_code=403)
+        # 跨客户保护：换池会把 params 里同一个 user 写到所有目标机。
+        # 勾选里已有 ≥2 个不同矿工名时，必须显式 acknowledge_cross_customer，否则拒发。
+        known = db.known_identity(SVC.conn)
+        workers = sorted({
+            (known.get(ip) or {}).get("worker") or "" for ip in ips
+        } - {""})
+        if len(workers) >= 2 and body.get("acknowledge_cross_customer") is not True:
+            sample = "、".join(workers[:8]) + ("…" if len(workers) > 8 else "")
+            _audit_reject(user, action, f"跨客户换池未确认: {sample}")
+            return JSONResponse({
+                "ok": False, "need_cross_customer_ack": True,
+                "workers": workers[:50], "worker_count": len(workers),
+                "error": (f"选中机器分属 {len(workers)} 个矿工名（{sample}）。"
+                          "换池会把它们改成同一客户名，可能把别人算力划走。"
+                          "确认无误请传 acknowledge_cross_customer:true"),
+            }, status_code=400)
     # 从最近快照取每台固件类型，避免重复探测
     _, recs = _latest_records()
     fw_map = {r["ip"]: r["firmware"] for r in recs}
@@ -1669,9 +1768,9 @@ def api_commands(limit: int = 100, _: dict = Depends(require_admin)):
 
 @app.post("/api/machine-state")
 def api_machine_state(request: Request, body: dict = Body(...), sess: dict = Depends(require_ops)):
-    """标记维修/取消维修/下架移除：{ips:[...], action:"repair"|"active"|"remove"}"""
+    """标记维修/限电/取消/下架：{ips:[...], action:"repair"|"powercut"|"active"|"remove"}"""
     action = body.get("action")
-    if action not in ("repair", "active", "remove"):
+    if action not in ("repair", "powercut", "active", "remove"):
         return JSONResponse({"ok": False, "error": "参数错误"}, status_code=400)
     ips, ip_error = control.normalize_ips(
         body.get("ips"), CFG.get("control", {}).get("max_batch", 1000))

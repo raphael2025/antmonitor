@@ -62,6 +62,11 @@ section.panel { margin: 0 22px 22px; }
 .a.warn { border-left: 3px solid #f0883e; }
 .a.info { border-left: 3px solid #3fb950; }
 .a .ip { color: #58a6ff; cursor: pointer; }
+.console-link {
+  margin-left: 4px; padding: 0 5px; border: 1px solid #30363d; border-radius: 4px;
+  background: #21262d; color: #58a6ff; cursor: pointer; font-size: 12px; line-height: 1.4;
+}
+.console-link:hover { background: #30363d; }
 .a .aworker { color: #c9d1d9; font-size: 12px; white-space: nowrap; }
 .a .aworker b { color: #8b949e; font-weight: 600; }
 .a .atime { color: #6e7681; font-size: 11px; min-width: 128px; }
@@ -87,6 +92,7 @@ td.low { color: #f0883e; font-weight: 600; }
 .pill.online { background: #16331f; color: #3fb950; }
 .pill.offline { background: #33181a; color: #f85149; }
 .pill.repair { background: #2d2410; color: #e3b341; }
+.pill.powercut { background: #1c2d3f; color: #79c0ff; }
 .pill.stock { background: #2a2230; color: #d2a8ff; }
 .pill.uniplus { background: #1c2a33; color: #56d4dd; }
 .pill.unknown { background: #12233d; color: #58a6ff; }
@@ -101,6 +107,7 @@ td.low { color: #f0883e; font-weight: 600; }
 .cmdbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
 .cmdbar .sep { width: 1px; height: 18px; background: #30363d; margin: 0 4px; }
 .mini-btn { padding: 5px 10px; font-size: 12px; }
+.mini-btn.active { background: #1f6feb; border-color: #1f6feb; color: #fff; }
 .mini-btn.danger { border-color: #5a2327; color: #f85149; }
 .mini-btn.danger:hover { background: #3d1d20; }
 #selCount { min-width: 64px; }

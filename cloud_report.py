@@ -211,10 +211,11 @@ def is_alive():
     return bool(_thread and _thread.is_alive())
 
 
-def start(cfg, get_summary, get_customers):
+def start(cfg, get_summary, get_customers, get_daily=None):
     """启动/热重启上报线程(旧线程自动失效)。未启用时仅停掉旧线程。
     get_summary: () -> /api/public/summary 同构 dict
-    get_customers: (hours:int) -> customers 列表；新协议每行含实际计算的算力/计费窗口端点。"""
+    get_customers: (hours:int) -> customers 列表；新协议每行含实际计算的算力/计费窗口端点。
+    get_daily: (days:int) -> customers_daily 列表（可选，UTC+8 日汇总对账）。"""
     global _GEN, _thread
     # Serialize restarts with status updates. An old in-flight request may finish
     # after a new connection is saved, but it cannot mark that connection healthy.
@@ -233,7 +234,8 @@ def start(cfg, get_summary, get_customers):
             sid = site_id(cfg)
             if str(c.get("url") or "").strip().lower().startswith("http://"):
                 log.warning("云端上报地址使用了非加密的 http:// 协议，token 将明文传输，建议改用 https://")
-            t = threading.Thread(target=_loop, args=(gen, c, sid, get_summary, get_customers),
+            t = threading.Thread(target=_loop,
+                                 args=(gen, c, sid, get_summary, get_customers, get_daily),
                                  daemon=True, name="cloud-report")
             _thread = t
             t.start()
@@ -312,7 +314,7 @@ def _customer_period(report, hours):
     return dict(zip(_CUSTOMER_PERIOD_FIELDS, (start, end, billing_start, billing_end)))
 
 
-def _loop(gen, c, sid, get_summary, get_customers):
+def _loop(gen, c, sid, get_summary, get_customers, get_daily=None):
     interval = max(10, int(c.get("interval", 60)))
     cust_iv = max(60, int(c.get("customer_interval", 600)))
     cust_hours = int(c.get("customer_hours", 24))
@@ -391,9 +393,16 @@ def _loop(gen, c, sid, get_summary, get_customers):
                 rows = report["customers"] if isinstance(report, dict) else (report or [])
                 if gen != _GEN:
                     break
-                _post(c, "/api/ingest/customers",
-                      {"site_id": sid, "site": c["site_name"],
-                       "hours": cust_hours, "customers": rows, **period}, sess)
+                body = {"site_id": sid, "site": c["site_name"],
+                        "hours": cust_hours, "customers": rows, **period}
+                if get_daily:
+                    try:
+                        daily = get_daily(14) or []
+                        if daily:
+                            body["customers_daily"] = daily
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("客户日汇总取数失败(不影响时段报表上报): %s", e)
+                _post(c, "/api/ingest/customers", body, sess)
                 last_cust = t0
                 _set_status(gen, last_customers_ok=int(time.time()))
             except Exception as e:  # noqa: BLE001
