@@ -220,6 +220,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     eff      REAL,
     uptime   INTEGER,
     worker   TEXT,
+    worker_suffix TEXT DEFAULT '',
     accepted INTEGER,
     rejected INTEGER,
     stale    INTEGER,
@@ -263,6 +264,7 @@ CREATE TABLE IF NOT EXISTS known_miners (
     sn          TEXT DEFAULT '',
     mac         TEXT DEFAULT '',
     worker      TEXT DEFAULT '',
+    worker_suffix TEXT DEFAULT '',
     firmware    TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_known_last ON known_miners(last_online);
@@ -408,6 +410,7 @@ def init_db(path):
             _try(conn, f"ALTER TABLE snapshots ADD COLUMN {col} {typ}")
         _try(conn, "ALTER TABLE snapshots ADD COLUMN mac TEXT")
         _try(conn, "ALTER TABLE snapshots ADD COLUMN measured_ts REAL")
+        _try(conn, "ALTER TABLE snapshots ADD COLUMN worker_suffix TEXT DEFAULT ''")
         _try(conn, "ALTER TABLE scans ADD COLUMN unknown INTEGER")
         _try(conn, "ALTER TABLE scans ADD COLUMN started_ts INTEGER")
         _try(conn, "ALTER TABLE scans ADD COLUMN source_scan_ts INTEGER")
@@ -416,7 +419,8 @@ def init_db(path):
         _try(conn, "ALTER TABLE known_miners ADD COLUMN state TEXT DEFAULT 'active'")
         _try(conn, "ALTER TABLE known_miners ADD COLUMN mac TEXT DEFAULT ''")
         for col in ("model TEXT DEFAULT ''", "sn TEXT DEFAULT ''",
-                    "worker TEXT DEFAULT ''", "firmware TEXT DEFAULT ''"):
+                    "worker TEXT DEFAULT ''", "worker_suffix TEXT DEFAULT ''",
+                    "firmware TEXT DEFAULT ''"):
             _try(conn, f"ALTER TABLE known_miners ADD COLUMN {col}")
         for col in ("ack_by TEXT", "ack_at INTEGER"):
             _try(conn, f"ALTER TABLE alerts ADD COLUMN {col}")
@@ -503,7 +507,8 @@ def meta_set(conn, k, v):
 
 
 SNAP_COLS = ("ip", "status", "firmware", "model", "sn", "mac", "hr_rt", "hr_avg", "power", "temp",
-             "eff", "uptime", "worker", "accepted", "rejected", "stale", "note", "measured_ts")
+             "eff", "uptime", "worker", "worker_suffix", "accepted", "rejected", "stale", "note",
+             "measured_ts")
 
 
 def _scan_totals(records, ts):
@@ -553,6 +558,7 @@ def save_scan(conn, kind, records, keep_ips=None, started_ts=None):
                  "hr_rt": r.get("hr_rt"), "hr_avg": r.get("hr_avg"),
                  "power": r.get("power"), "temp": r.get("temp"), "eff": r.get("eff"),
                  "uptime": r.get("uptime"), "worker": r.get("worker") or "",
+                 "worker_suffix": r.get("worker_suffix") or "",
                  "accepted": r.get("accepted"), "rejected": r.get("rejected"),
                  "stale": r.get("stale"), "note": r.get("note") or "",
                  # Preserve invalid time as an invalid numeric sentinel. SQLite
@@ -560,10 +566,10 @@ def save_scan(conn, kind, records, keep_ips=None, started_ts=None):
                  # valid clock after restart; None is reserved for old missing clocks.
                  "measured_ts": record_measured_ts(r, ts) if record_time_valid(r, ts) else 0}
                 for r in kept_src]
+        cols = ",".join(SNAP_COLS)
+        qs = ",".join("?" for _ in range(len(SNAP_COLS) + 1))
         conn.executemany(
-            "INSERT INTO snapshots(scan_id,ip,status,firmware,model,sn,mac,hr_rt,hr_avg,power,temp,"
-            "eff,uptime,worker,accepted,rejected,stale,note,measured_ts)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            f"INSERT INTO snapshots(scan_id,{cols}) VALUES({qs})",
             [tuple([sid] + [r[c] for c in SNAP_COLS]) for r in kept],
         )
     return sid, ts, kept
@@ -754,7 +760,7 @@ def upsert_known_miners(conn, recs, ts):
     rows = []
     for r in recs:
         if isinstance(r, str):
-            rows.append((r, ts, "", "", "", "", ""))
+            rows.append((r, ts, "", "", "", "", "", ""))
         else:
             # N/A/error/占位串不算 SN：不能覆盖名册里已知的真 SN(否则掉线后回填出 N/A，搜不到)
             sn = r.get("sn") or ""
@@ -763,7 +769,8 @@ def upsert_known_miners(conn, recs, ts):
                 continue
             rows.append((r["ip"], int(measured), r.get("model") or "", sn if sn_valid(sn) else "",
                          normalize_mac(r.get("mac")),
-                         r.get("worker") or "", r.get("firmware") or ""))
+                         r.get("worker") or "", r.get("worker_suffix") or "",
+                         r.get("firmware") or ""))
     with _wlock, conn:
         # 与实际写入持同一把锁：新机没有 SN 时，不能让上一台的 SN 在掉线后被回填，
         # 否则旧机换 IP 上线会把这台新机误标为 migrated。MAC 必须先校验、规范化。
@@ -771,7 +778,7 @@ def upsert_known_miners(conn, recs, ts):
                       conn.execute("SELECT ip,sn,mac FROM known_miners").fetchall()}
         updates = []
         for row in rows:
-            ip, _ts, _model, sn, mac, _worker, _firmware = row
+            ip, _ts, _model, sn, mac, _worker, _suffix, _firmware = row
             old_sn, old_mac = identities.get(ip, ("", ""))
             new_mac = normalize_mac(mac)
             clear_sn = bool(not sn and old_mac and new_mac and old_mac != new_mac)
@@ -780,8 +787,8 @@ def upsert_known_miners(conn, recs, ts):
             identities[ip] = (sn or ("" if clear_sn else old_sn),
                               new_mac if mac else ("" if sn and sn != old_sn else old_mac))
         conn.executemany(
-            "INSERT INTO known_miners(ip,last_online,state,model,sn,mac,worker,firmware) "
-            "VALUES(?,?,'active',?,?,?,?,?) "
+            "INSERT INTO known_miners(ip,last_online,state,model,sn,mac,worker,worker_suffix,firmware) "
+            "VALUES(?,?,'active',?,?,?,?,?,?) "
             "ON CONFLICT(ip) DO UPDATE SET last_online=MAX(COALESCE(known_miners.last_online,0),excluded.last_online), "
             "state=CASE WHEN known_miners.state='migrated' THEN 'active' "
             "ELSE known_miners.state END, "
@@ -792,12 +799,14 @@ def upsert_known_miners(conn, recs, ts):
             "WHEN excluded.sn!='' AND excluded.sn!=known_miners.sn THEN '' "
             "ELSE known_miners.mac END, "
             "worker=CASE WHEN excluded.worker!='' THEN excluded.worker ELSE known_miners.worker END, "
+            "worker_suffix=CASE WHEN excluded.worker!='' THEN excluded.worker_suffix "
+            "ELSE known_miners.worker_suffix END, "
             "firmware=CASE WHEN excluded.firmware!='' THEN excluded.firmware "
             "ELSE known_miners.firmware END",
             updates)
         # SN→客户台账：有可靠 SN + 矿工名时写入/刷新，换矿工名即更新归属。
         ledger = []
-        for _ip, measured, _model, sn, _mac, worker, _fw in rows:
+        for _ip, measured, _model, sn, _mac, worker, _suffix, _fw in rows:
             if sn and worker and worker != "(未知)":
                 ledger.append((sn, worker, int(measured)))
         if ledger:
@@ -811,7 +820,8 @@ def upsert_known_miners(conn, recs, ts):
 def known_identity(conn):
     """名册里每台机的最后已知身份 {ip: {...}}，用于回填离线机。"""
     rows = _r(conn).execute(
-        "SELECT ip,model,sn,mac,worker,firmware,last_online,state FROM known_miners").fetchall()
+        "SELECT ip,model,sn,mac,worker,worker_suffix,firmware,last_online,state "
+        "FROM known_miners").fetchall()
     return {r["ip"]: dict(r) for r in rows}
 
 

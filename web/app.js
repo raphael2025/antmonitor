@@ -170,6 +170,14 @@ function hashUnit(maxTh) {
   return { div: 1, unit: "TH" };
 }
 
+/** 列表展示：基础名.后缀。统计归组仍只用 worker 基础名；与 MAC 列无关。 */
+function workerLabel(r) {
+  const base = String((r && r.worker) || "").trim();
+  if (!base) return "";
+  const suffix = String((r && r.worker_suffix) || "").trim();
+  return suffix ? `${base}.${suffix}` : base;
+}
+
 function fmtTime(ts) {
   if (!ts) return t("header.last_scan_none");
   return new Date(ts * 1000).toLocaleString(uiLocale(), { hour12: false });
@@ -606,7 +614,7 @@ async function refreshMiners() {
       + rejCell(r)
       + tempCell(r)
       + `<td>${fmtUptime(r.uptime)}</td>`
-      + `<td>${esc(r.worker) || "-"}</td>`
+      + `<td title="${esc(r.worker || "")}">${esc(workerLabel(r)) || "-"}</td>`
       + `<td>${esc(r.sn) || "-"}</td>`
       + `<td class="mac-col">${esc(r.mac) || "-"}</td>`
       + `<td class="muted">${esc(r.note)}</td></tr>`;
@@ -814,7 +822,7 @@ async function openMiner(ip) {
     + t("miner.detail_mac", { mac: esc(c.mac) || "-" }) + "<br>"
     + t("miner.detail_hr", { hr: c.hr_rt == null ? t("td.no_hr") : fmtHash(c.hr_rt), avg: fmtHash(c.hr_avg), pw: fmtPower(c.power) }) + "<br>"
     + t("miner.detail_eff", { eff: safeVal(c.eff), temp: safeVal(c.temp), up: fmtUptime(c.uptime) }) + "<br>"
-    + t("miner.detail_worker", { w: esc(c.worker) || "-", a: safeVal(c.accepted), r: safeVal(c.rejected), s: safeVal(c.stale) })
+    + t("miner.detail_worker", { w: esc(workerLabel(c)) || "-", a: safeVal(c.accepted), r: safeVal(c.rejected), s: safeVal(c.stale) })
     + (c.note ? "<br>" + t("miner.detail_note", { n: esc(c.note) }) : "");
   const btn = $("mOpenConsole");
   if (btn) {

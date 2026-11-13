@@ -38,7 +38,8 @@ def test_probe_uniplus_uses_bearer_get_stats(monkeypatch):
                                "chain": [{"temp_chip": [70, 71]}]}],
                 })
             if url.endswith("/cgi-bin/get_system_info.cgi"):
-                return Resp(headers={"Content-Type": "application/json"},
+                # 现场 CGI 常不带 application/json，只回 text/plain；以前会因此丢掉 MAC
+                return Resp(headers={"Content-Type": "text/plain; charset=utf-8"},
                             payload={"macaddr": "a8:1b:db:b4:e7:fb", "minertype": "Antminer S19 XP+ Hyd"})
             return Resp(status=404, text="no")
 
@@ -52,6 +53,28 @@ def test_probe_uniplus_uses_bearer_get_stats(monkeypatch):
     assert rec["model"] == "Antminer S19 XP+ Hyd"
     assert rec["hr_rt"] == 345.0
     assert rec["mac"] == "A8:1B:DB:B4:E7:FB"
+
+
+def test_probe_uniplus_mac_not_blocked_by_missing_content_type(monkeypatch):
+    class Session:
+        def get(self, url, **kwargs):
+            if url.endswith("/api/v1/summary"):
+                return Resp(headers={"Content-Type": "text/html"}, text="<html>")
+            if url.endswith("/cgi-bin/get_stats.cgi"):
+                return Resp(payload={
+                    "INFO": {"type": "S19"}, "STATS": [{"rate_5s": 100000, "rate_avg": 99000, "elapsed": 1}],
+                })
+            if url.endswith("/cgi-bin/get_system_info.cgi"):
+                return Resp(headers={}, payload={"mac": "aa:bb:cc:dd:ee:ff"})
+            return Resp(status=404)
+
+        def post(self, url, **kwargs):
+            return Resp(headers={"Content-Type": "application/json"},
+                        payload={"status": "ok", "token": "t"})
+
+    monkeypatch.setattr(miner_core, "get_session", Session)
+    rec = miner_core.probe_uniplus("10.0.0.2", 1, 1, collect_identity=True)
+    assert rec["mac"] == "AA:BB:CC:DD:EE:FF"
 
 
 def test_probe_prefers_uniplus_when_html_says_so(monkeypatch):

@@ -246,7 +246,7 @@ def _blank(ip, status):
         "ip": ip, "status": status, "firmware": "", "model": "", "sn": "",
         "mac": "",
         "hr_rt": None, "hr_avg": None, "power": None, "temp": None,
-        "eff": None, "uptime": None, "worker": "",
+        "eff": None, "uptime": None, "worker": "", "worker_suffix": "",
         "accepted": None, "rejected": None, "stale": None, "note": "",
         "measured_ts": time.time(),
     }
@@ -432,7 +432,12 @@ def fetch_pool(ip, timeout):
             primary = min(pools, key=_prio, default=None)  # 同优先级保持配置返回顺序
         user = primary.get("User", primary.get("user")) if primary is not None else None
         # 主池账户缺失就交给 service 按矿机身份回填，不能跳到备用池认出新客户。
-        worker = (user.split(".", 1)[0].strip() or None) if isinstance(user, str) else None
+        # 统计/客户归组只用「.」前基础名；后缀单独保留，列表矿工名列显示 基础名.后缀。
+        worker, worker_suffix = None, ""
+        if isinstance(user, str) and user.strip():
+            base, sep, tail = user.strip().partition(".")
+            worker = base.strip() or None
+            worker_suffix = tail.strip() if sep else ""
         totals = {key: [] for key in ("Accepted", "Rejected", "Stale")}
         samples = {}
         for p in use:
@@ -454,7 +459,8 @@ def fetch_pool(ip, timeout):
 
         # 全部配置的矿池地址(含备用/失活池)：换池防篡改检查用。攻击者常把自己的池塞在备用位
         urls = [str(p.get("URL") or p.get("url") or "").strip() for p in sorted(pools, key=_prio)]
-        return {"worker": worker, "accepted": total("Accepted"),
+        return {"worker": worker, "worker_suffix": worker_suffix,
+                "accepted": total("Accepted"),
                 "rejected": total("Rejected"), "stale": total("Stale"),
                 "counter_basis": "cgminer-pools:" + basis, "counter_samples": samples,
                 "pools": [u for u in urls if u]}
@@ -701,12 +707,21 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False, password=
                         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
                     )
                     if ir.status_code == 200:
-                        info = ir.json() if "json" in (ir.headers.get("Content-Type") or "") else {}
+                        # 1.3.x CGI 常回 text/plain 或空 Content-Type，不能靠头里有无 "json"
+                        # 决定是否解析——以前写成头不含 json 就当 {}，MAC 永远采不到。
+                        try:
+                            info = ir.json()
+                        except ValueError:
+                            info = {}
                         if isinstance(info, dict):
-                            rec["mac"] = normalize_mac(info.get("macaddr"))
-                            model = info.get("minertype")
+                            rec["mac"] = normalize_mac(
+                                info.get("macaddr") or info.get("mac") or info.get("MAC"))
+                            model = info.get("minertype") or info.get("miner_type")
                             if model and not rec.get("model"):
                                 rec["model"] = model if isinstance(model, str) else ""
+                            serial = info.get("serinum") or info.get("serial") or info.get("sn")
+                            if sn_valid(serial) and not sn_valid(rec.get("sn")):
+                                rec["sn"] = str(serial).strip()
                 except (requests.RequestException, ValueError, AttributeError):
                     pass
 
@@ -823,6 +838,9 @@ def probe(ip, cfg, limiter=None):
         if pi:
             if pi.get("worker"):
                 rec["worker"] = pi["worker"]
+            # 本轮读到矿池用户时同步后缀(可为空)，避免名册旧后缀张冠李戴
+            if "worker_suffix" in pi:
+                rec["worker_suffix"] = pi.get("worker_suffix") or ""
             rec["accepted"] = pi.get("accepted")
             rec["rejected"] = pi.get("rejected")
             rec["stale"] = pi.get("stale")

@@ -913,24 +913,26 @@ class MonitorService:
                             changed = bool(old_mac and new_mac and old_mac != new_mac)
                     owner = info.get("worker") if info and info.get("state") != "migrated" and not changed else None
                     r["worker"] = owner or "(未知)"
+                    if owner and owner != "(未知)" and not r.get("worker_suffix"):
+                        r["worker_suffix"] = (info or {}).get("worker_suffix") or ""
                 # 离线机：回填名册身份，方便搜索/认机。
-                # 在线机：快巡检通常不采 MAC；仅当本轮 SN 与名册一致（仍是同一台）时
-                # 回填名册 MAC，供 SN 列下方单独显示。SN 对不上绝不沿用旧 MAC，
-                # 避免残影误下架。
-                # 已判为迁移残影的旧 IP 不回填：回填旧 SN 后每次全网扫描都会被重新算成残影，
-                # 累计超过 migrate_max 就把自动识别迁移永久熔断
+                # 在线机：快巡检通常不采 MAC；名册有 MAC 且未证实换机(有效 SN 变更)时回填，
+                # 供列表 MAC 列显示。已判迁移残影的旧 IP 不回填。
                 if info and info.get("state") != "migrated":
-                    same_sn = (miner_core.sn_valid(r.get("sn"))
-                               and miner_core.sn_valid(info.get("sn"))
-                               and r["sn"] == info["sn"])
                     if r["status"] != "online":
                         r["mac"] = r.get("mac") or info.get("mac") or ""
                         r["model"] = r.get("model") or info.get("model") or ""
                         r["sn"] = r.get("sn") or info.get("sn") or ""
                         r["worker"] = r.get("worker") or info.get("worker") or ""
+                        if not r.get("worker_suffix"):
+                            r["worker_suffix"] = info.get("worker_suffix") or ""
                         r["firmware"] = r.get("firmware") or info.get("firmware") or ""
-                    elif same_sn and not r.get("mac"):
-                        r["mac"] = info.get("mac") or ""
+                    elif not r.get("mac") and info.get("mac"):
+                        sn_changed = (miner_core.sn_valid(r.get("sn"))
+                                      and miner_core.sn_valid(info.get("sn"))
+                                      and r["sn"] != info["sn"])
+                        if not sn_changed:
+                            r["mac"] = info.get("mac") or ""
 
             if kind == "quick":
                 self._maybe_request_early_full(miners)

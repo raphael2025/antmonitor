@@ -584,6 +584,7 @@ def _public_miner_row(r):
         "firmware": r.get("firmware") or "", "model": r.get("model") or "",
         "sn": r.get("sn") or "", "mac": r.get("mac") or "",
         "worker": r.get("worker") or "",
+        "worker_suffix": r.get("worker_suffix") or "",
         "hashrate_ths": r["hr_rt"], "hashrate_avg_ths": r["hr_avg"],
         "power_w": r["power"], "temp_c": r["temp"],
         "measured_ts": r.get("measured_ts"), "data_stale": bool(r.get("data_stale")),
@@ -638,7 +639,9 @@ def _filter_recs(recs, status="", fw="", seg="", q="", repair=None, powercut=Non
         ql = q.lower()
         out = [r for r in out if ql in r["ip"].lower() or ql in (r.get("sn") or "").lower()
                or ql in (r.get("mac") or "").lower()
-               or ql in (r.get("worker") or "").lower()]
+               or ql in (r.get("worker") or "").lower()
+               or ql in (r.get("worker_suffix") or "").lower()
+               or ql in f'{r.get("worker") or ""}.{r.get("worker_suffix") or ""}'.lower()]
     return out
 
 
