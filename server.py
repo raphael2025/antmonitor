@@ -876,9 +876,23 @@ def api_report_customers(hours: int = 24, format: str = "", until_ts: float = No
     return packet
 
 
+def _attach_segment_labels(rows):
+    """给矿机/集装箱记录附带 /24 网段备注（不改写内存快照原对象）。"""
+    labels = appconfig.load_segment_labels()
+    out = []
+    for row in rows or []:
+        item = dict(row)
+        parts = str(item.get("ip") or "").split(".")
+        seg = ".".join(parts[:3]) if len(parts) == 4 else ""
+        item["segment"] = seg
+        item["label"] = labels.get(seg) or ""
+        out.append(item)
+    return out
+
+
 @app.get("/api/containers")
 def api_containers(_: dict = Depends(require_viewer)):
-    cs = _current_containers()
+    cs = _attach_segment_labels(_current_containers())
     acfg = CFG.get("alerts", {})
     ignore = set(acfg.get("container_faults_ignore", []))
     return {"count": len(cs),
@@ -918,6 +932,8 @@ def api_containers_remove(request: Request, body: dict = Body(...),
 @app.get("/api/container/{ip}")
 def api_container(ip: str, _: dict = Depends(require_viewer)):
     cur = next((c for c in _current_containers() if c["ip"] == ip), None)
+    if cur is not None:
+        cur = _attach_segment_labels([cur])[0]
     return {"current": cur, "history": db.container_history(SVC.conn, ip),
             "stale_after": _container_stale_after()}
 

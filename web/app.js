@@ -701,7 +701,7 @@ async function refreshRacks() {
     }).join("");
     const bad = rk.abnormal ? t("rack.zero_bad", { n: rk.abnormal }).replace(String(rk.abnormal), `<b class="bad">${rk.abnormal}</b>`) : "";
     const title = rk.label
-      ? `${esc(rk.label)} <span class="muted">(${esc(rk.name)}.x)</span>`
+      ? `<span class="rack-label">${esc(rk.label)}</span><span class="muted rack-seg">(${esc(rk.name)}.x)</span>`
       : `${esc(rk.name)}.x`;
     return `<div class="rack"><div class="rack-head"><span class="name">${title}</span>`
       + `<span class="stat">${t("rack.stat", { online: rk.online, hr: fmtHash(rk.hashrate), bad, offline: rk.offline, empty: rk.empty })}</span></div>`
@@ -918,9 +918,13 @@ async function refreshContainers() {
     + (d.faulty ? t("cbox.faulty", { n: d.faulty }) : "") + (d.offline ? t("cbox.offline", { n: d.offline }) : "")
     + (d.unknown ? " · " + t("quality.unknown_count", { n: d.unknown }) : "");
   $("containerList").innerHTML = cs.map(c => {
+    const headName = c.label
+      ? `<span class="cbox-title"><span class="cbox-label">${esc(c.label)}</span>`
+        + `<span class="cbox-ip">${esc(c.ip)}</span></span>`
+      : `<span class="cbox-ip cbox-ip-solo">${esc(c.ip)}</span>`;
     if (!c.online && !containerQuality(c)) {
       return `<div class="cbox offline" onclick="openContainer('${esc(c.ip)}')">`
-        + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
+        + `<div class="cbox-head">${headName}`
         + `<span class="fbadge crit">${esc(t("cbox.ctrl_off"))}</span>${containerRemoveBtn(c.ip)}</div>`
         + `<div class="cbox-meta">${esc(t("cbox.last_temp", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp) }))}</div></div>`;
     }
@@ -932,7 +936,7 @@ async function refreshContainers() {
     const rpLow = rpMin && c.return_pressure != null && c.return_pressure < rpMin;
     const realFault = (c.faults || []).some(f => !ign.has(f.flag)) || spLow || rpLow;
     return `<div class="cbox ${realFault ? "fault" : ""}" onclick="openContainer('${esc(c.ip)}')">`
-      + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
+      + `<div class="cbox-head">${headName}`
       + `<span class="cbox-meta">${esc(t("cbox.miners_line", { n: safeVal(c.miner_num) }))} ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span>`
       + `${containerRemoveBtn(c.ip)}</div>`
       + (containerQuality(c) ? AntDataQuality.note(t(c.data_stale ? "quality.stale" : "quality.partial"), true) : "")
@@ -949,7 +953,9 @@ async function refreshContainers() {
 async function openContainer(ip) {
   const d = await jget(`/api/container/${ip}`);
   const c = d.current || {};
-  $("mTitle").textContent = t("cbox.title", { ip });
+  $("mTitle").textContent = c.label
+    ? `${c.label} · ${ip}`
+    : t("cbox.title", { ip });
   const consoleBtn = $("mOpenConsole");
   if (consoleBtn) { consoleBtn.classList.add("hidden"); consoleBtn.onclick = null; }
   const rm = $("mRemoveContainer");

@@ -171,8 +171,10 @@ body.viewer #btnFull, body.viewer #btnQuick, body.viewer #btnScanContainers { di
 .slot.empty:hover { outline: none; }
 .slot.unknown { background: #1f6feb; }              /* 货架 本轮未探测(非离线) 蓝 */
 .rack { background: #0d1117; border: 1px solid #21262d; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
-.rack-head { display: flex; justify-content: space-between; margin-bottom: 10px; font-size: 13px; }
+.rack-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 10px; font-size: 13px; }
 .rack-head .name { font-weight: 600; color: #c9d1d9; }
+.rack-head .rack-label { font-size: 18px; font-weight: 700; color: #e6edf3; margin-right: 8px; }
+.rack-head .rack-seg { font-size: 12px; font-weight: 500; }
 .rack-head .stat { color: #6e7681; font-size: 12px; }
 .rack-head .stat b.bad { color: #f0883e; }
 .slots { display: grid; grid-template-columns: repeat(auto-fill, 22px); gap: 3px; }
@@ -195,8 +197,11 @@ body.viewer #btnFull, body.viewer #btnQuick, body.viewer #btnScanContainers { di
 .cbox:hover { border-color: #1f6feb; }
 .cbox.fault { border-color: #da3633; }
 .cbox.offline { opacity: .5; border-color: #30363d; }
-.cbox-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
-.cbox-ip { font-weight: 600; color: #58a6ff; }
+.cbox-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
+.cbox-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cbox-label { font-size: 20px; font-weight: 700; color: #e6edf3; line-height: 1.2; }
+.cbox-ip { font-weight: 600; color: #58a6ff; font-size: 12px; }
+.cbox-ip-solo { font-size: 16px; }
 .cbox-temps { display: flex; gap: 14px; font-size: 13px; margin-bottom: 8px; }
 .cbox-temps .v { font-size: 18px; font-weight: 700; }
 .cbox-temps .in { color: #56d4dd; } .cbox-temps .out { color: #f0883e; }

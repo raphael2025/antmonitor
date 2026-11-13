@@ -53,3 +53,16 @@ def test_parse_batch_then_save_like_api(tmp_path, monkeypatch):
     assert bad == ["8.8.8 公网"]
     appconfig.save_segments(norm, 1, 50, labels=labels)
     assert appconfig.load_segment_labels(norm) == {"10.0.0": "A仓"}
+
+
+def test_attach_segment_labels_for_containers(tmp_path, monkeypatch):
+    import server
+
+    seg_file = tmp_path / "segments.json"
+    monkeypatch.setattr(appconfig, "SEG_FILE", str(seg_file))
+    monkeypatch.setattr(server.appconfig, "SEG_FILE", str(seg_file))
+    appconfig.save_segments(["10.9.1"], 1, 254, labels={"10.9.1": "水冷A4"})
+    rows = server._attach_segment_labels([{"ip": "10.9.1.20", "online": True}])
+    assert rows[0]["label"] == "水冷A4"
+    assert rows[0]["segment"] == "10.9.1"
+    assert rows[0]["ip"] == "10.9.1.20"
