@@ -122,12 +122,75 @@ def console_plan(ip: str, firmware_hint: str = "",
     }
 
 
-def uniplus_bridge_html(ip: str, password: str = _DEFAULT_UNIPLUS_PWD) -> str:
-    """在新窗口里 POST pwd 到矿机（写入 auth_token cookie），再跳进 /dashboard。"""
+def uniplus_login(ip: str, password: str = _DEFAULT_UNIPLUS_PWD, timeout: float = 3.0) -> str:
+    """向矿机 POST pwd=…，返回 token；失败返回空串。"""
     ip = validate_miner_ip(ip)
     pwd = password or _DEFAULT_UNIPLUS_PWD
-    login = f"http://{ip}/cgi-bin/login.cgi"
+    try:
+        r = requests.post(
+            f"http://{ip}/cgi-bin/login.cgi",
+            data={"pwd": pwd},
+            timeout=timeout,
+            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        data = r.json() if "json" in (r.headers.get("Content-Type") or "") else {}
+        if not isinstance(data, dict):
+            data = {}
+        token = str(data.get("token") or "").strip()
+        if r.ok and token:
+            return token
+        log.info("uniplus_login %s failed: status=%s body=%s", ip, r.status_code, str(data)[:120])
+    except (requests.RequestException, ValueError) as exc:
+        log.info("uniplus_login %s error: %s", ip, exc)
+    return ""
+
+
+def uniplus_autologin_url(ip: str, token: str) -> str:
+    """UniPlus SPA 启动时会读 location.search / hash 里的 token|auth_token，写入 sessionStorage。
+
+    用 hash（#?token=）避免 token 进 access log / Referer；SPA 读完会 replaceState 清掉。
+    """
+    ip = validate_miner_ip(ip)
+    tok = quote(str(token or "").strip(), safe="")
+    return f"http://{ip}/dashboard#?token={tok}"
+
+
+def uniplus_bridge_html(ip: str, password: str = _DEFAULT_UNIPLUS_PWD) -> str:
+    """服务端代登拿 token，再跳到矿机 dashboard#?token=…（写入 sessionStorage，免输密码）。
+
+    仅靠 cookie / iframe POST 不够：UniPlus 登录门闸只认 sessionStorage.uniplus_auth_token。
+    """
+    ip = validate_miner_ip(ip)
+    pwd = password or _DEFAULT_UNIPLUS_PWD
     dash = f"http://{ip}/dashboard"
+    token = uniplus_login(ip, pwd)
+    if token:
+        target = uniplus_autologin_url(ip, token)
+        return f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>打开矿机网页 {escape(ip)}</title>
+  <meta http-equiv="refresh" content="2;url={escape(dash)}">
+  <style>
+    body {{ font-family: system-ui, sans-serif; background:#0d1117; color:#e6edf3;
+           display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; }}
+    .box {{ max-width: 28rem; padding: 1.25rem 1.5rem; border:1px solid #30363d; border-radius:10px;
+            background:#161b22; line-height:1.5; }}
+    a {{ color:#58a6ff; }}
+    code {{ background:#21262d; padding:0.1rem 0.35rem; border-radius:4px; }}
+  </style>
+</head>
+<body>
+  <div class="box">
+    <p>已登录 <code>{escape(ip)}</code>（UniPlus），正在进入看板…</p>
+    <p><a href="{escape(target)}">若未跳转，点此进入</a></p>
+  </div>
+  <script>window.location.replace({target!r});</script>
+</body>
+</html>
+"""
+    # 代登失败（密码改过/机子不通）：仍打开看板，并提示默认密码
     return f"""<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -144,25 +207,15 @@ def uniplus_bridge_html(ip: str, password: str = _DEFAULT_UNIPLUS_PWD) -> str:
 </head>
 <body>
   <div class="box">
-    <p>正在登录 <code>{escape(ip)}</code>（UniPlus）…</p>
-    <p id="msg">写入会话后将进入看板。</p>
-    <p><a id="manual" href="{escape(dash)}">若未跳转，点此进入看板</a></p>
+    <p>自动登录 <code>{escape(ip)}</code> 失败（密码可能已改，或机器暂时不可达）。</p>
+    <p>默认密码 <code>{escape(pwd)}</code> 已尽量复制；请在看板密码框粘贴。</p>
+    <p><a href="{escape(dash)}">打开看板</a></p>
   </div>
-  <iframe name="antminer_login_frame" style="display:none" title="login"></iframe>
-  <form id="f" method="POST" action="{escape(login)}" target="antminer_login_frame"
-        enctype="application/x-www-form-urlencoded">
-    <input type="hidden" name="pwd" value="{escape(pwd)}">
-  </form>
   <script>
     (function () {{
-      var dash = {dash!r};
-      var msg = document.getElementById("msg");
-      try {{ document.getElementById("f").submit(); }}
-      catch (e) {{ msg.textContent = "自动登录失败，请手动打开看板并输入密码 admin。"; return; }}
-      setTimeout(function () {{ window.location.replace(dash); }}, 700);
-      setTimeout(function () {{
-        msg.textContent = "若仍停在登录页，密码默认是 admin（可改过）。";
-      }}, 2500);
+      var pwd = {pwd!r}, dash = {dash!r};
+      try {{ navigator.clipboard.writeText(pwd); }} catch (e) {{}}
+      setTimeout(function () {{ window.location.replace(dash); }}, 600);
     }})();
   </script>
 </body>

@@ -35,9 +35,39 @@ def test_uniplus_plan_uses_bridge_and_dashboard():
     assert plan["open_url"].endswith("/dashboard")
     assert plan["password"] == "admin"
     assert plan["method"] == "uniplus_bridge"
+
+
+def test_uniplus_autologin_url_uses_hash_token():
+    url = miner_web.uniplus_autologin_url("10.1.2.4", "abc123")
+    assert url.startswith("http://10.1.2.4/dashboard#?token=")
+    assert "abc123" in url
+
+
+def test_uniplus_bridge_html_with_token(monkeypatch):
+    monkeypatch.setattr(miner_web, "uniplus_login", lambda *a, **k: "tok_alive")
     html = miner_web.uniplus_bridge_html("10.1.2.4", "admin")
-    assert "pwd" in html and "10.1.2.4" in html and "/dashboard" in html
-    assert "login.cgi" in html
+    assert "tok_alive" in html
+    assert "#?token=" in html
+    assert "location.replace" in html
+
+
+def test_uniplus_bridge_html_fallback_when_login_fails(monkeypatch):
+    monkeypatch.setattr(miner_web, "uniplus_login", lambda *a, **k: "")
+    html = miner_web.uniplus_bridge_html("10.1.2.4", "admin")
+    assert "自动登录" in html
+    assert "10.1.2.4" in html and "/dashboard" in html
+
+
+def test_uniplus_login_parses_token(monkeypatch):
+    class Resp:
+        ok = True
+        status_code = 200
+        headers = {"Content-Type": "application/json"}
+        def json(self):
+            return {"status": "ok", "token": "deadbeef"}
+
+    monkeypatch.setattr(miner_web.requests, "post", lambda *a, **k: Resp())
+    assert miner_web.uniplus_login("10.1.2.5", "admin") == "deadbeef"
 
 
 def test_detect_console_kind_stock(monkeypatch):
