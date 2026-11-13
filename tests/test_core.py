@@ -102,13 +102,16 @@ def test_probe_uniplus_collects_nested_mac_and_serial(monkeypatch):
             return self.payload
 
     class Session:
-        def get(self, url, timeout):
+        def get(self, url, timeout=None, **kwargs):
             if url.endswith("/api/v1/info"):
                 return Response({
                     "serial": "UNI1234567890",
                     "system": {"network_status": {"mac": "10-0a-41-96-b6-f2"}},
                 })
             return Response({"miner": {"miner_type": "S19", "hr_realtime": 100000}})
+
+        def post(self, url, **kwargs):
+            raise AssertionError("legacy /api/v1/summary path should not need login")
 
     monkeypatch.setattr(miner_core, "get_session", lambda: Session())
     result = miner_core.probe_uniplus("10.0.0.1", 1, 1, collect_identity=True)

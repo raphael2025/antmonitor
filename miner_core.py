@@ -514,7 +514,10 @@ def probe_stock(ip, online_to, data_to, passwords, collect_identity=False):
     if r.status_code != 200:
         return None   # 非 200(错误页/其它服务) 不当原厂矿机
     txt = (r.text or "").strip()
-    sn = txt if (txt and "error" not in txt.lower()) else "N/A"
+    # UniPlus 也常开 6060，但返回 "error http cmd" 一类占位——不能据此标成 stock。
+    if not txt or "error" in txt.lower():
+        return None
+    sn = txt
 
     rec = _blank(ip, "online")
     rec["firmware"] = "stock"
@@ -584,14 +587,8 @@ def probe_stock(ip, online_to, data_to, passwords, collect_identity=False):
     return rec
 
 
-def probe_uniplus(ip, online_to, data_to=None, collect_identity=False):
-    """第三方 UniPlusOS：/api/v1/summary 免认证取算力。返回 dict 或 None。"""
-    s = get_session()
-    try:
-        r = s.get(f"http://{ip}/api/v1/summary", timeout=online_to)
-        d = r.json()
-    except (requests.RequestException, ValueError):
-        return None
+def _uniplus_from_api_summary(d):
+    """旧版 UniPlus /api/v1/summary JSON → 记录；结构不对返回 None。"""
     if not isinstance(d, dict):
         return None
     m = d.get("miner")
@@ -601,7 +598,7 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False):
     ct = ct if isinstance(ct, dict) else {}
     state = m.get("miner_status")
     state = state if isinstance(state, dict) else {}
-    rec = _blank(ip, "online")
+    rec = _blank("", "online")
     rec["firmware"] = "uniplus"
     model = m.get("miner_type")
     rec["model"] = model if isinstance(model, str) else ""
@@ -611,9 +608,123 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False):
     rec["temp"] = _temp(ct.get("max"))
     rec["eff"] = _nonnegative(m.get("power_efficiency"))  # J/TH
     rec["uptime"] = _nonnegative(state.get("miner_state_time"), integer=True)
-    if collect_identity:
+    return rec
+
+
+def _uniplus_from_stats_payload(d):
+    """UniPlus 1.3.x get_stats.cgi（与原厂 stats 同构，需 Bearer）→ 记录。"""
+    if not isinstance(d, dict):
+        return None
+    info = d.get("INFO") if isinstance(d.get("INFO"), dict) else {}
+    rows = d.get("STATS")
+    st = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(st, dict):
+        return None
+    if st.get("rate_5s") is None and st.get("rate_avg") is None:
+        return None
+    rec = _blank("", "online")
+    rec["firmware"] = "uniplus"
+    model = info.get("type")
+    rec["model"] = model if isinstance(model, str) else ""
+    rec["hr_rt"] = gh_to_th(st.get("rate_5s"))
+    rec["hr_avg"] = gh_to_th(st.get("rate_avg"))
+    rec["power"] = _nonnegative(st.get("watt"), integer=True)
+    rec["eff"] = _nonnegative(st.get("jt"))
+    rec["uptime"] = _nonnegative(st.get("elapsed"), integer=True)
+    rec["measured_ts"] = time.time()
+    temps = []
+    for c in st.get("chain") if isinstance(st.get("chain"), list) else []:
+        if not isinstance(c, dict):
+            continue
+        chips = c.get("temp_chip")
+        if isinstance(chips, list):
+            temps += [n for n in (_temp(t) for t in chips) if n is not None]
+    rec["temp"] = max(temps) if temps else None
+    return rec
+
+
+def _uniplus_login_token(s, ip, password, timeout):
+    try:
+        r = s.post(
+            f"http://{ip}/cgi-bin/login.cgi",
+            data={"pwd": password or "admin"},
+            timeout=timeout,
+            headers={"Accept": "application/json",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        if "json" not in (r.headers.get("Content-Type") or ""):
+            return ""
+        data = r.json()
+        if isinstance(data, dict):
+            return str(data.get("token") or "").strip()
+    except (requests.RequestException, ValueError, AttributeError):
+        return ""
+    return ""
+
+
+def probe_uniplus(ip, online_to, data_to=None, collect_identity=False, password="admin"):
+    """第三方 UniPlusOS：旧版 /api/v1/summary；1.3.x 走 login+get_stats / 4028。"""
+    s = get_session()
+    data_to = data_to or online_to
+    rec = None
+
+    # 1) 旧 API（1.3.x 常回 SPA HTML，json 解析失败或无 miner 字段 → 跳过）
+    try:
+        r = s.get(f"http://{ip}/api/v1/summary", timeout=online_to,
+                  headers={"Accept": "application/json"})
+        rec = _uniplus_from_api_summary(r.json())
+        if rec is not None:
+            rec["ip"] = ip
+    except (requests.RequestException, ValueError):
+        rec = None
+
+    # 2) UniPlus 1.3.x：Bearer + get_stats.cgi
+    if rec is None:
+        token = _uniplus_login_token(s, ip, password, online_to)
+        if token:
+            try:
+                r = s.get(
+                    f"http://{ip}/cgi-bin/get_stats.cgi",
+                    timeout=data_to,
+                    headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                )
+                if r.status_code == 200:
+                    rec = _uniplus_from_stats_payload(r.json())
+                    if rec is not None:
+                        rec["ip"] = ip
+            except (requests.RequestException, ValueError):
+                rec = None
+            if collect_identity and rec is not None:
+                try:
+                    ir = s.get(
+                        f"http://{ip}/cgi-bin/get_system_info.cgi",
+                        timeout=data_to,
+                        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                    )
+                    if ir.status_code == 200:
+                        info = ir.json() if "json" in (ir.headers.get("Content-Type") or "") else {}
+                        if isinstance(info, dict):
+                            rec["mac"] = normalize_mac(info.get("macaddr"))
+                            model = info.get("minertype")
+                            if model and not rec.get("model"):
+                                rec["model"] = model if isinstance(model, str) else ""
+                except (requests.RequestException, ValueError, AttributeError):
+                    pass
+
+    # 3) 4028 兜底（仍标 uniplus，避免再被 6060 路径误标 stock）
+    if rec is None:
+        sm = fetch_summary(ip, min(data_to, 3.0))
+        if sm is None:
+            return None
+        rec = _blank(ip, "online")
+        rec["firmware"] = "uniplus"
+        rec.update(sm)
+        rec["note"] = "UniPlus经4028取数"
+
+    if collect_identity and rec is not None and not rec.get("mac"):
+        # 旧 API 身份
         try:
-            info = s.get(f"http://{ip}/api/v1/info", timeout=data_to or online_to).json()
+            info = s.get(f"http://{ip}/api/v1/info", timeout=data_to).json()
             if isinstance(info, dict):
                 system = info.get("system") or {}
                 network = info.get("network_status") or (
@@ -640,6 +751,8 @@ def probe(ip, cfg, limiter=None):
     if gate and not tcp_open(ip, 80, cfg.get("gate_timeout", 0.4)):
         return _blank(ip, "offline")
     collect_identity = bool(cfg.get("collect_identity"))
+    control = cfg.get("control") if isinstance(cfg.get("control"), dict) else {}
+    uni_pwd = control.get("uniplus_password") or cfg.get("uniplus_password") or "admin"
     # UniPlus 也常开 6060：若先走原厂会被误标 stock。优先看 80 口页面指纹。
     def _uniplus_html(text):
         low = (text or "").lower()
@@ -650,7 +763,8 @@ def probe(ip, cfg, limiter=None):
     page_html = ""
     try:
         s = get_session()
-        page = s.get(f"http://{ip}/", timeout=min(online_to, 1.0))
+        # 指纹超时单独放宽：扫描 online_timeout 常被压到 0.5s，页面指纹失败就会掉回 6060→stock
+        page = s.get(f"http://{ip}/", timeout=max(online_to, 1.5))
         auth = (page.headers.get("WWW-Authenticate") or "").lower()
         page_html = page.text or ""
         if page.status_code != 401 or "digest" not in auth:
@@ -660,17 +774,19 @@ def probe(ip, cfg, limiter=None):
 
     rec = None
     if uniplus_first:
-        rec = probe_uniplus(ip, online_to, data_to, collect_identity)
-        if rec is None:
-            rec = probe_stock(ip, online_to, data_to, passwords, collect_identity)
+        # 页面已是 UniPlus：禁止再走 probe_stock（6060 占位应答会标成 stock）
+        rec = probe_uniplus(ip, online_to, data_to, collect_identity, password=uni_pwd)
     else:
         rec = probe_stock(ip, online_to, data_to, passwords, collect_identity)
         if rec is None:
-            rec = probe_uniplus(ip, online_to, data_to, collect_identity)
+            rec = probe_uniplus(ip, online_to, data_to, collect_identity, password=uni_pwd)
         elif rec.get("firmware") == "stock" and page_html and _uniplus_html(page_html):
-            alt = probe_uniplus(ip, online_to, data_to, collect_identity)
+            alt = probe_uniplus(ip, online_to, data_to, collect_identity, password=uni_pwd)
             if alt is not None:
                 rec = alt
+            else:
+                rec["firmware"] = "uniplus"
+                rec["note"] = ((rec.get("note") or "") + " HTML=UniPlus").strip()
     if rec is None:
         # AntBox 控制器响应比矿机慢（要查 PLC），给更宽超时
         cont = probe_antbox(ip, max(online_to, 1.5), data_to)

@@ -835,6 +835,8 @@ class MonitorService:
             # MAC is a stable fallback identity for firmware that cannot expose
             # an SN.  Fetch it on discovery scans, not every five-minute patrol.
             scan_cfg["collect_identity"] = kind in {"full", "manual"}
+            # UniPlus 代登/取数密码在 control 段，探测层需要看到
+            scan_cfg["control"] = self.cfg.get("control") or {}
             records = _scan_batch(ips, scan_cfg, progress_cb=cb, workers=workers) if ips else []
             # 看门狗恢复会递增世代并启动新扫描。旧线程苏醒后必须在任何进度更新、
             # 二次探测或落库前退出，否则会覆盖新扫描的进度/快照。
