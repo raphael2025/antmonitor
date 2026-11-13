@@ -564,9 +564,8 @@ def probe_stock(ip, online_to, data_to, passwords, collect_identity=False):
                 temps += [n for n in (_temp(t) for t in chips)
                           if n is not None]
             rec["temp"] = max(temps) if temps else None
-            # 6060 does not expose a MAC.  Only machines without a usable SN
-            # need the extra authenticated request, and only on discovery scans.
-            if collect_identity and not sn_valid(rec["sn"]):
+            # 6060 不带 MAC；发现/手动扫描额外读一次。有合法 SN 也要采，列表在 SN 下单独显示。
+            if collect_identity:
                 try:
                     ir = s.get(f"http://{ip}/cgi-bin/get_system_info.cgi",
                                auth=HTTPDigestAuth(user, pwd), timeout=data_to)

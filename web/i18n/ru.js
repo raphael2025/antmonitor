@@ -200,6 +200,7 @@ I18N.register('ru', {
   "th.temp": "Чип °C",
   "th.uptime": "Аптайм",
   "th.worker": "Worker",
+  "th.mac": "MAC",
   "th.note": "Заметка",
   "cmd.cancel": "Отмена",
   "cmd.confirm": "Подтвердить",

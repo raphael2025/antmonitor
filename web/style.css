@@ -115,6 +115,7 @@ td.low { color: #f0883e; font-weight: 600; }
 .cbcol { width: 28px; text-align: center; }
 td.cbcol input, th.cbcol input { cursor: pointer; }
 tr.sel { background: #15293f; }
+td.mac-col { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; white-space: nowrap; }
 
 .modal-foot { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
 #cmdBody { font-size: 13px; line-height: 1.9; color: #c9d1d9; }

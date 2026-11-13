@@ -607,7 +607,8 @@ async function refreshMiners() {
       + tempCell(r)
       + `<td>${fmtUptime(r.uptime)}</td>`
       + `<td>${esc(r.worker) || "-"}</td>`
-      + `<td>${esc(r.sn) || "-"}${r.mac ? `<br><small>${esc(r.mac)}</small>` : ""}</td>`
+      + `<td>${esc(r.sn) || "-"}</td>`
+      + `<td class="mac-col">${esc(r.mac) || "-"}</td>`
       + `<td class="muted">${esc(r.note)}</td></tr>`;
   }).join("");
   const more = $("renderNote");

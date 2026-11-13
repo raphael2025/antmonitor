@@ -207,6 +207,7 @@ I18N.register('en', {
   "th.temp": "Chip °C",
   "th.uptime": "Uptime",
   "th.worker": "Worker",
+  "th.mac": "MAC",
   "th.note": "Note",
   "cmd.cancel": "Cancel",
   "cmd.confirm": "Confirm",

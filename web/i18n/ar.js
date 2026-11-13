@@ -200,6 +200,7 @@ I18N.register('ar', {
   "th.temp": "حرارة الشريحة",
   "th.uptime": "مدة التشغيل",
   "th.worker": "العامل",
+  "th.mac": "MAC",
   "th.note": "ملاحظة",
   "cmd.cancel": "إلغاء",
   "cmd.confirm": "تأكيد",

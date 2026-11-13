@@ -207,6 +207,7 @@ I18N.register('zh', {
   "th.temp": "芯片温",
   "th.uptime": "运行时长",
   "th.worker": "矿工名",
+  "th.mac": "MAC",
   "th.note": "备注",
   "cmd.cancel": "取消",
   "cmd.confirm": "确认执行",

@@ -765,7 +765,7 @@ def api_public_customers(request: Request, hours: int = 24, until_ts: float = No
 
 # ---- 会话 API ----
 _SORT_FIELDS = {"ip", "status", "firmware", "model", "hr_rt", "hr_avg", "power",
-                "eff", "temp", "uptime", "worker", "sn"}
+                "eff", "temp", "uptime", "worker", "sn", "mac"}
 
 
 @app.get("/api/miners")
