@@ -645,6 +645,8 @@ def _uniplus_from_stats_payload(d):
         if isinstance(chips, list):
             temps += [n for n in (_temp(t) for t in chips) if n is not None]
     rec["temp"] = max(temps) if temps else None
+    # chain[].sn 是算力板 SN，不是整机 SN。刷过超频固件的机器常永久无整机 SN，
+    # 身份靠 MAC（get_system_info.macaddr），不能拿板卡 SN 冒充整机。
     return rec
 
 
@@ -657,9 +659,11 @@ def _uniplus_login_token(s, ip, password, timeout):
             headers={"Accept": "application/json",
                      "Content-Type": "application/x-www-form-urlencoded"},
         )
-        if "json" not in (r.headers.get("Content-Type") or ""):
+        # 与 get_system_info 相同：1.3.x 偶发空/非 json Content-Type，仍可能是 JSON body。
+        try:
+            data = r.json()
+        except ValueError:
             return ""
-        data = r.json()
         if isinstance(data, dict):
             return str(data.get("token") or "").strip()
     except (requests.RequestException, ValueError, AttributeError):
@@ -667,11 +671,18 @@ def _uniplus_login_token(s, ip, password, timeout):
     return ""
 
 
-def _uniplus_fetch_power(s, ip, timeout):
-    """UniPlus 1.3.x 功率在独立服务 :8000/api/v0/power（Web「功率」同源，无需 Bearer）。
+def _uniplus_parse_power_log(text):
+    """log_status.cgi 文本里取最近一条 Power:NNNN（:8000 抖动时的可靠兜底）。"""
+    if not text:
+        return None
+    matches = re.findall(r"Power\s*:\s*([0-9]+(?:\.[0-9]+)?)", text, flags=re.I)
+    if not matches:
+        return None
+    return _nonnegative(matches[-1], integer=True)
 
-    get_stats.cgi 不含 watt/jt；前端用本接口的 power(W) ÷ 实时算力(TH/s) 得到 J/TH。
-    """
+
+def _uniplus_fetch_power_api(s, ip, timeout):
+    """Web「功率」同源：:8000/api/v0/power → {"power": W}。现场常慢/超时，调用方应短超时。"""
     try:
         r = s.get(
             f"http://{ip}:8000/api/v0/power",
@@ -688,16 +699,39 @@ def _uniplus_fetch_power(s, ip, timeout):
         return None
 
 
-def _uniplus_fill_power_eff(rec, s, ip, timeout):
-    """补齐 UniPlus 功耗/能耗比：优先已有字段，缺功耗则拉 :8000，缺 eff 则用 W/TH 推算。"""
+def _uniplus_fetch_power_log(s, ip, token, timeout):
+    if not token:
+        return None
+    try:
+        r = s.get(
+            f"http://{ip}/cgi-bin/log_status.cgi",
+            timeout=timeout,
+            headers={"Authorization": f"Bearer {token}", "Accept": "*/*"},
+        )
+        if r.status_code != 200:
+            return None
+        return _uniplus_parse_power_log(r.text)
+    except (requests.RequestException, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _uniplus_fill_power_eff(rec, s, ip, timeout, token=None):
+    """补齐 UniPlus 功耗/能耗比。
+
+    现场 :8000/api/v0/power 在并发扫描下经常读超时（会拖垮整轮）；
+    已持有 Bearer 时优先解析 log_status 的 Power:（稳定，约半小时一条）。
+    log 没有时再短超时打 :8000。缺 eff 时用 W/TH/s 推算。
+    """
     if rec is None:
         return
     if rec.get("power") is None:
-        watts = _uniplus_fetch_power(s, ip, timeout)
+        watts = _uniplus_fetch_power_log(s, ip, token, timeout)
+        if watts is None:
+            api_to = min(0.5, float(timeout) if timeout else 0.5)
+            watts = _uniplus_fetch_power_api(s, ip, api_to)
         if watts is not None:
             rec["power"] = watts
     if rec.get("eff") is None and rec.get("power") is not None:
-        # 与 Web / data_metrics.efficiency 一致：J/TH = W / (TH/s)
         hr = rec.get("hr_rt")
         if hr is None:
             hr = rec.get("hr_avg")
@@ -716,6 +750,7 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False, password=
     s = get_session()
     data_to = data_to or online_to
     rec = None
+    token = ""
 
     # 1) 旧 API（1.3.x 常回 SPA HTML，json 解析失败或无 miner 字段 → 跳过）
     try:
@@ -779,9 +814,11 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False, password=
         rec.update(sm)
         rec["note"] = "UniPlus经4028取数"
 
-    # 1.3.x Web「功率/效率」来自 :8000/api/v0/power，get_stats 无 watt/jt
+    # 功耗：get_stats 无 watt；:8000 易超时，log_status 作兜底（需 token）
+    if rec is not None and rec.get("power") is None and not token:
+        token = _uniplus_login_token(s, ip, password, online_to)
     if rec is not None:
-        _uniplus_fill_power_eff(rec, s, ip, min(data_to, 2.0))
+        _uniplus_fill_power_eff(rec, s, ip, min(data_to, 2.0), token=token or None)
 
     if collect_identity and rec is not None and not rec.get("mac"):
         # 旧 API 身份
@@ -793,7 +830,7 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False, password=
                     system.get("network_status") if isinstance(system, dict) else {}) or {}
                 rec["mac"] = normalize_mac(network.get("mac"))
                 serial = info.get("serial") or info.get("sn")
-                if sn_valid(serial):
+                if sn_valid(serial) and not sn_valid(rec.get("sn")):
                     rec["sn"] = str(serial).strip()
         except (requests.RequestException, ValueError, AttributeError):
             pass

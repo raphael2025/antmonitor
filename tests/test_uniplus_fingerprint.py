@@ -35,7 +35,9 @@ def test_probe_uniplus_uses_bearer_get_stats(monkeypatch):
                 return Resp(headers={"Content-Type": "application/json"}, payload={
                     "INFO": {"type": "Antminer S19 XP+ Hyd", "CompileTime": "Uniplus 1.3.1"},
                     "STATS": [{"rate_5s": 345000.0, "rate_avg": 344000.0, "elapsed": 100,
-                               "chain": [{"temp_chip": [70, 71]}]}],
+                               # chain[].sn 仅为算力板 SN，不得写入整机 sn
+                               "chain": [{"temp_chip": [70, 71], "sn": "HQDZYT9BEJCAH008Y"},
+                                         {"temp_chip": [72], "sn": "HQDZYT9BEJCAH004E"}]}],
                 })
             if url.endswith("/cgi-bin/get_system_info.cgi"):
                 # 现场 CGI 常不带 application/json，只回 text/plain；以前会因此丢掉 MAC
@@ -56,6 +58,7 @@ def test_probe_uniplus_uses_bearer_get_stats(monkeypatch):
     assert rec["model"] == "Antminer S19 XP+ Hyd"
     assert rec["hr_rt"] == 345.0
     assert rec["mac"] == "A8:1B:DB:B4:E7:FB"
+    assert not rec.get("sn")  # 无整机 SN；板卡 SN 不顶替，身份靠 MAC
     assert rec["power"] == 5703
     assert rec["eff"] == 16.53  # 5703 / 345 TH/s，与 Web 同源算法
 
@@ -73,11 +76,13 @@ def test_probe_uniplus_mac_not_blocked_by_missing_content_type(monkeypatch):
                 return Resp(headers={}, payload={"mac": "aa:bb:cc:dd:ee:ff"})
             if ":8000/api/v0/power" in url:
                 return Resp(status=404)
+            if url.endswith("/cgi-bin/log_status.cgi"):
+                return Resp(status=404)
             return Resp(status=404)
 
         def post(self, url, **kwargs):
-            return Resp(headers={"Content-Type": "application/json"},
-                        payload={"status": "ok", "token": "t"})
+            # 空 Content-Type 也应能登录（与 MAC 同类坑）
+            return Resp(headers={}, payload={"status": "ok", "token": "t"})
 
     monkeypatch.setattr(miner_core, "get_session", Session)
     rec = miner_core.probe_uniplus("10.0.0.2", 1, 1, collect_identity=True)
@@ -110,6 +115,57 @@ def test_probe_uniplus_power_from_port_8000(monkeypatch):
     assert rec["power"] == 5703
     assert rec["eff"] == 18.13  # 5703 / 314.59
 
+
+def test_probe_uniplus_power_falls_back_to_log_status(monkeypatch):
+    """优先 log_status；:8000 即使超时也不影响（扫描路径不先等它）。"""
+    class Session:
+        def get(self, url, **kwargs):
+            if url.endswith("/api/v1/summary"):
+                return Resp(headers={"Content-Type": "text/html"}, text="<html>")
+            if url.endswith("/cgi-bin/get_stats.cgi"):
+                return Resp(payload={
+                    "INFO": {"type": "S19"},
+                    "STATS": [{"rate_5s": 318000.0, "rate_avg": 317000.0, "elapsed": 10}],
+                })
+            if ":8000/api/v0/power" in url:
+                raise miner_core.requests.exceptions.ReadTimeout("slow")
+            if url.endswith("/cgi-bin/log_status.cgi"):
+                return Resp(text="\n[11-13 19:11:53] Power:5813 ,Temp:38,Hash :317.99T\n"
+                                 "[11-13 19:41:57] Power:5807 ,Temp:37,Hash :318.60T\n")
+            return Resp(status=404)
+
+        def post(self, url, **kwargs):
+            return Resp(payload={"status": "ok", "token": "t"})
+
+    monkeypatch.setattr(miner_core, "get_session", Session)
+    rec = miner_core.probe_uniplus("172.16.119.10", 1, 1)
+    assert rec["power"] == 5807  # 取最新一条
+    assert rec["eff"] == 18.26   # 5807 / 318.0
+
+
+def test_probe_uniplus_power_api_when_log_empty(monkeypatch):
+    class Session:
+        def get(self, url, **kwargs):
+            if url.endswith("/api/v1/summary"):
+                return Resp(headers={"Content-Type": "text/html"}, text="<html>")
+            if url.endswith("/cgi-bin/get_stats.cgi"):
+                return Resp(payload={
+                    "INFO": {"type": "S19"},
+                    "STATS": [{"rate_5s": 300000.0, "rate_avg": 300000.0, "elapsed": 1}],
+                })
+            if url.endswith("/cgi-bin/log_status.cgi"):
+                return Resp(text="no power lines yet\n")
+            if ":8000/api/v0/power" in url:
+                return Resp(payload={"power": 5400})
+            return Resp(status=404)
+
+        def post(self, url, **kwargs):
+            return Resp(payload={"status": "ok", "token": "t"})
+
+    monkeypatch.setattr(miner_core, "get_session", Session)
+    rec = miner_core.probe_uniplus("10.0.0.8", 1, 1)
+    assert rec["power"] == 5400
+    assert rec["eff"] == 18.0
 
 def test_probe_prefers_uniplus_when_html_says_so(monkeypatch):
     html = '<meta name="firmware" content="UniPlusOS" /><title>Firmware Console</title>'
