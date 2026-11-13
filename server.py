@@ -1991,14 +1991,26 @@ def _wait_port_free(host, port, timeout=30):
         time.sleep(0.5)
 
 
+def _ensure_listen_port_free(port):
+    """启动前主动清掉仍占用监听端口的进程（WinError 10048），再短等确认。"""
+    try:
+        import windows_launcher as _launcher
+        _launcher.free_listen_port(port)
+    except Exception as e:  # noqa: BLE001 - 清端口失败不阻止后续 wait/bind，由 uvicorn 报错
+        log.warning("清理端口 %s 失败: %s", port, e)
+    _wait_port_free("127.0.0.1", port, timeout=10)
+
+
 if __name__ == "__main__":
     import uvicorn
-    if os.environ.pop("MINER_WAIT_PORT_FREE", None):
-        _wait_port_free(CFG["server"]["host"], CFG["server"]["port"])
-    _announce_and_open_browser(CFG["server"]["host"], CFG["server"]["port"])
+    port = CFG["server"]["port"]
+    # 守护重启 / 网页更新拉起 / 直接 python server.py：都先杀掉占用端口的旧进程再绑。
+    os.environ.pop("MINER_WAIT_PORT_FREE", None)  # 兼容旧更新器；清端口已统一走下面
+    _ensure_listen_port_free(port)
+    _announce_and_open_browser(CFG["server"]["host"], port)
     tls = _tls_files()
     if (CFG["server"].get("tls_cert") or CFG["server"].get("tls_key")) and not tls:
         log.error("server.tls_cert/tls_key 配了但文件不存在，仍以 HTTP 启动")
-    uvicorn.run(app, host=CFG["server"]["host"], port=CFG["server"]["port"],
+    uvicorn.run(app, host=CFG["server"]["host"], port=port,
                 ssl_certfile=tls[0] if tls else None, ssl_keyfile=tls[1] if tls else None,
                 log_config=None)   # 日志统一交给 logs.py

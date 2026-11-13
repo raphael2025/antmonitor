@@ -1,5 +1,6 @@
 """Bootstrap failures must stop before a restart loop; updates must recheck deps."""
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 
@@ -13,6 +14,12 @@ def _no_web_update_bootstrap(monkeypatch):
     """ZIP 转 git 会联网、调 git：这些单元测试只测守护循环，统一关掉(真实流程由
     tests/windows_smoke.py 和 tests/windows_git_bootstrap.py 在 CI 的 Windows 上跑)。"""
     monkeypatch.setattr(launcher, "enable_web_updates", lambda base, env: None)
+
+
+@pytest.fixture
+def _no_port_cleanup(monkeypatch):
+    """守护循环单测不真的清端口。"""
+    monkeypatch.setattr(launcher, "free_listen_port", lambda *a, **k: None)
 
 
 def environment(tmp_path):
@@ -184,7 +191,51 @@ def test_new_and_interrupted_setup_prompt_for_admin(tmp_path, monkeypatch):
     assert (tmp_path / "config.yaml").read_text() == "auth: {}\n"
 
 
-def test_update_exit_rechecks_environment_and_does_not_count_as_failure(tmp_path, monkeypatch):
+def test_configured_server_port_reads_yaml(tmp_path, monkeypatch):
+    monkeypatch.delenv("MINER_CONFIG", raising=False)
+    (tmp_path / "config.yaml").write_text(
+        "server:\n  host: 0.0.0.0\n  port: 9900\n", encoding="utf-8")
+    assert launcher.configured_server_port(tmp_path) == 9900
+    assert launcher.configured_server_port(tmp_path / "missing") == launcher.DEFAULT_PORT
+
+
+def test_pids_listening_on_parses_windows_netstat(monkeypatch):
+    sample = (
+        "  TCP    0.0.0.0:8800    0.0.0.0:0    LISTENING    4242\n"
+        "  TCP    127.0.0.1:88001   0.0.0.0:0    LISTENING    9\n"
+        "  TCP    [::]:8800       [::]:0       LISTENING    4242\n"
+        "  TCP    0.0.0.0:8800    1.2.3.4:5    ESTABLISHED  7\n"
+    )
+    monkeypatch.setattr(launcher.os, "name", "nt")
+
+    def fake_check_output(args, **kwargs):
+        return sample
+
+    monkeypatch.setattr(launcher.subprocess, "check_output", fake_check_output)
+    assert launcher.pids_listening_on(8800) == [4242]
+
+
+def test_free_listen_port_taskkills_listeners(monkeypatch):
+    killed = []
+    calls = {"n": 0}
+
+    def fake_pids(port):
+        calls["n"] += 1
+        return [111] if calls["n"] == 1 else []
+
+    monkeypatch.setattr(launcher.os, "name", "nt")
+    monkeypatch.setattr(launcher, "pids_listening_on", fake_pids)
+    monkeypatch.setattr(launcher.subprocess, "run",
+                        lambda args, **kw: killed.append(list(args)) or
+                        type("R", (), {"returncode": 0})())
+    monkeypatch.setattr(launcher.time, "sleep", lambda s: None)
+    launcher.free_listen_port(8800, exclude_pids=[os.getpid()])
+    assert killed and killed[0][:3] == ["taskkill", "/F", "/PID"]
+    assert killed[0][3] == "111"
+
+
+def test_update_exit_rechecks_environment_and_does_not_count_as_failure(
+        tmp_path, monkeypatch, _no_port_cleanup):
     # Four failed starts, update exit 42, four failed starts, then clean shutdown.
     codes = iter([1] * 4 + [42] + [1] * 4 + [0])
     launches = []
@@ -207,7 +258,7 @@ def test_update_exit_rechecks_environment_and_does_not_count_as_failure(tmp_path
     assert all(e["MINER_NO_BROWSER"] == "1" for e in launches[1:])
 
 
-def test_repeated_crashes_stop_at_five(tmp_path, monkeypatch):
+def test_repeated_crashes_stop_at_five(tmp_path, monkeypatch, _no_port_cleanup):
     launches = []
     monkeypatch.setattr(launcher, "prepare_environment", lambda base: Path("python"))
     monkeypatch.setattr(launcher, "prepare_config", lambda *args: None)
@@ -223,7 +274,7 @@ def test_repeated_crashes_stop_at_five(tmp_path, monkeypatch):
     assert len(launches) == 5
 
 
-def test_ctrl_c_does_not_restart(tmp_path, monkeypatch):
+def test_ctrl_c_does_not_restart(tmp_path, monkeypatch, _no_port_cleanup):
     waits = []
     monkeypatch.setattr(launcher, "prepare_environment", lambda base: Path("python"))
     monkeypatch.setattr(launcher, "prepare_config", lambda *args: None)

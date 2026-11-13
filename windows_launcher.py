@@ -20,7 +20,133 @@ MAX_PYTHON = (3, 15)  # exclusive: newer minors need Windows wheel validation fi
 MAX_FAILURES = 5
 MIN_UPTIME = 30
 RESTART_DELAY = 3
+DEFAULT_PORT = 8800
 IMPORT_CHECK = "import requests, fastapi, uvicorn, websockets, yaml, httpx, openpyxl"
+
+
+def configured_server_port(base):
+    """Read server.port from config.yaml without importing app deps (stdlib only)."""
+    config = Path(os.environ.get("MINER_CONFIG") or "config.yaml")
+    if not config.is_absolute():
+        config = base / config
+    if not config.is_file():
+        return DEFAULT_PORT
+    try:
+        text = config.read_text(encoding="utf-8")
+    except OSError:
+        return DEFAULT_PORT
+    in_server = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if line.strip() == "server:" or line.startswith("server:"):
+            in_server = True
+            continue
+        if in_server and line and not line[0].isspace() and not line.startswith(" "):
+            # next top-level key
+            if not line.startswith("\t"):
+                in_server = False
+        if in_server:
+            stripped = line.strip()
+            if stripped.startswith("port:"):
+                try:
+                    return int(stripped.split(":", 1)[1].strip())
+                except ValueError:
+                    return DEFAULT_PORT
+    return DEFAULT_PORT
+
+
+def _addr_port(local_addr):
+    """Extract port from netstat local address (0.0.0.0:8800 or [::]:8800)."""
+    if "]:" in local_addr:  # IPv6 like [::]:8800
+        return int(local_addr.rsplit("]:", 1)[-1])
+    return int(local_addr.rsplit(":", 1)[-1])
+
+
+def pids_listening_on(port):
+    """PIDs with a TCP LISTENING socket on port (Windows netstat; else ss/lsof)."""
+    port = int(port)
+    pids = set()
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(
+                ["netstat", "-ano", "-p", "tcp"],
+                stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                errors="replace")
+        except (OSError, subprocess.SubprocessError):
+            return []
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) < 5 or parts[0].upper() != "TCP":
+                continue
+            if parts[3].upper() != "LISTENING":
+                continue
+            try:
+                if _addr_port(parts[1]) != port:
+                    continue
+                pid = int(parts[-1])
+            except ValueError:
+                continue
+            if pid > 0:
+                pids.add(pid)
+        return sorted(pids)
+    # Non-Windows: best-effort for local dev
+    for cmd in (
+        ["ss", "-lptn", "sport = :" + str(port)],
+        ["lsof", "-t", "-iTCP:" + str(port), "-sTCP:LISTEN"],
+    ):
+        try:
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for token in out.replace(",", " ").split():
+            if token.isdigit() and int(token) > 0:
+                pids.add(int(token))
+            elif "pid=" in token:
+                try:
+                    pids.add(int(token.split("pid=", 1)[1].split(",")[0].split(")")[0]))
+                except ValueError:
+                    pass
+        if pids:
+            break
+    return sorted(pids)
+
+
+def free_listen_port(port, *, exclude_pids=None, wait_sec=15.0):
+    """Kill processes listening on port, then wait until the port is free.
+
+    Used before each server start so a leftover python/server from a crashed
+    restart (WinError 10048) cannot block the new process.
+    """
+    port = int(port)
+    exclude = {os.getpid(), os.getppid()}
+    if exclude_pids:
+        exclude.update(int(p) for p in exclude_pids)
+    victims = [pid for pid in pids_listening_on(port) if pid not in exclude]
+    for pid in victims:
+        print("Port {} busy (PID {}); stopping it before start...".format(port, pid),
+              flush=True)
+        try:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", str(pid)],
+                    check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.kill(pid, 15)
+        except OSError as error:
+            print("Could not stop PID {}: {}".format(pid, error), flush=True)
+    if not victims:
+        return
+    deadline = time.monotonic() + float(wait_sec)
+    while time.monotonic() < deadline:
+        left = [pid for pid in pids_listening_on(port) if pid not in exclude]
+        if not left:
+            print("Port {} is free.".format(port), flush=True)
+            return
+        time.sleep(0.3)
+    print("WARNING: port {} still busy after cleanup: {}".format(
+        port, pids_listening_on(port)), flush=True)
 
 
 def run_checked(args, base):
@@ -152,6 +278,9 @@ def supervise(base):
         if first_launch:
             prepare_config(python, base)
             first_launch = False
+        # Leftover server from a failed restart holds 8800 → WinError 10048.
+        # Free the configured listen port before every launch.
+        free_listen_port(configured_server_port(base))
         started = time.monotonic()
         child = subprocess.Popen([str(python), str(base / "server.py")],
                                  cwd=str(base), env=env)
