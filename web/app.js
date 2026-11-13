@@ -39,6 +39,11 @@ function alertDetail(x) {
     return u ? t("alert.offline_unresponsive", { rounds: u[1] }) : t("alert.offline");
   }
   if (x.type === "zero") return t("alert.zero");
+  if (x.type === "reboot_limit") {
+    const m = value(/已成功重启\s*(\d+)\s*次\(上限\s*(\d+)\)/);
+    return m ? t("alert.reboot_limit", { count: m[1], max: m[2] })
+      : t("alert.reboot_limit_short");
+  }
   if (x.type === "reject") {
     const m = value(/拒绝率\s*([\d.]+)%\s*≥\s*([\d.]+)%/);
     return m ? t("alert.reject", { rate: m[1], threshold: m[2] }) : t("alert.reject_short");
@@ -385,6 +390,7 @@ function announceCounts(counts) {
   if (n("segment_down")) parts.push(t("voice.segment_down", { n: n("segment_down") }));
   if (n("offline")) parts.push(t("voice.offline", { n: n("offline") }));
   if (n("zero")) parts.push(t("voice.zero", { n: n("zero") }));
+  if (n("reboot_limit")) parts.push(t("voice.reboot_limit", { n: n("reboot_limit") }));
   if (n("low_hashrate")) parts.push(t("voice.low_hr", { n: n("low_hashrate") }));
   if (n("overheat")) parts.push(t("voice.overheat", { n: n("overheat") }));
   if (n("reject")) parts.push(t("voice.reject", { n: n("reject") }));

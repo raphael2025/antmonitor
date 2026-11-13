@@ -871,7 +871,8 @@ def set_machine_state(conn, ips, state):
         conn.executemany("UPDATE known_miners SET state=? WHERE ip=?", [(state, ip) for ip in ips])
 
 
-_MINER_ALERT_TYPES = ("offline", "zero", "reject", "low_hashrate", "overheat", "pool_hijack")
+_MINER_ALERT_TYPES = ("offline", "zero", "reject", "low_hashrate", "overheat",
+                      "pool_hijack", "reboot_limit")
 
 
 def _resolve_gone_miners(conn, ips, ts):

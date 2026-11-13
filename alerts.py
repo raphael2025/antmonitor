@@ -25,7 +25,8 @@ log = logs.get(__name__)
 
 # 本模块产生的全部告警类型（启动清理旧类型时作为白名单）
 MINER_TYPES = ("offline", "zero", "reject", "low_hashrate", "overheat",
-               "segment_down", "site_down", "stalled", "pool_hijack")
+               "segment_down", "site_down", "stalled", "pool_hijack",
+               "reboot_limit")
 
 # 全场级事件的告警 ip(不是某台机器)
 SITE_KEY = "__site__"
@@ -127,10 +128,11 @@ def _tg_send(tg_cfg, text):
 
 # 恢复时推送通知的告警类型(严重类)。零算力/掉算力/拒绝率这类 warn 抖动多，恢复不推，免得刷屏
 RECOVERY_TYPES = ("offline", "segment_down", "site_down", "overheat", "pool_hijack",
-                  "cooler_offline")
+                  "cooler_offline", "reboot_limit")
 _RECOVERY_LABEL = {"offline": "掉线", "segment_down": "整段掉线", "site_down": "全场大面积掉线",
                    "overheat": "高温",
-                   "pool_hijack": "矿池不在白名单", "cooler_offline": "集装箱控制器离线"}
+                   "pool_hijack": "矿池不在白名单", "cooler_offline": "集装箱控制器离线",
+                   "reboot_limit": "重启次数耗尽"}
 
 
 def _push_recovered(cfg, recovered):
@@ -508,6 +510,34 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
     # remain visible forever after upgrading; share counters remain available for metrics.
     for alert in db.active_alerts_by_type(conn, "reject"):
         b.resolve(alert["ip"], "reject", recovered=False)
+
+    # 24h 成功重启次数触顶：限流已不再下发，机器若仍异常基本是硬件故障，单独挂 crit。
+    max_day = int((cfg.get("control") or {}).get("reboot_max_per_day", 4) or 4)
+    if max_day > 0:
+        watched = [ip for ip in cur if ip in roster]
+        rb_stats = db.reboot_stats(conn, watched, window_sec=86400) if watched else {}
+        for ip in watched:
+            r = cur[ip]
+            seg = ".".join(ip.split(".")[:3])
+            muted = ip in repair or seg in down_segments
+            cnt = int((rb_stats.get(ip) or {}).get("count") or 0)
+            hr = r.get("hr_rt")
+            # unknown 且本轮没真正探到：别动既有告警，等下一轮有结论再判
+            if r["status"] == "unknown" and not r.get("alive"):
+                continue
+            healthy = r["status"] == "online" and hr is not None and hr > 0
+            unhealthy = (
+                (r["status"] == "online" and hr == 0)
+                or r["status"] == "offline"
+                or (r["status"] == "unknown" and r.get("alive"))
+            )
+            if muted or cnt < max_day or healthy or not unhealthy:
+                # 算力回来才算恢复通知；次数窗口滚出/维修静音只消库、不推「已恢复」
+                b.resolve(ip, "reboot_limit",
+                          recovered=bool(healthy and not muted))
+            else:
+                b.fire(ip, "reboot_limit", "crit",
+                       f"{ip} 24h内已成功重启{cnt}次(上限{max_day})，疑似硬件故障")
 
     fired = b.commit()
     if fired:

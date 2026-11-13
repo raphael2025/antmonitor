@@ -163,3 +163,28 @@ def test_cloud_summary_counts_machines_in_down_segments(conn):
     g = {x["category"]: x for x in cloud_alert_summary.build(conn)}["segment_down"]
     assert g["count"] == 10 and "1个网段" in g["label"]
     assert {w["worker"]: w["count"] for w in g["workers"]} == {"甲": 5, "乙": 5}
+
+
+def test_reboot_limit_alert_when_24h_quota_exhausted(conn, cfg):
+    """24h 成功重启触顶且机器仍异常 → reboot_limit；算力恢复后消警。"""
+    import time
+    ip = "10.0.7.4"
+    cfg["control"]["reboot_max_per_day"] = 4
+    _roster(conn, [ip])
+    now = int(time.time())
+    for i in range(4):
+        db.log_commands(conn, "ops@test", "reboot",
+                        [{"ip": ip, "ok": True, "msg": "ok"}], ts=now - 3600 * (i + 1))
+
+    peer = "10.0.7.5"
+    db.log_commands(conn, "ops@test", "reboot",
+                    [{"ip": peer, "ok": True, "msg": "ok"}], ts=now - 100)
+    _roster(conn, [ip, peer])
+    fired = _run(conn, cfg, [rec(ip, hr=0.0), rec(peer, hr=0.0)])
+    kinds = [(f[0], f[1]) for f in fired]
+    assert (ip, "reboot_limit") in kinds
+    assert (peer, "reboot_limit") not in kinds
+    assert db.active_alert(conn, ip, "reboot_limit") is not None
+
+    _run(conn, cfg, [rec(ip, hr=100.0), rec(peer, hr=100.0)])
+    assert db.active_alert(conn, ip, "reboot_limit") is None
