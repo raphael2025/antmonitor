@@ -19,7 +19,8 @@ def automatic(cfg, monkeypatch):
     cfg["db"]["path"] = ":memory:"
     cfg["schedule"]["enabled"] = False
     cfg["control"].update(enabled=True, reboot_enabled=True, reboot_concurrency=1,
-                          reboot_delay_sec=8, reboot_shuffle=False)
+                          reboot_delay_sec=8, reboot_shuffle=False,
+                          zero_reboot_wait_sec=900)
     clock = [BASE]
     monkeypatch.setattr(service.time, "time", lambda: clock[0])
     monkeypatch.setattr(alerts, "push_text", lambda *args: None)

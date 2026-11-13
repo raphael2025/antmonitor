@@ -184,16 +184,26 @@ class MonitorService:
         return blocked
 
     def _zero_reboot_timing(self):
-        """自动零算力等候/次数：读 control 配置，默认与现网一致（900 秒 / 4 次）。"""
+        """自动零算力等候/次数。
+
+        默认：识别到零算力后再等 zero_reboot_wait_rounds 轮快巡检（× schedule.scan_interval）
+        才重启；zero_reboot_wait_sec>0 时优先用绝对秒数。次数默认 4。
+        """
         ctl = self.cfg.get("control") or {}
-        wait = int(ctl.get("zero_reboot_wait_sec",
-                           ctl.get("reboot_min_interval_sec", 900)) or 900)
+        sch = self.cfg.get("schedule") or {}
+        explicit = int(ctl.get("zero_reboot_wait_sec") or 0)
+        if explicit > 0:
+            wait = explicit
+        else:
+            rounds = int(ctl.get("zero_reboot_wait_rounds", 2) or 2)
+            scan_iv = int(sch.get("scan_interval", 300) or 300)
+            wait = max(1, rounds) * max(1, scan_iv)
         max_attempts = int(ctl.get("zero_reboot_max_attempts",
                                    ctl.get("reboot_max_per_day", 4)) or 4)
         return max(1, wait), max(1, max_attempts)
 
     def zero_reboot_candidates(self, records, now=None):
-        """持续零算力重启：首个合格零算力样本起等候，每次尝试后再等，次数达上限停止。"""
+        """持续零算力重启：首个合格零算力样本起等候（默认两轮快巡检），再下发。"""
         now = int(time.time()) if now is None else int(now)
         ctl = self.cfg.get("control") or {}
         acfg = self.cfg.get("alerts") or {}

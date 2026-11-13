@@ -16,7 +16,8 @@ IP = "192.0.2.20"
 def thermal(cfg, monkeypatch):
     cfg["db"]["path"] = ":memory:"
     cfg["schedule"]["enabled"] = False
-    cfg["control"].update(enabled=True, reboot_enabled=True)
+    cfg["control"].update(enabled=True, reboot_enabled=True,
+                          zero_reboot_wait_sec=900)
     clock = [BASE]
     monkeypatch.setattr(service.time, "time", lambda: clock[0])
     monkeypatch.setattr(alerts, "push_text", lambda *args: None)

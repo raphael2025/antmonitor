@@ -99,18 +99,19 @@ def test_auto_reboot_only_targets_online_zero_hashrate(conn, cfg):
     svc = _svc(conn, cfg)
     now = int(time.time())
     ip = "10.0.3.2"
+    wait = svc._zero_reboot_timing()[0]  # 默认 2×scan_interval
     db.upsert_known_miners(conn, [rec(ip)], now)
 
     # 在线且明确读到 0 算力才启动计时；掉线期间清掉未尝试的计时且不重启。
     assert svc.zero_reboot_candidates([rec(ip, status="online", hr_rt=0)], now=now) == []
-    assert svc.zero_reboot_candidates([rec(ip, status="offline")], now=now + 900) == []
+    assert svc.zero_reboot_candidates([rec(ip, status="offline")], now=now + wait) == []
     assert ip not in db.zero_reboot_states(conn)
 
-    # 恢复在线零算力后重新累计 15 分钟才进入候选。
+    # 恢复在线零算力后重新等满两轮快巡检才进入候选。
     assert svc.zero_reboot_candidates(
-        [rec(ip, status="online", hr_rt=0)], now=now + 900) == []
+        [rec(ip, status="online", hr_rt=0)], now=now + wait) == []
     candidates = svc.zero_reboot_candidates(
-        [rec(ip, status="online", hr_rt=0)], now=now + 1800)
+        [rec(ip, status="online", hr_rt=0)], now=now + wait * 2)
     assert [target[0] for target in candidates] == [ip]
 
 
@@ -140,7 +141,9 @@ def _zero_svc(conn, cfg, monkeypatch):
 
 
 def test_maintenance_segment_paused_other_segments_still_reboot(conn, cfg, monkeypatch):
-    """维护某个网段(150 台零算力)：只暂停这一段，别的网段里真坏的那台照常重启。"""
+    """可选成片熔断开启时：维护网段暂停，其它网段零算力机照常。"""
+    cfg["control"]["zero_reboot_mass_ratio"] = 0.2
+    cfg["control"]["zero_reboot_wait_sec"] = 900
     svc, pushed = _zero_svc(conn, cfg, monkeypatch)
     now = int(time.time())
     maint = [f"10.0.1.{i}" for i in range(1, 151)]
@@ -153,7 +156,6 @@ def test_maintenance_segment_paused_other_segments_still_reboot(conn, cfg, monke
     assert [t[0] for t in got] == [other[0]]
     assert len(pushed) == 1 and "10.0.1.x" in pushed[0] and "其他网段照常" in pushed[0]
     assert not any(ip in db.zero_reboot_states(conn) for ip in maint)
-    # 维护结束后剩 1 台还是零算力：从恢复那一刻重新计时 15 分钟
     recs = [rec(maint[0], hr_rt=0)] + [rec(ip) for ip in maint[1:] + other]
     assert svc.zero_reboot_candidates(recs, now=now + 1000) == []
     got = svc.zero_reboot_candidates(recs, now=now + 1000 + 900)
@@ -161,7 +163,9 @@ def test_maintenance_segment_paused_other_segments_still_reboot(conn, cfg, monke
 
 
 def test_site_wide_zero_hashrate_pauses_everything(conn, cfg, monkeypatch):
-    """矿池故障/限电：各网段都成片零算力 → 全场暂停，只推一次。"""
+    """可选成片熔断开启时：全场成片零算力 → 全场暂停。"""
+    cfg["control"]["zero_reboot_mass_ratio"] = 0.2
+    cfg["control"]["zero_reboot_wait_sec"] = 900
     svc, pushed = _zero_svc(conn, cfg, monkeypatch)
     now = int(time.time())
     ips = [f"10.0.{s}.{i}" for s in range(1, 6) for i in range(1, 101)]
@@ -174,7 +178,9 @@ def test_site_wide_zero_hashrate_pauses_everything(conn, cfg, monkeypatch):
 
 
 def test_scattered_zero_across_site_pauses_everything(conn, cfg, monkeypatch):
-    """每段只有零星几台、但全场合计占比过高(如部分矿池故障)：按全场暂停。"""
+    """可选成片熔断开启时：全场占比过高 → 全场暂停。"""
+    cfg["control"]["zero_reboot_mass_ratio"] = 0.2
+    cfg["control"]["zero_reboot_wait_sec"] = 900
     svc, pushed = _zero_svc(conn, cfg, monkeypatch)
     now = int(time.time())
     ips = [f"10.0.{s}.{i}" for s in range(1, 11) for i in range(1, 11)]   # 10 段 × 10 台
@@ -185,10 +191,26 @@ def test_scattered_zero_across_site_pauses_everything(conn, cfg, monkeypatch):
     assert len(pushed) == 1 and "全场" in pushed[0]
 
 
+def test_mass_fuse_off_by_default_reboots_segment_zeros(conn, cfg, monkeypatch):
+    """默认关闭成片熔断：成片零算力网段里的机，等满两轮快巡检后仍可进候选。"""
+    svc, pushed = _zero_svc(conn, cfg, monkeypatch)
+    now = int(time.time())
+    wait = svc._zero_reboot_timing()[0]
+    ips = [f"10.0.1.{i}" for i in range(1, 21)]
+    db.upsert_known_miners(conn, [rec(ip) for ip in ips], now)
+    zero = [rec(ip, hr_rt=0) for ip in ips]
+    assert svc.zero_reboot_candidates(zero, now=now) == []
+    got = svc.zero_reboot_candidates(zero, now=now + wait)
+    assert sorted(t[0] for t in got) == sorted(ips)
+    assert pushed == []
+
+
 def test_mass_zero_ratio_needs_min_count(conn, cfg):
     """小场地 1 台零算力占比虽高，不算成片事件。"""
     cfg["control"]["enabled"] = True
     cfg["control"]["reboot_enabled"] = True
+    cfg["control"]["zero_reboot_mass_ratio"] = 0.2
+    cfg["control"]["zero_reboot_wait_sec"] = 900
     svc = _svc(conn, cfg)
     now = int(time.time())
     db.upsert_known_miners(conn, [rec("10.0.9.1"), rec("10.0.9.2")], now)
@@ -196,7 +218,6 @@ def test_mass_zero_ratio_needs_min_count(conn, cfg):
     svc.zero_reboot_candidates(recs, now=now)
     got = svc.zero_reboot_candidates(recs, now=now + 900)
     assert [t[0] for t in got] == ["10.0.9.1"]
-
 
 def test_auto_zero_wait_and_attempts_read_config(conn, cfg):
     """自动零算力等候/次数读 zero_reboot_*，不再写死 900/4。"""
@@ -220,19 +241,33 @@ def test_auto_zero_wait_and_attempts_read_config(conn, cfg):
 
 def test_crash_loop_low_uptime_still_auto_reboots_after_grace(conn, cfg):
     """挖矿崩溃环：uptime 永远 < zero_grace，但连续零算力已满宽限 → 仍进自动候选。"""
-    cfg["control"].update(enabled=True, reboot_enabled=True)
+    cfg["control"].update(enabled=True, reboot_enabled=True,
+                          zero_reboot_wait_sec=900)
     cfg["alerts"]["zero_grace_sec"] = 600
     svc = _svc(conn, cfg)
     now = int(time.time())
     ip = "10.0.8.2"
     db.upsert_known_miners(conn, [rec(ip)], now)
-    # 首次样本：uptime 低，只启动计时
     assert svc.zero_reboot_candidates(
         [rec(ip, hr_rt=0, uptime=30)], now=now) == []
-    # 连续零算力仍短于 grace → 真开机升频，跳过（即使已接近等候期）
     assert svc.zero_reboot_candidates(
         [rec(ip, hr_rt=0, uptime=30)], now=now + 500) == []
-    # 连续零算力已满 grace，且等候期满 → 崩溃环，允许重启
     got = svc.zero_reboot_candidates(
         [rec(ip, hr_rt=0, uptime=30)], now=now + 900)
     assert [t[0] for t in got] == [ip]
+
+
+def test_default_wait_is_two_quick_scan_rounds(conn, cfg):
+    cfg["control"].update(enabled=True, reboot_enabled=True)
+    cfg["schedule"]["scan_interval"] = 300
+    cfg["control"]["zero_reboot_wait_sec"] = 0
+    cfg["control"]["zero_reboot_wait_rounds"] = 2
+    svc = _svc(conn, cfg)
+    assert svc._zero_reboot_timing() == (600, 4)
+    now = int(time.time())
+    ip = "10.0.8.3"
+    db.upsert_known_miners(conn, [rec(ip)], now)
+    zero = [rec(ip, hr_rt=0)]
+    assert svc.zero_reboot_candidates(zero, now=now) == []
+    assert svc.zero_reboot_candidates(zero, now=now + 599) == []
+    assert svc.zero_reboot_candidates(zero, now=now + 600) == [(ip, "stock")]

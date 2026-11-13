@@ -112,19 +112,18 @@ DEFAULTS = {
         "enabled": False, "uniplus_password": "", "timeout": 8, "max_batch": 1000,
         "reboot_concurrency": 30, "reboot_delay_sec": 8, "reboot_shuffle": True,
         "reboot_grace_sec": 600,
-        # 自动重启：默认关。掉线按扫描评估。
+        # 自动重启：默认关。掉线不自动重启；在线确认零算力后等 N 轮快巡检再重启。
         # 成功限流（手动+自动共用，只计 ok=1）：reboot_max_per_day / reboot_min_interval_sec。
-        # 自动零算力状态机：zero_reboot_wait_sec / zero_reboot_max_attempts（未单独配时回退上两项）。
         "reboot_enabled": False,
         "reboot_max_per_day": 4,
         "reboot_min_interval_sec": 900,
-        "zero_reboot_wait_sec": 900,
+        # 等候：zero_reboot_wait_sec>0 用绝对秒；否则 rounds × schedule.scan_interval（默认 2 轮）
+        "zero_reboot_wait_sec": 0,
+        "zero_reboot_wait_rounds": 2,
         "zero_reboot_max_attempts": 4,
-        # 成片零算力熔断：某 /24 网段零算力 ≥ zero_reboot_mass_min 台且占该段在线机比例
-        # > zero_reboot_mass_ratio → 只暂停该段的零算力自动重启(维护/断电/矿池配置问题)；
-        # 去掉这些网段后全场剩余在线机仍满足同样条件 → 全场暂停(矿池故障/限电)。ratio=0 关闭熔断
+        # 成片熔断可选：ratio=0 关闭（默认关——按单机零算力重启，不因网段成片而暂停）
         "zero_reboot_mass_min": 5,
-        "zero_reboot_mass_ratio": 0.2,
+        "zero_reboot_mass_ratio": 0,
         # 允许换到的矿池主机名(含子域名)。只能在 config.yaml 配置，网页改不了。
         # 为空 = 禁止网页换矿池、也不做矿池篡改告警
         "pool_allowlist": [],   # 下发重启后这么久内掉线不报警；过了仍不在线报"重启后未上线"
@@ -267,7 +266,8 @@ def _validate(cfg):
     clamp("control", "reboot_grace_sec", 0, 86400, int)
     clamp("control", "reboot_max_per_day", 1, 100, int)
     clamp("control", "reboot_min_interval_sec", 0, 86400, int)
-    clamp("control", "zero_reboot_wait_sec", 1, 86400, int)
+    clamp("control", "zero_reboot_wait_sec", 0, 86400, int)
+    clamp("control", "zero_reboot_wait_rounds", 1, 100, int)
     clamp("control", "zero_reboot_max_attempts", 1, 100, int)
     clamp("control", "zero_reboot_mass_min", 1, 100000, int)
     clamp("control", "zero_reboot_mass_ratio", 0, 1)
