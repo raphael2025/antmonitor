@@ -321,32 +321,196 @@ def _stock(ip, action, params, passwords, timeout):
     return False, "不支持的命令"
 
 
+def _looks_like_spa_html(r):
+    """UniPlus 1.3.x 把未知 /api/v1/* 路由回 SPA HTML 且常带 200，不能当命令成功。"""
+    ct = (r.headers.get("Content-Type") or "").lower()
+    if "html" in ct:
+        return True
+    body = (r.text or "").lstrip()[:64].lower()
+    return body.startswith("<!doctype") or body.startswith("<html")
+
+
+def _uniplus_json_ok(r):
+    """1.3.x cgi 成功体为 {\"status\":\"ok\"}；旧 API 可能空 body 的 200/204。"""
+    if r.status_code not in (200, 204):
+        return False
+    if _looks_like_spa_html(r):
+        return False
+    text = (r.text or "").strip()
+    if not text:
+        return True
+    try:
+        data = r.json()
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return True
+    st = data.get("status")
+    if st is None:
+        return True
+    return str(st).lower() in ("ok", "success", "true", "1")
+
+
+def _uniplus_bearer_headers(token):
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _uniplus_reboot(s, ip, uni_pw, timeout):
+    """第三方重启：1.3.x 与网页一致——login.cgi 拿 Bearer，再 GET /cgi-bin/reboot.cgi。
+
+    已拿到 token 且 cgi 有明确应答（非 404/405）时不再回落旧 /api/v1，避免 SPA HTML 假成功
+    与多余请求。仅无 token（旧固件无 login.cgi）时才走 unlock + /api/v1/system/reboot。
+    """
+    pwd = uni_pw or "admin"
+    token = miner_core._uniplus_login_token(s, ip, pwd, timeout)
+    if token:
+        url = f"http://{ip}/cgi-bin/reboot.cgi"
+        try:
+            r = s.get(url, headers=_uniplus_bearer_headers(token), timeout=timeout)
+        except requests.RequestException as e:
+            # Bearer 已带上：读超时/对端断开通常表示矿机已开始重启
+            if _request_sent_then_dropped(e):
+                return True, "已下发(矿机未回响应即断开，通常表示已开始重启)"
+            return False, f"连不上矿机: {e}"
+        if r.status_code == 401:
+            return False, "需要 uniplus 解锁密码"
+        if _uniplus_json_ok(r):
+            return True, "reboot ok"
+        # 1.3.x 已确认有 login：cgi 失败或 SPA 壳都直接失败，不打 legacy REST
+        if r.status_code in (404, 405):
+            return False, f"矿机拒绝重启: HTTP {r.status_code}"
+        if _looks_like_spa_html(r):
+            return False, "UniPlus 接口为网页壳，重启未真正下发"
+        return False, f"矿机拒绝重启: HTTP {r.status_code}"
+
+    # 旧版 UniPlus REST（无 login.cgi / 无 token）
+    if uni_pw:
+        try:
+            s.post(f"http://{ip}/api/v1/unlock", json={"pw": uni_pw}, timeout=timeout)
+        except requests.RequestException:
+            pass
+    try:
+        r = s.post(f"http://{ip}/api/v1/system/reboot", timeout=timeout)
+    except requests.RequestException as e:
+        if _request_sent_then_dropped(e):
+            return True, "已下发(矿机未回响应即断开，通常表示已开始重启)"
+        return False, f"连不上矿机: {e}"
+    if r.status_code == 401:
+        return False, "需要 uniplus 解锁密码"
+    if _looks_like_spa_html(r):
+        return False, "UniPlus 接口为网页壳，重启未真正下发"
+    if r.status_code in (200, 204):
+        return True, "reboot ok"
+    return False, f"矿机拒绝重启: HTTP {r.status_code}"
+
+
+def _uniplus_locate(s, ip, uni_pw, on, timeout):
+    """1.3.x：Bearer POST blink.cgi action=startBlink|stopBlink；旧版 /api/v1/find-miner。"""
+    pwd = uni_pw or "admin"
+    token = miner_core._uniplus_login_token(s, ip, pwd, timeout)
+    if token:
+        try:
+            r = s.post(
+                f"http://{ip}/cgi-bin/blink.cgi",
+                headers={**_uniplus_bearer_headers(token),
+                         "Content-Type": "application/x-www-form-urlencoded"},
+                data={"action": "startBlink" if on else "stopBlink"},
+                timeout=timeout,
+            )
+        except requests.RequestException as e:
+            return False, f"连不上矿机: {e}"
+        if r.status_code == 401:
+            return False, "需要 uniplus 解锁密码"
+        if _uniplus_json_ok(r) or (r.status_code == 200 and not _looks_like_spa_html(r)):
+            return True, f"locate={on}"
+        if _looks_like_spa_html(r):
+            return False, "UniPlus 接口为网页壳，定位灯未真正下发"
+        return False, f"定位灯失败: HTTP {r.status_code}"
+
+    try:
+        r = s.post(f"http://{ip}/api/v1/find-miner", json={"find": on}, timeout=timeout)
+    except requests.RequestException as e:
+        return False, f"连不上矿机: {e}"
+    if _looks_like_spa_html(r):
+        return False, "UniPlus 接口为网页壳，定位灯未真正下发"
+    if r.status_code == 200:
+        return True, f"locate={on}"
+    return False, f"定位灯失败: HTTP {r.status_code}"
+
+
+def _uniplus_set_pools(s, ip, uni_pw, pools, timeout):
+    """1.3.x：Bearer 读 get_miner_conf.cgi，再 POST set_miner_conf.cgi；旧版 /api/v1/settings。"""
+    pwd = uni_pw or "admin"
+    token = miner_core._uniplus_login_token(s, ip, pwd, timeout)
+    if token:
+        headers = _uniplus_bearer_headers(token)
+        try:
+            r = s.get(f"http://{ip}/cgi-bin/get_miner_conf.cgi",
+                      headers=headers, timeout=timeout)
+        except requests.RequestException as e:
+            return False, f"连不上矿机: {e}"
+        if r.status_code == 401:
+            return False, "需要 uniplus 解锁密码"
+        if _looks_like_spa_html(r):
+            return False, "UniPlus 接口为网页壳，换池未真正下发"
+        try:
+            conf = r.json()
+        except ValueError:
+            return False, "读取现有配置失败"
+        if not isinstance(conf, dict):
+            return False, "读取现有配置失败"
+        conf["pools"] = pools
+        try:
+            r = s.post(
+                f"http://{ip}/cgi-bin/set_miner_conf.cgi",
+                headers={**headers, "Content-Type": "application/json"},
+                json=conf,
+                timeout=timeout,
+            )
+        except requests.RequestException as e:
+            return False, f"连不上矿机: {e}"
+        if r.status_code == 401:
+            return False, "需要 uniplus 解锁密码"
+        if _looks_like_spa_html(r):
+            return False, "UniPlus 接口为网页壳，换池未真正下发"
+        if _uniplus_json_ok(r) or (r.status_code in (200, 204) and not _looks_like_spa_html(r)):
+            # 1.3.x 成功体常为 {"stats":"success"} / {"status":"ok"}
+            try:
+                data = r.json() if (r.text or "").strip() else {}
+            except ValueError:
+                data = {}
+            if isinstance(data, dict) and (
+                    str(data.get("stats", "")).lower() == "error"
+                    or str(data.get("code", "")) == "401"):
+                return False, data.get("msg") or "换池失败"
+            return True, "pools updated"
+        return False, f"换池失败: HTTP {r.status_code}"
+
+    if uni_pw:
+        try:
+            s.post(f"http://{ip}/api/v1/unlock", json={"pw": uni_pw}, timeout=timeout)
+        except requests.RequestException:
+            pass
+    try:
+        r = s.post(f"http://{ip}/api/v1/settings", json={"pools": pools}, timeout=timeout)
+    except requests.RequestException as e:
+        return False, f"连不上矿机: {e}"
+    if r.status_code == 401:
+        return False, "需要 uniplus 解锁密码"
+    if _looks_like_spa_html(r):
+        return False, "UniPlus 接口为网页壳，换池未真正下发"
+    return r.status_code in (200, 204), "pools updated"
+
+
 def _uniplus(ip, action, params, uni_pw, timeout):
     s = requests.Session(); s.trust_env = False
-    base = f"http://{ip}/api/v1"
     try:
         if action == "locate":
-            on = bool(params.get("on"))
-            r = s.post(f"{base}/find-miner", json={"find": on}, timeout=timeout)
-            return r.status_code == 200, f"locate={on}"
-        # reboot / set_pools 需要解锁
-        if uni_pw:
-            s.post(f"{base}/unlock", json={"pw": uni_pw}, timeout=timeout)
+            return _uniplus_locate(s, ip, uni_pw, bool(params.get("on")), timeout)
         if action == "reboot":
-            try:
-                r = s.post(f"{base}/system/reboot", timeout=timeout)
-            except requests.RequestException as e:
-                if _request_sent_then_dropped(e):
-                    return True, "已下发(矿机未回响应即断开，通常表示已开始重启)"
-                return False, f"连不上矿机: {e}"
-            if r.status_code == 401:
-                return False, "需要 uniplus 解锁密码"
-            return r.status_code in (200, 204), "reboot ok"
+            return _uniplus_reboot(s, ip, uni_pw, timeout)
         if action == "set_pools":
-            r = s.post(f"{base}/settings", json={"pools": params["pools"]}, timeout=timeout)
-            if r.status_code == 401:
-                return False, "需要 uniplus 解锁密码"
-            return r.status_code in (200, 204), "pools updated"
+            return _uniplus_set_pools(s, ip, uni_pw, params.get("pools") or [], timeout)
     except requests.RequestException as e:
         return False, str(e)
     return False, "不支持的命令"

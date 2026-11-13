@@ -196,3 +196,43 @@ def test_mass_zero_ratio_needs_min_count(conn, cfg):
     svc.zero_reboot_candidates(recs, now=now)
     got = svc.zero_reboot_candidates(recs, now=now + 900)
     assert [t[0] for t in got] == ["10.0.9.1"]
+
+
+def test_auto_zero_wait_and_attempts_read_config(conn, cfg):
+    """自动零算力等候/次数读 zero_reboot_*，不再写死 900/4。"""
+    cfg["control"].update(enabled=True, reboot_enabled=True,
+                          zero_reboot_wait_sec=60, zero_reboot_max_attempts=2)
+    svc = _svc(conn, cfg)
+    now = int(time.time())
+    ip = "10.0.8.1"
+    db.upsert_known_miners(conn, [rec(ip)], now)
+    zero = [rec(ip, hr_rt=0)]
+    assert svc.zero_reboot_candidates(zero, now=now) == []
+    assert svc.zero_reboot_candidates(zero, now=now + 59) == []
+    assert svc.zero_reboot_candidates(zero, now=now + 60) == [(ip, "stock")]
+    db.record_zero_reboot_attempts(conn, [ip], now + 60)
+    assert svc.zero_reboot_candidates(zero, now=now + 119) == []
+    assert svc.zero_reboot_candidates(zero, now=now + 120) == [(ip, "stock")]
+    db.record_zero_reboot_attempts(conn, [ip], now + 120)
+    assert svc.zero_reboot_candidates(zero, now=now + 9999) == []
+    assert db.zero_reboot_states(conn)[ip]["attempts"] == 2
+
+
+def test_crash_loop_low_uptime_still_auto_reboots_after_grace(conn, cfg):
+    """挖矿崩溃环：uptime 永远 < zero_grace，但连续零算力已满宽限 → 仍进自动候选。"""
+    cfg["control"].update(enabled=True, reboot_enabled=True)
+    cfg["alerts"]["zero_grace_sec"] = 600
+    svc = _svc(conn, cfg)
+    now = int(time.time())
+    ip = "10.0.8.2"
+    db.upsert_known_miners(conn, [rec(ip)], now)
+    # 首次样本：uptime 低，只启动计时
+    assert svc.zero_reboot_candidates(
+        [rec(ip, hr_rt=0, uptime=30)], now=now) == []
+    # 连续零算力仍短于 grace → 真开机升频，跳过（即使已接近等候期）
+    assert svc.zero_reboot_candidates(
+        [rec(ip, hr_rt=0, uptime=30)], now=now + 500) == []
+    # 连续零算力已满 grace，且等候期满 → 崩溃环，允许重启
+    got = svc.zero_reboot_candidates(
+        [rec(ip, hr_rt=0, uptime=30)], now=now + 900)
+    assert [t[0] for t in got] == [ip]

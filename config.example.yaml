@@ -121,9 +121,13 @@ control:
   reboot_delay_sec: 8      # 每批之间间隔秒数(让涌流回落、电压稳定；网页顶部可改)
   reboot_shuffle: true     # 打乱重启顺序(把同变压器的连号机器分散到不同批次，最关键)
   reboot_enabled: false    # 零算力自动重启总开关(默认关；网页顶部可开)。只重启在线且明确零算力的机器；控制手动命令的开关仍是 enabled
-  # 持续零算力满15分钟后重启；仍未恢复则每15分钟重试，最多4次；正算力恢复后计数清零
-  reboot_max_per_day: 4    # 滚动 24h 内每 IP 最多成功重启次数(手动+自动共用；只计 ok=1)
+  # 成功重启限流（手动+自动共用，只计 command_log ok=1）：
+  reboot_max_per_day: 4    # 滚动 24h 内每 IP 最多成功重启次数
   reboot_min_interval_sec: 900  # 同一 IP 两次成功重启最小间隔(秒)；默认 15 分钟
+  # 自动零算力状态机（与上面限流分开）：持续零算力满等候期后重启；未恢复则再等再试；正算力清零。
+  # 未单独配置时回退到 reboot_min_interval_sec / reboot_max_per_day，默认仍是 900 秒 / 4 次。
+  zero_reboot_wait_sec: 900       # 首次零算力样本起、以及每次尝试后的等候秒数
+  zero_reboot_max_attempts: 4     # 自动重启最多尝试次数(含失败；与日成功限额正交)
   zero_reboot_mass_min: 5      # 成片零算力熔断：某 /24 网段零算力至少这么多台，且
   zero_reboot_mass_ratio: 0.2  # 占该段在线机比例超过此值 → 只暂停该段自动重启(维护/断电)；去掉这些段后
                                # 全场剩余在线机仍满足 → 全场暂停(矿池故障/限电)。0=关闭熔断

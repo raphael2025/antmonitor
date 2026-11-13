@@ -210,3 +210,122 @@ def test_reboot_grace_zero_never_fires_for_unmarked_miners(conn, cfg):
     _run(conn, cfg, [rec("10.0.0.1"), rec("10.0.0.2", status="offline")], state)
     fired = _run(conn, cfg, [rec("10.0.0.1", status="offline"), rec("10.0.0.2", status="offline")], state)
     assert fired == [("10.0.0.1", "offline")]
+
+
+# ---------- UniPlus 1.3.x 重启 ----------
+
+class _UniResp:
+    def __init__(self, code, text="", content_type="application/json"):
+        self.status_code = code
+        self.text = text
+        self.headers = {"Content-Type": content_type}
+
+    def json(self):
+        import json
+        return json.loads(self.text)
+
+
+def test_uniplus_reboot_uses_bearer_cgi_like_web_ui(monkeypatch):
+    """1.3.x：login.cgi 拿 token 后 GET /cgi-bin/reboot.cgi，与官方 SPA 一致。"""
+    calls = []
+
+    class Sess:
+        def get(self, url, headers=None, timeout=None):
+            calls.append(("GET", url, (headers or {}).get("Authorization")))
+            return _UniResp(200, '{"status":"ok"}')
+
+        def post(self, *a, **k):
+            raise AssertionError("1.3.x 成功路径不应落到旧 /api/v1/system/reboot")
+
+    monkeypatch.setattr(control.miner_core, "_uniplus_login_token",
+                        lambda s, ip, pw, to: "tok123")
+    ok, msg = control._uniplus_reboot(Sess(), "10.0.0.9", "", 3)
+    assert ok and msg == "reboot ok"
+    assert calls == [("GET", "http://10.0.0.9/cgi-bin/reboot.cgi", "Bearer tok123")]
+
+
+def test_uniplus_reboot_rejects_spa_html_false_success(monkeypatch):
+    """旧代码把 SPA HTML 的 200 当成 reboot ok——必须拒绝。"""
+    monkeypatch.setattr(control.miner_core, "_uniplus_login_token",
+                        lambda *a, **k: "")
+
+    class Sess:
+        def post(self, url, json=None, timeout=None):
+            return _UniResp(200, "<!doctype html><html>", "text/html")
+
+    ok, msg = control._uniplus_reboot(Sess(), "10.0.0.9", "admin", 3)
+    assert not ok and "网页壳" in msg
+
+
+def test_uniplus_reboot_with_token_does_not_fall_back_to_legacy(monkeypatch):
+    """已 login 拿到 token 后，cgi 非 ok 不得再打 /api/v1/system/reboot。"""
+    posts = []
+
+    class Sess:
+        def get(self, url, headers=None, timeout=None):
+            return _UniResp(500, '{"status":"error"}')
+
+        def post(self, url, json=None, timeout=None):
+            posts.append(url)
+            return _UniResp(200, "{}")
+
+    monkeypatch.setattr(control.miner_core, "_uniplus_login_token",
+                        lambda *a, **k: "tok")
+    ok, msg = control._uniplus_reboot(Sess(), "10.0.0.9", "admin", 3)
+    assert not ok and "500" in msg
+    assert posts == []
+
+
+def test_uniplus_legacy_api_reboot_still_works(monkeypatch):
+    monkeypatch.setattr(control.miner_core, "_uniplus_login_token",
+                        lambda *a, **k: "")
+    posts = []
+
+    class Sess:
+        def post(self, url, json=None, timeout=None):
+            posts.append(url)
+            if url.endswith("/unlock"):
+                return _UniResp(200, "{}")
+            return _UniResp(204, "")
+
+    ok, msg = control._uniplus_reboot(Sess(), "10.0.0.9", "secret", 3)
+    assert ok and msg == "reboot ok"
+    assert posts[-1].endswith("/api/v1/system/reboot")
+
+
+def test_uniplus_locate_uses_bearer_blink(monkeypatch):
+    calls = []
+
+    class Sess:
+        def post(self, url, headers=None, data=None, json=None, timeout=None):
+            calls.append((url, data, (headers or {}).get("Authorization")))
+            return _UniResp(200, '{"status":"ok"}')
+
+    monkeypatch.setattr(control.miner_core, "_uniplus_login_token",
+                        lambda *a, **k: "tok")
+    ok, msg = control._uniplus_locate(Sess(), "10.0.0.9", "", True, 3)
+    assert ok and msg == "locate=True"
+    assert calls == [("http://10.0.0.9/cgi-bin/blink.cgi",
+                      {"action": "startBlink"}, "Bearer tok")]
+
+
+def test_uniplus_set_pools_uses_bearer_cgi(monkeypatch):
+    calls = []
+
+    class Sess:
+        def get(self, url, headers=None, timeout=None):
+            calls.append(("GET", url))
+            return _UniResp(200, '{"pools":[{"url":"old"}],"bitmain-fan-ctrl":true}')
+
+        def post(self, url, headers=None, json=None, data=None, timeout=None):
+            calls.append(("POST", url, json))
+            return _UniResp(200, '{"stats":"success"}')
+
+    monkeypatch.setattr(control.miner_core, "_uniplus_login_token",
+                        lambda *a, **k: "tok")
+    pools = [{"url": "stratum+tcp://a:3333", "user": "w", "pass": "x"}]
+    ok, msg = control._uniplus_set_pools(Sess(), "10.0.0.9", "admin", pools, 3)
+    assert ok and msg == "pools updated"
+    assert calls[0] == ("GET", "http://10.0.0.9/cgi-bin/get_miner_conf.cgi")
+    assert calls[1][0] == "POST" and calls[1][1].endswith("set_miner_conf.cgi")
+    assert calls[1][2]["pools"] == pools

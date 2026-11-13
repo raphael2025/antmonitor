@@ -73,7 +73,11 @@ def test_later_automatic_group_rechecks_current_state(automatic, monkeypatch, ch
         elif change == "stale":
             clock[0] += db.MAX_SAMPLE_GAP + 1
         elif change == "warming":
+            # 真开机宽限：uptime 低且连续零算力计时仍短于 zero_grace_sec。
+            # 若计时已很长（崩溃环），应对齐告警 warming 豁免继续下发——见 crash-loop 单测。
             rows[1]["uptime"] = 30
+            db.clear_zero_reboot_states(svc.conn, [IPS[1]])
+            db.start_zero_reboot_states(svc.conn, [IPS[1]], int(clock[0]) - 30)
         elif change == "mass_paused":
             svc._alert_state["zero_mass_segs"] = {"192.0.2"}
         elif change == "quota_changed":

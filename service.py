@@ -183,11 +183,21 @@ class MonitorService:
                 blocked[ip] = f"芯片温度尚未低于 {clear:g}℃ 回落阈值，自动重启已暂停"
         return blocked
 
+    def _zero_reboot_timing(self):
+        """自动零算力等候/次数：读 control 配置，默认与现网一致（900 秒 / 4 次）。"""
+        ctl = self.cfg.get("control") or {}
+        wait = int(ctl.get("zero_reboot_wait_sec",
+                           ctl.get("reboot_min_interval_sec", 900)) or 900)
+        max_attempts = int(ctl.get("zero_reboot_max_attempts",
+                                   ctl.get("reboot_max_per_day", 4)) or 4)
+        return max(1, wait), max(1, max_attempts)
+
     def zero_reboot_candidates(self, records, now=None):
-        """持续零算力重启：首个合格零算力样本起等15分钟，每次尝试后等15分钟，最多4次。"""
+        """持续零算力重启：首个合格零算力样本起等候，每次尝试后再等，次数达上限停止。"""
         now = int(time.time()) if now is None else int(now)
         ctl = self.cfg.get("control") or {}
         acfg = self.cfg.get("alerts") or {}
+        wait_sec, max_attempts = self._zero_reboot_timing()
         states = db.zero_reboot_states(self.conn)
         thermal = self._zero_reboot_thermal_blocks(records)
         repair = db.quiet_ips(self.conn)  # 维修 + 限电：都不自动重启
@@ -195,8 +205,8 @@ class MonitorService:
                            if a["ip"].endswith(".x")}
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         clear = set(repair) | (set(states) - roster)
-        # 缺温/高温期间不能累计首次自动重启的等候时间；确认降温且告警解除后重新等满15分钟。
-        # 已尝试的次数和真实下发时间保留，不能靠温度变化绕过4次上限。
+        # 缺温/高温期间不能累计首次自动重启的等候时间；确认降温且告警解除后重新等满等候期。
+        # 已尝试的次数和真实下发时间保留，不能靠温度变化绕过次数上限。
         clear.update(ip for ip, st in states.items()
                      if ip in thermal and int(st.get("attempts") or 0) == 0)
         rebooting = self._alert_state.get("rebooting") or {}
@@ -236,7 +246,7 @@ class MonitorService:
         #   1) 按 /24 网段：段内零算力 ≥ zero_reboot_mass_min 台且占该段在线机 > zero_reboot_mass_ratio
         #      → 只暂停这一段(维护某个网段、该段断电/交换机/矿池配置问题)，其他网段照常
         #   2) 去掉暂停的网段后，剩余在线机仍满足同样条件 → 全场性(矿池故障/限电/断网)，整体暂停
-        # 暂停范围内未尝试过的计时清零：事件结束后掉队的机器重新等满 15 分钟，而不是一恢复就被重启
+        # 暂停范围内未尝试过的计时清零：事件结束后掉队的机器重新等满等候期，而不是一恢复就被重启
         mass_min = int(ctl.get("zero_reboot_mass_min", 5) or 1)
         mass_ratio = float(ctl.get("zero_reboot_mass_ratio", 0.2) or 0)
 
@@ -299,7 +309,7 @@ class MonitorService:
             seg = ".".join(ip.split(".")[:3])
             if ip in repair or ip in thermal or seg in active_segments or seg in paused:
                 continue
-            # Start the 15-minute timer on the first zero sample. Startup grace is
+            # Start the wait timer on the first zero sample. Startup grace is
             # checked separately before sending, so it never delays the timer itself.
             if ip not in states:
                 starts.append(ip)
@@ -310,7 +320,7 @@ class MonitorService:
         for r in records:
             ip = r["ip"]
             st = states.get(ip)
-            if not st or int(st.get("attempts") or 0) >= 4:
+            if not st or int(st.get("attempts") or 0) >= max_attempts:
                 continue
             status = r.get("status")
             if status == "unknown":
@@ -319,7 +329,10 @@ class MonitorService:
                 if r.get("hr_rt") != 0:
                     continue
                 uptime = r.get("uptime")
-                if grace and isinstance(uptime, (int, float)) and uptime < grace:
+                # 与告警 warming 对齐：uptime 仍在开机宽限内，但连续零算力已满
+                # zero_grace_sec（用计时 started_at）时允许进入自动重启（挖矿崩溃环）。
+                if (grace and isinstance(uptime, (int, float)) and uptime < grace
+                        and now - int(st["started_at"]) < grace):
                     continue
                 seg = ".".join(ip.split(".")[:3])
                 if ip in repair or ip in thermal or seg in active_segments or seg in paused:
@@ -330,7 +343,7 @@ class MonitorService:
             if now - int(rebooting.get(ip, 0) or 0) < rb_grace:
                 continue
             last = st.get("last_attempt_at")
-            due = int(last) + 900 if last else int(st["started_at"]) + 900
+            due = int(last) + wait_sec if last else int(st["started_at"]) + wait_sec
             if now >= due:
                 targets.append((ip, r.get("firmware") or ""))
         return targets
@@ -399,6 +412,7 @@ class MonitorService:
         rebooting = self._alert_state.get("rebooting") or {}
         rb_grace = int(ctl.get("reboot_grace_sec", 600))
         grace = int((self.cfg.get("alerts") or {}).get("zero_grace_sec", 600) or 0)
+        wait_sec, max_attempts = self._zero_reboot_timing()
         eligible, skipped = [], []
         for ip, firmware in targets:
             row, st = current.get(ip), states.get(ip)
@@ -419,11 +433,12 @@ class MonitorService:
             elif now - int(rebooting.get(ip, 0) or 0) < rb_grace:
                 reason = "机器仍在重启静默期"
             elif (grace and isinstance(row.get("uptime"), (int, float))
-                  and row["uptime"] < grace):
+                  and row["uptime"] < grace
+                  and st and now - int(st["started_at"]) < grace):
                 reason = "机器仍在开机宽限期"
-            elif not st or int(st.get("attempts") or 0) >= 4:
+            elif not st or int(st.get("attempts") or 0) >= max_attempts:
                 reason = "零算力计时已取消或自动尝试已达上限"
-            elif now < int(st.get("last_attempt_at") or st["started_at"]) + 900:
+            elif now < int(st.get("last_attempt_at") or st["started_at"]) + wait_sec:
                 reason = "尚未到下一次自动重启时间"
             if reason:
                 skipped.append({"ip": ip, "ok": False, "skipped": True,

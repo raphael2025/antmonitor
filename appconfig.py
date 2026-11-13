@@ -112,12 +112,14 @@ DEFAULTS = {
         "enabled": False, "uniplus_password": "", "timeout": 8, "max_batch": 1000,
         "reboot_concurrency": 30, "reboot_delay_sec": 8, "reboot_shuffle": True,
         "reboot_grace_sec": 600,
-        # 自动重启：默认关。掉线按扫描评估；零算力持续15分钟后重启，失败每15分钟重试，最多4次。
-        # 手动与自动共用限流：滚动 24h 内每 IP 最多 reboot_max_per_day 次成功重启，
-        # 且距上次成功至少 reboot_min_interval_sec 秒。
+        # 自动重启：默认关。掉线按扫描评估。
+        # 成功限流（手动+自动共用，只计 ok=1）：reboot_max_per_day / reboot_min_interval_sec。
+        # 自动零算力状态机：zero_reboot_wait_sec / zero_reboot_max_attempts（未单独配时回退上两项）。
         "reboot_enabled": False,
         "reboot_max_per_day": 4,
         "reboot_min_interval_sec": 900,
+        "zero_reboot_wait_sec": 900,
+        "zero_reboot_max_attempts": 4,
         # 成片零算力熔断：某 /24 网段零算力 ≥ zero_reboot_mass_min 台且占该段在线机比例
         # > zero_reboot_mass_ratio → 只暂停该段的零算力自动重启(维护/断电/矿池配置问题)；
         # 去掉这些网段后全场剩余在线机仍满足同样条件 → 全场暂停(矿池故障/限电)。ratio=0 关闭熔断
@@ -265,6 +267,8 @@ def _validate(cfg):
     clamp("control", "reboot_grace_sec", 0, 86400, int)
     clamp("control", "reboot_max_per_day", 1, 100, int)
     clamp("control", "reboot_min_interval_sec", 0, 86400, int)
+    clamp("control", "zero_reboot_wait_sec", 1, 86400, int)
+    clamp("control", "zero_reboot_max_attempts", 1, 100, int)
     clamp("control", "zero_reboot_mass_min", 1, 100000, int)
     clamp("control", "zero_reboot_mass_ratio", 0, 1)
     # 告警阈值：0 在这几项里是"关闭该告警"的约定语义，故下限取 0 而非正数；
