@@ -1196,6 +1196,144 @@ function toast(text, kind) {
   setTimeout(() => t.remove(), 6000);
 }
 
+/* ---------------- 重启记录（批次汇总） ---------------- */
+let _rhOpenKey = "";
+
+function closeRebootHist() {
+  $("rebootHistModal").classList.add("hidden");
+  _rhOpenKey = "";
+}
+
+function rhBatchKey(b) {
+  return `${b.user}|${b.id_from}|${b.id_to}`;
+}
+
+async function loadRebootHist() {
+  const body = $("rebootHistBody");
+  if (!body) return;
+  body.innerHTML = `<div class="muted">${esc(t("rh.loading"))}</div>`;
+  try {
+    const d = await jget("/api/command/reboot-history?limit=50");
+    const batches = d.batches || [];
+    if (!batches.length) {
+      body.innerHTML = `<div class="muted">${esc(t("rh.empty"))}</div>`;
+      return;
+    }
+    let html = `<table class="rh-table"><thead><tr>`
+      + `<th>${esc(t("rh.th_time"))}</th>`
+      + `<th>${esc(t("rh.th_source"))}</th>`
+      + `<th>${esc(t("rh.th_user"))}</th>`
+      + `<th>${esc(t("rh.th_total"))}</th>`
+      + `<th>${esc(t("rh.th_ok"))}</th>`
+      + `<th>${esc(t("rh.th_fail"))}</th>`
+      + `<th>${esc(t("rh.th_act"))}</th>`
+      + `</tr></thead><tbody>`;
+    for (const b of batches) {
+      const key = rhBatchKey(b);
+      const src = b.source === "auto" ? "auto" : "manual";
+      const srcLabel = src === "auto" ? t("rh.src_auto") : t("rh.src_manual");
+      const timeTxt = b.ended_ts && b.ended_ts !== b.started_ts
+        ? `${fmtTime(b.started_ts)} → ${fmtTime(b.ended_ts)}`
+        : fmtTime(b.started_ts);
+      html += `<tr data-rh-key="${esc(key)}">`
+        + `<td>${esc(timeTxt)}</td>`
+        + `<td><span class="rh-src ${src}">${esc(srcLabel)}</span></td>`
+        + `<td>${esc(b.user || "")}</td>`
+        + `<td>${esc(String(b.total || 0))}</td>`
+        + `<td class="rh-ok">${esc(String(b.success || 0))}</td>`
+        + `<td class="${b.failed ? "rh-fail" : ""}">${esc(String(b.failed || 0))}</td>`
+        + `<td><button type="button" class="mini-btn rh-toggle" data-user="${esc(b.user || "")}"`
+        + ` data-from="${esc(String(b.id_from))}" data-to="${esc(String(b.id_to))}"`
+        + ` data-key="${esc(key)}">${esc(_rhOpenKey === key ? t("rh.hide") : t("rh.detail"))}</button></td>`
+        + `</tr>`
+        + `<tr class="rh-detail-row${_rhOpenKey === key ? "" : " hidden"}" data-rh-detail="${esc(key)}">`
+        + `<td colspan="7"><div class="rh-detail">`
+        + `${_rhOpenKey === key ? esc(t("rh.loading")) : ""}</div></td></tr>`;
+    }
+    html += `</tbody></table>`;
+    body.innerHTML = html;
+    body.querySelectorAll(".rh-toggle").forEach(btn => {
+      btn.onclick = () => toggleRebootHistDetail(btn);
+    });
+    if (_rhOpenKey) {
+      const openBtn = body.querySelector(`.rh-toggle[data-key="${CSS.escape(_rhOpenKey)}"]`);
+      if (openBtn) fillRebootHistDetail(openBtn);
+      else _rhOpenKey = "";
+    }
+  } catch (e) {
+    body.innerHTML = `<div class="muted">${esc(t("rh.detail_fail"))}</div>`;
+  }
+}
+
+function rhDetailBox(key) {
+  const row = $("rebootHistBody").querySelector(`tr[data-rh-detail="${CSS.escape(key)}"]`);
+  return row ? row.querySelector(".rh-detail") : null;
+}
+
+async function fillRebootHistDetail(btn) {
+  const key = btn.dataset.key || "";
+  const box = rhDetailBox(key);
+  if (!box) return;
+  box.textContent = t("rh.loading");
+  try {
+    const q = new URLSearchParams({
+      user: btn.dataset.user || "",
+      id_from: btn.dataset.from || "0",
+      id_to: btn.dataset.to || "0",
+    });
+    const d = await jget("/api/command/reboot-history/detail?" + q.toString());
+    const items = d.items || [];
+    if (!items.length) {
+      box.textContent = t("rh.empty");
+      return;
+    }
+    box.innerHTML = items.map(it => {
+      const ok = !!it.ok;
+      const label = ok ? t("rh.item_ok") : t("rh.item_fail");
+      const cls = ok ? "rh-ok" : "rh-fail";
+      const msg = it.msg ? ` — ${it.msg}` : "";
+      return `<div><span class="ip">${esc(it.ip)}</span>`
+        + ` <span class="${cls}">${esc(label)}</span>`
+        + `<span class="muted">${esc(msg)}</span></div>`;
+    }).join("");
+  } catch (e) {
+    box.textContent = t("rh.detail_fail");
+  }
+}
+
+async function toggleRebootHistDetail(btn) {
+  const key = btn.dataset.key || "";
+  const row = $("rebootHistBody").querySelector(`tr[data-rh-detail="${CSS.escape(key)}"]`);
+  if (!row) return;
+  if (_rhOpenKey === key) {
+    _rhOpenKey = "";
+    row.classList.add("hidden");
+    btn.textContent = t("rh.detail");
+    return;
+  }
+  // 一次只展开一批，避免明细刷屏
+  if (_rhOpenKey) {
+    const prev = $("rebootHistBody").querySelector(`tr[data-rh-detail="${CSS.escape(_rhOpenKey)}"]`);
+    const prevBtn = $("rebootHistBody").querySelector(`.rh-toggle[data-key="${CSS.escape(_rhOpenKey)}"]`);
+    if (prev) prev.classList.add("hidden");
+    if (prevBtn) prevBtn.textContent = t("rh.detail");
+  }
+  _rhOpenKey = key;
+  row.classList.remove("hidden");
+  btn.textContent = t("rh.hide");
+  await fillRebootHistDetail(btn);
+}
+
+async function openRebootHist() {
+  if (myRole !== "ops" && myRole !== "admin") return;
+  $("rebootHistModal").classList.remove("hidden");
+  await loadRebootHist();
+}
+
+$("btnRebootHist").onclick = openRebootHist;
+$("rebootHistClose").onclick = $("rebootHistClose2").onclick = closeRebootHist;
+$("rebootHistRefresh").onclick = () => loadRebootHist();
+
 /* ---------------- 网段与扫描设置 ---------------- */
 async function openSeg() {
   const d = await jget("/api/segments");

@@ -1516,6 +1516,29 @@ def api_command_job(job_id: str, _: dict = Depends(require_ops)):
     return {"ok": True, "job": job}
 
 
+@app.get("/api/command/reboot-history")
+def api_reboot_history(limit: int = 50, _: dict = Depends(require_ops)):
+    """重启批次汇总：手动 + 自动，按操作者与时间邻近聚合。"""
+    return {"batches": db.list_reboot_batches(SVC.conn, max(1, min(200, limit)))}
+
+
+@app.get("/api/command/reboot-history/detail")
+def api_reboot_history_detail(user: str = "", id_from: int = 0, id_to: int = 0,
+                              _: dict = Depends(require_ops)):
+    user = str(user or "").strip()
+    if not user or len(user) > 200:
+        return JSONResponse({"ok": False, "error": "参数错误"}, status_code=400)
+    try:
+        id_from, id_to = int(id_from), int(id_to)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "参数错误"}, status_code=400)
+    if id_from <= 0 or id_to <= 0:
+        return JSONResponse({"ok": False, "error": "参数错误"}, status_code=400)
+    rows = db.list_reboot_batch_detail(SVC.conn, user, id_from, id_to)
+    return {"ok": True, "user": user, "id_from": id_from, "id_to": id_to,
+            "total": len(rows), "items": rows}
+
+
 @app.post("/api/command")
 def api_command(request: Request, body: dict = Body(...), sess: dict = Depends(require_ops)):
     """远程命令：{ips:[...], action:"reboot|locate|set_pools", params:{...}, confirm:true}

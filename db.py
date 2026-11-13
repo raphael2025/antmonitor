@@ -1266,6 +1266,74 @@ def list_commands(conn, limit=100):
     return [dict(r) for r in rows]
 
 
+def list_reboot_batches(conn, limit=50, lookback=5000, gap_sec=180):
+    """把 command_log 里的 reboot 行按「同操作者 + 时间邻近」聚成批次。
+
+    覆盖手动同步/异步重启与零算力自动重启（后者只写审计、不建 command_jobs）。
+    gap_sec：同一操作者相邻两条间隔超过此值则拆成新批次（兼容分批下发的批间隔）。
+    """
+    limit = max(1, min(200, int(limit or 50)))
+    lookback = max(limit, min(20000, int(lookback or 5000)))
+    gap_sec = max(30, min(3600, int(gap_sec or 180)))
+    rows = _r(conn).execute(
+        "SELECT id,ts,user,ip,ok,msg FROM command_log "
+        "WHERE action='reboot' ORDER BY ts DESC, id DESC LIMIT ?",
+        (lookback,)).fetchall()
+    if not rows:
+        return []
+    chrono = [dict(r) for r in reversed(rows)]
+    batches = []
+    cur = None
+    for r in chrono:
+        ts = int(r["ts"] or 0)
+        user = str(r.get("user") or "")
+        rid = int(r["id"])
+        if (cur is None or user != cur["user"]
+                or ts - int(cur["ended_ts"]) > gap_sec):
+            cur = {
+                "user": user,
+                "started_ts": ts,
+                "ended_ts": ts,
+                "total": 0,
+                "success": 0,
+                "failed": 0,
+                "id_from": rid,
+                "id_to": rid,
+            }
+            batches.append(cur)
+        else:
+            cur["ended_ts"] = ts
+            cur["id_from"] = min(int(cur["id_from"]), rid)
+            cur["id_to"] = max(int(cur["id_to"]), rid)
+        cur["total"] += 1
+        if int(r.get("ok") or 0):
+            cur["success"] += 1
+        else:
+            cur["failed"] += 1
+    out = []
+    for b in reversed(batches):
+        b["source"] = "auto" if str(b["user"]).startswith("system@") else "manual"
+        out.append(b)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def list_reboot_batch_detail(conn, user, id_from, id_to, limit=2000):
+    """某批次内的单机明细（按 id 闭区间 + user 约束，避免串批）。"""
+    user = str(user or "")
+    id_from, id_to = int(id_from), int(id_to)
+    if id_to < id_from:
+        id_from, id_to = id_to, id_from
+    limit = max(1, min(5000, int(limit or 2000)))
+    rows = _r(conn).execute(
+        "SELECT id,ts,user,ip,ok,msg FROM command_log "
+        "WHERE action='reboot' AND user=? AND id>=? AND id<=? "
+        "ORDER BY ts ASC, id ASC LIMIT ?",
+        (user, id_from, id_to, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
 def recent_reboots(conn, since_ts):
     """since_ts 之后成功下发过重启的 IP → 最近一次时间。服务重启后据此恢复重启静默期标记。"""
     rows = _r(conn).execute(
