@@ -667,6 +667,50 @@ def _uniplus_login_token(s, ip, password, timeout):
     return ""
 
 
+def _uniplus_fetch_power(s, ip, timeout):
+    """UniPlus 1.3.x 功率在独立服务 :8000/api/v0/power（Web「功率」同源，无需 Bearer）。
+
+    get_stats.cgi 不含 watt/jt；前端用本接口的 power(W) ÷ 实时算力(TH/s) 得到 J/TH。
+    """
+    try:
+        r = s.get(
+            f"http://{ip}:8000/api/v0/power",
+            timeout=timeout,
+            headers={"Accept": "application/json"},
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        if not isinstance(data, dict):
+            return None
+        return _nonnegative(data.get("power"), integer=True)
+    except (requests.RequestException, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _uniplus_fill_power_eff(rec, s, ip, timeout):
+    """补齐 UniPlus 功耗/能耗比：优先已有字段，缺功耗则拉 :8000，缺 eff 则用 W/TH 推算。"""
+    if rec is None:
+        return
+    if rec.get("power") is None:
+        watts = _uniplus_fetch_power(s, ip, timeout)
+        if watts is not None:
+            rec["power"] = watts
+    if rec.get("eff") is None and rec.get("power") is not None:
+        # 与 Web / data_metrics.efficiency 一致：J/TH = W / (TH/s)
+        hr = rec.get("hr_rt")
+        if hr is None:
+            hr = rec.get("hr_avg")
+        try:
+            hr = float(hr) if hr is not None else None
+        except (TypeError, ValueError):
+            hr = None
+        if hr is not None and hr > 0:
+            value = float(rec["power"]) / hr
+            if math.isfinite(value) and value >= 0:
+                rec["eff"] = round(value, 2)
+
+
 def probe_uniplus(ip, online_to, data_to=None, collect_identity=False, password="admin"):
     """第三方 UniPlusOS：旧版 /api/v1/summary；1.3.x 走 login+get_stats / 4028。"""
     s = get_session()
@@ -734,6 +778,10 @@ def probe_uniplus(ip, online_to, data_to=None, collect_identity=False, password=
         rec["firmware"] = "uniplus"
         rec.update(sm)
         rec["note"] = "UniPlus经4028取数"
+
+    # 1.3.x Web「功率/效率」来自 :8000/api/v0/power，get_stats 无 watt/jt
+    if rec is not None:
+        _uniplus_fill_power_eff(rec, s, ip, min(data_to, 2.0))
 
     if collect_identity and rec is not None and not rec.get("mac"):
         # 旧 API 身份
