@@ -630,6 +630,36 @@ def mark_containers_offline(conn, ips):
                      f"WHERE ip IN ({qm})", (time.time(), *ips))
 
 
+def _resolve_container_alerts(conn, ips, ts):
+    """消掉这些箱上的冷却告警（offline / stale / cooler:故障位）。调用方持有 _wlock。"""
+    if not ips:
+        return
+    qm = ",".join("?" * len(ips))
+    conn.execute(
+        f"UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 AND ip IN ({qm}) "
+        f"AND (type IN ('cooler_offline','cooler_stale') OR type LIKE 'cooler:%')",
+        (ts, *ips))
+
+
+def remove_containers(conn, ips):
+    """运维手动删除集装箱：立刻从监控记忆剔除并消冷却告警。历史快照保留。返回实际删除的 IP。"""
+    if not ips:
+        return []
+    ips = list(dict.fromkeys(str(ip).strip() for ip in ips if str(ip or "").strip()))
+    if not ips:
+        return []
+    ts = int(time.time())
+    with _wlock, conn:
+        qm = ",".join("?" * len(ips))
+        victims = [r["ip"] for r in conn.execute(
+            f"SELECT ip FROM containers WHERE ip IN ({qm})", ips).fetchall()]
+        if not victims:
+            return []
+        _resolve_container_alerts(conn, victims, ts)
+        conn.execute(f"DELETE FROM containers WHERE ip IN ({qm})", victims)
+        return victims
+
+
 def kick_offline_containers(conn, max_offline_sec=86400):
     """离线超过 max_offline_sec 的箱子从记忆中踢除，并清掉其残留冷却告警。返回被踢除的 IP 列表。"""
     cutoff = int(time.time()) - max_offline_sec
@@ -639,9 +669,7 @@ def kick_offline_containers(conn, max_offline_sec=86400):
             "SELECT ip FROM containers WHERE online=0 AND last_online < ?", (cutoff,)).fetchall()]
         if victims:
             qm = ",".join("?" * len(victims))
-            conn.execute(f"UPDATE alerts SET resolved=1,resolved_ts=? WHERE resolved=0 "
-                         f"AND ip IN ({qm}) AND (type='cooler_offline' OR type LIKE 'cooler:%')",
-                         (ts, *victims))
+            _resolve_container_alerts(conn, victims, ts)
             conn.execute(f"DELETE FROM containers WHERE ip IN ({qm})", victims)
         return victims
 

@@ -810,7 +810,14 @@ async function openMiner(ip) {
     + t("miner.detail_worker", { w: esc(c.worker) || "-", a: safeVal(c.accepted), r: safeVal(c.rejected), s: safeVal(c.stale) })
     + (c.note ? "<br>" + t("miner.detail_note", { n: esc(c.note) }) : "");
   const btn = $("mOpenConsole");
-  if (btn) btn.onclick = () => openMinerConsole(ip);
+  if (btn) {
+    btn.classList.remove("hidden");
+    btn.textContent = btn.dataset.defaultLabel || "网页";
+    btn.title = t("alert.open_console");
+    btn.onclick = () => openMinerConsole(ip);
+  }
+  const rm = $("mRemoveContainer");
+  if (rm) { rm.classList.add("hidden"); rm.onclick = null; }
   $("modal").classList.remove("hidden");
 }
 
@@ -861,6 +868,28 @@ function containerFaultBadge(f, ignored = false) {
     + (f.observed === false ? ` · ${esc(t("quality.last_fault", { time: f.measured_ts ? fmtTime(f.measured_ts) : t("rate.time_unknown") }))}` : "") + `</span>`;
 }
 
+function containerRemoveBtn(ip) {
+  return `<button type="button" class="rmbtn" onclick="event.stopPropagation(); removeContainer('${esc(ip)}')" `
+    + `title="${esc(t("cbox.remove_title"))}">${esc(t("cbox.remove_btn"))}</button>`;
+}
+
+async function removeContainer(ip) {
+  if (!/^[0-9.]+$/.test(String(ip || "")) || String(ip).split(".").length !== 4) return;
+  if (!confirm(t("cbox.remove_confirm", { ip }))) return;
+  try {
+    const d = await jpost("/api/containers/remove", { ips: [ip] });
+    if (!d || d.ok === false) {
+      toast(t("cbox.remove_fail", { msg: (d && d.error) || "" }));
+      return;
+    }
+    toast(t("cbox.removed", { ip }), "ok");
+    $("modal").classList.add("hidden");
+    refreshContainers();
+    refreshAlerts();
+    refreshSummary();
+  } catch (e) {}
+}
+
 async function refreshContainers() {
   const d = await jget("/api/containers");
   const cs = d.containers || [];
@@ -874,7 +903,7 @@ async function refreshContainers() {
     if (!c.online && !containerQuality(c)) {
       return `<div class="cbox offline" onclick="openContainer('${esc(c.ip)}')">`
         + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
-        + `<span class="fbadge crit">${esc(t("cbox.ctrl_off"))}</span></div>`
+        + `<span class="fbadge crit">${esc(t("cbox.ctrl_off"))}</span>${containerRemoveBtn(c.ip)}</div>`
         + `<div class="cbox-meta">${esc(t("cbox.last_temp", { s: safeVal(c.supply_temp), r: safeVal(c.return_temp) }))}</div></div>`;
     }
     const dt = (c.supply_temp != null && c.return_temp != null) ? (c.return_temp - c.supply_temp).toFixed(1) : "-";
@@ -886,7 +915,8 @@ async function refreshContainers() {
     const realFault = (c.faults || []).some(f => !ign.has(f.flag)) || spLow || rpLow;
     return `<div class="cbox ${realFault ? "fault" : ""}" onclick="openContainer('${esc(c.ip)}')">`
       + `<div class="cbox-head"><span class="cbox-ip">${esc(c.ip)}</span>`
-      + `<span class="cbox-meta">${esc(t("cbox.miners_line", { n: safeVal(c.miner_num) }))} ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span></div>`
+      + `<span class="cbox-meta">${esc(t("cbox.miners_line", { n: safeVal(c.miner_num) }))} ｜ ⚡ <b>${fmtPower(boxPower(c))}</b></span>`
+      + `${containerRemoveBtn(c.ip)}</div>`
       + (containerQuality(c) ? AntDataQuality.note(t(c.data_stale ? "quality.stale" : "quality.partial"), true) : "")
       + `<div class="cbox-temps"><div>${esc(t("cbox.supply"))} <span class="v in">${safeVal(c.supply_temp)}℃</span></div>`
       + `<div>${esc(t("cbox.return"))} <span class="v out">${safeVal(c.return_temp)}℃</span></div><div>ΔT <span class="v">${safeVal(dt)}℃</span></div></div>`
@@ -902,6 +932,15 @@ async function openContainer(ip) {
   const d = await jget(`/api/container/${ip}`);
   const c = d.current || {};
   $("mTitle").textContent = t("cbox.title", { ip });
+  const consoleBtn = $("mOpenConsole");
+  if (consoleBtn) { consoleBtn.classList.add("hidden"); consoleBtn.onclick = null; }
+  const rm = $("mRemoveContainer");
+  if (rm) {
+    rm.classList.remove("hidden");
+    rm.textContent = t("cbox.remove_btn");
+    rm.title = t("cbox.remove_title");
+    rm.onclick = () => removeContainer(ip);
+  }
   const h = d.history || [];
   const maxGap = Math.max(60, Number(d.stale_after) || 60);
   const series = key => {

@@ -892,6 +892,23 @@ def api_containers(_: dict = Depends(require_viewer)):
 def api_containers_scan(_: dict = Depends(require_ops)):
     """手动立即刷新集装箱（后台执行，秒回）。"""
     threading.Thread(target=SVC.scan_containers, daemon=True).start()
+
+
+@app.post("/api/containers/remove")
+def api_containers_remove(request: Request, body: dict = Body(...),
+                          sess: dict = Depends(require_ops)):
+    """运维删除集装箱（换网段/整箱退役）：{ips:[...]}。控制器恢复且仍在扫描范围内会再被发现。"""
+    ips, ip_error = control.normalize_ips(
+        body.get("ips"), CFG.get("control", {}).get("max_batch", 1000))
+    if ip_error:
+        return JSONResponse({"ok": False, "error": ip_error}, status_code=400)
+    gone = db.remove_containers(SVC.conn, ips)
+    if gone:
+        db.log_commands(SVC.conn, f'{sess.get("user", "?")}@{_client_ip(request)}',
+                        "container:remove",
+                        [{"ip": ip, "ok": True, "msg": "remove"} for ip in gone])
+        log.info("删除集装箱 %d 台: %s, 操作人 %s", len(gone), gone[:8], sess.get("user", "?"))
+    return {"ok": True, "count": len(gone), "removed": gone}
     return {"ok": True}
 
 
