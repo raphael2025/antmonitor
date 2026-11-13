@@ -700,7 +700,10 @@ async function refreshRacks() {
       return `<div class="slot ${s.st}" title="${esc(tip)}" onclick="openMiner('${esc(s.ip)}')">${s.h}</div>`;
     }).join("");
     const bad = rk.abnormal ? t("rack.zero_bad", { n: rk.abnormal }).replace(String(rk.abnormal), `<b class="bad">${rk.abnormal}</b>`) : "";
-    return `<div class="rack"><div class="rack-head"><span class="name">${esc(rk.name)}.x</span>`
+    const title = rk.label
+      ? `${esc(rk.label)} <span class="muted">(${esc(rk.name)}.x)</span>`
+      : `${esc(rk.name)}.x`;
+    return `<div class="rack"><div class="rack-head"><span class="name">${title}</span>`
       + `<span class="stat">${t("rack.stat", { online: rk.online, hr: fmtHash(rk.hashrate), bad, offline: rk.offline, empty: rk.empty })}</span></div>`
       + `<div class="slots">${slots}</div></div>`;
   }).join("");
@@ -1350,9 +1353,22 @@ $("rebootHistClose").onclick = $("rebootHistClose2").onclick = closeRebootHist;
 $("rebootHistRefresh").onclick = () => loadRebootHist();
 
 /* ---------------- 网段与扫描设置 ---------------- */
+function formatSegLines(segments, labels) {
+  labels = labels || {};
+  return (segments || []).map(s => {
+    const lab = labels[s];
+    return lab ? `${s} ${lab}` : s;
+  }).join("\n");
+}
+
+/** 按行解析「网段 [备注]」；备注可含空格。不再按空白拆碎整段。 */
+function parseSegTextarea(text) {
+  return String(text || "").split("\n").map(line => line.trim()).filter(Boolean);
+}
+
 async function openSeg() {
   const d = await jget("/api/segments");
-  $("segText").value = (d.segments || []).join("\n");
+  $("segText").value = formatSegLines(d.segments, d.labels);
   $("segHs").value = d.host_start; $("segHe").value = d.host_end;
   const s = await jget("/api/settings");
   $("setInterval").value = s.scan_interval;
@@ -1361,7 +1377,7 @@ async function openSeg() {
   $("segModal").classList.remove("hidden");
 }
 async function saveSeg(scan) {
-  const segs = $("segText").value.split(/[\n,\s]+/).map(s => s.trim()).filter(Boolean);
+  const segs = parseSegTextarea($("segText").value);
   try {
     const d = await jpost("/api/segments", {
       segments: segs,
@@ -1757,11 +1773,20 @@ let _searchTimer = null;
 async function loadSegOptions() {
   try {
     const d = await jget("/api/segments");
+    const labels = d.labels || {};
     const sel = $("fSeg");
     [...sel.options].forEach(o => { if (o.value && o.value !== sel.value) o.remove(); });   // 重新登录/改网段后别重复追加
     const have = new Set([...sel.options].map(o => o.value));
     (d.segments || []).filter(s => !have.has(s)).forEach(s => {
-      const o = document.createElement("option"); o.value = s; o.textContent = s + ".x"; sel.appendChild(o);
+      const o = document.createElement("option");
+      o.value = s;
+      o.textContent = labels[s] ? `${labels[s]} (${s}.x)` : `${s}.x`;
+      sel.appendChild(o);
+    });
+    // 已有选项也刷新显示名（改备注后不必清掉当前筛选）
+    [...sel.options].forEach(o => {
+      if (!o.value) return;
+      o.textContent = labels[o.value] ? `${labels[o.value]} (${o.value}.x)` : `${o.value}.x`;
     });
   } catch (e) {}
 }

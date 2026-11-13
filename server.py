@@ -953,6 +953,7 @@ def api_racks(_: dict = Depends(require_viewer)):
             continue
         by_seg.setdefault(".".join(parts[:3]), {})[host] = r
 
+    labels = appconfig.load_segment_labels(list(by_seg.keys()))
     out = []
     for seg in sorted(by_seg, key=lambda n: tuple(int(x) for x in n.split("."))):
         hosts = by_seg[seg]
@@ -967,7 +968,8 @@ def api_racks(_: dict = Depends(require_viewer)):
                           "hr": (r.get("hr_rt") if r else None),
                           "temp": (r.get("temp") if r else None)})
         stats = data_metrics.aggregate(rack_records)
-        out.append({"name": seg, "slots": slots,
+        out.append({"name": seg, "label": labels.get(seg) or "",
+                    "slots": slots,
                     "online": cnt.get("ok", 0) + cnt.get("zero", 0),
                     "abnormal": cnt.get("zero", 0), "offline": cnt.get("offline", 0),
                     "empty": cnt.get("empty", 0), "unknown": cnt.get("unknown", 0),
@@ -1077,7 +1079,8 @@ def api_progress(_: dict = Depends(require_viewer)):
 @app.get("/api/segments")
 def api_segments(_: dict = Depends(require_viewer)):
     segs, hs, he = appconfig.load_segments(CFG)
-    return {"segments": segs, "host_start": hs, "host_end": he}
+    labels = appconfig.load_segment_labels(segs)
+    return {"segments": segs, "host_start": hs, "host_end": he, "labels": labels}
 
 
 @app.get("/api/settings")
@@ -1252,24 +1255,30 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
 @app.post("/api/segments")
 def api_segments_save(body: dict = Body(...), _: dict = Depends(require_admin)):
     norm, bad = [], []
+    labels = {}
+    # 显式 labels 字典（前端也可直接传）；行内备注优先写进同一 dict
+    raw_labels = body.get("labels") if isinstance(body.get("labels"), dict) else {}
     for s in (body.get("segments") or []):
-        parts = str(s).strip().split(".")
-        if len(parts) < 3:
-            continue
-        # 只收 ASCII 数字并规范化(172.016.005 → 172.16.5)：前导 0 会被系统当八进制解析，
-        # 扫的就不是你以为的网段；全角/其它数字字符 int() 也认，得挡掉
-        if not all(x.isascii() and x.isdigit() and int(x) <= 255 for x in parts[:3]):
-            bad.append(str(s)[:32])
-            continue
-        base = ".".join(str(int(x)) for x in parts[:3])
-        # 只允许内网网段：扫描/命令会带着矿机口令去连这些地址，加进公网段等于把口令送出去
-        net = ipaddress.ip_address(base + ".1")
-        if not (net.is_private or net in ipaddress.ip_network("100.64.0.0/10")) \
-                or net.is_loopback or net.is_link_local or net.is_multicast:
-            bad.append(str(s)[:32])
+        # 兼容旧客户端：纯网段字符串；新客户端：同行带备注
+        if isinstance(s, dict):
+            base, lab, err = appconfig.parse_segment_entry(
+                f'{s.get("segment") or s.get("prefix") or ""} {s.get("label") or ""}'.strip())
+        else:
+            base, lab, err = appconfig.parse_segment_entry(s)
+        if err or not base:
+            if err:
+                bad.append(err)
             continue
         if base not in norm:
             norm.append(base)
+        if lab:
+            labels[base] = lab
+    for key, val in raw_labels.items():
+        b, lab, err = appconfig.parse_segment_entry(f"{key} {val}".strip() if val else str(key))
+        if err or not b:
+            continue
+        if b in norm and lab:
+            labels[b] = lab
     if bad:
         return JSONResponse({"ok": False, "error": "以下网段无效或不是内网地址: " + "、".join(bad[:5])},
                             status_code=400)
@@ -1279,9 +1288,10 @@ def api_segments_save(body: dict = Body(...), _: dict = Depends(require_admin)):
     except (TypeError, ValueError, OverflowError):
         return JSONResponse({"ok": False, "error": "host_start/host_end 须为数字"},
                             status_code=400)
-    appconfig.save_segments(norm, hs, he)
-    log.info("网段已更新: %d 段, 主机号 %d-%d", len(norm), hs, he)
-    return {"ok": True, "segments": norm, "host_start": hs, "host_end": he, "count": len(norm)}
+    appconfig.save_segments(norm, hs, he, labels=labels)
+    log.info("网段已更新: %d 段, 主机号 %d-%d, 备注 %d", len(norm), hs, he, len(labels))
+    return {"ok": True, "segments": norm, "host_start": hs, "host_end": he,
+            "labels": labels, "count": len(norm)}
 
 
 # 破坏性动作：后端强制要求请求体显式带 confirm:true。

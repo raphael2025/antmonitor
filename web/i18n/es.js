@@ -88,7 +88,7 @@ I18N.register('es', {
   "header.full": "Escaneo completo",
   "lang.label": "Idioma",
   "seg.title": "⚙ Configuración de red y escaneo",
-  "seg.hint": "Una subred por línea (p. ej. 172.16.119).",
+  "seg.hint": "Una subred por línea, con nota opcional (p. ej. 172.16.119 A4).",
   "seg.host": "Rango de hosts",
   "seg.interval": "Intervalo quick (s)",
   "seg.interval_hint": "Espera tras terminar cada escaneo — solo roster",

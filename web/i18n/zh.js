@@ -88,7 +88,7 @@ I18N.register('zh', {
   "header.full": "全网扫描",
   "lang.label": "语言",
   "seg.title": "⚙ 网段与扫描设置",
-  "seg.hint": "每行一个网段（如 172.16.119 或 172.16.119.x）。",
+  "seg.hint": "每行一个网段，后面可写备注（如 172.16.119 A4区）。备注会出现在货架与筛选里。",
   "seg.host": "主机号",
   "seg.interval": "巡检间隔(秒)",
   "seg.interval_hint": "扫完一轮后等这么久再扫下一轮；只探已知机器",

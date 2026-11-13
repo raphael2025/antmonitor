@@ -88,7 +88,7 @@ I18N.register('en', {
   "header.full": "Full scan",
   "lang.label": "Language",
   "seg.title": "⚙ Network and scan settings",
-  "seg.hint": "One subnet per line (e.g. 172.16.119 or 172.16.119.x).",
+  "seg.hint": "One subnet per line; optional label after it (e.g. 172.16.119 Zone-A4). Labels show on racks and filters.",
   "seg.host": "Host range",
   "seg.interval": "Quick interval (s)",
   "seg.interval_hint": "Wait this long after each scan finishes — roster only",

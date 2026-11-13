@@ -88,7 +88,7 @@ I18N.register('de', {
   "header.full": "Vollscan",
   "lang.label": "Sprache",
   "seg.title": "⚙ Netzwerk- und Scan-Einstellungen",
-  "seg.hint": "Ein Subnetz pro Zeile (z. B. 172.16.119).",
+  "seg.hint": "Ein Subnetz pro Zeile, optional mit Label (z. B. 172.16.119 A4).",
   "seg.host": "Host-Bereich",
   "seg.interval": "Quick-Intervall (s)",
   "seg.interval_hint": "Pause nach Ende jedes Scans — nur Roster",

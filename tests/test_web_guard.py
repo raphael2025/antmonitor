@@ -62,7 +62,7 @@ def test_cross_site_websocket_is_refused(app):
 def test_segments_must_be_private_and_are_normalized(app):
     server, c = app
     saved = []
-    server.appconfig.save_segments = lambda segs, hs, he: saved.append(segs)
+    server.appconfig.save_segments = lambda segs, hs, he, labels=None: saved.append(segs)
     r = c.post("/api/segments", json={"segments": ["8.8.8"], "host_start": 1, "host_end": 254})
     assert r.status_code == 400 and not saved
     r = c.post("/api/segments", json={"segments": ["１７２.16.5"]})    # 全角数字

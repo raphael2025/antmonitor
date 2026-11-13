@@ -81,8 +81,8 @@
     <div class="modal-box">
       <div class="modal-head"><span data-i18n="seg.title">⚙ 网段与扫描设置</span><button id="segClose">×</button></div>
       <div id="segBody">
-        <div class="muted" data-i18n="seg.hint">每行一个网段（如 172.16.119 或 172.16.119.x）。</div>
-        <textarea id="segText" rows="8" placeholder="172.16.101&#10;172.16.102&#10;..."></textarea>
+        <div class="muted" data-i18n="seg.hint">每行一个网段，可加备注（如 172.16.119 A4区）。</div>
+        <textarea id="segText" rows="8" placeholder="172.16.119 A4区&#10;172.16.120 B2区&#10;172.16.121"></textarea>
         <div class="seg-host"><span data-i18n="seg.host">主机号</span> <input id="segHs" type="number" min="1" max="254"> – <input id="segHe" type="number" min="1" max="254"></div>
         <div class="seg-host"><span data-i18n="seg.interval">巡检间隔(秒)</span> <input id="setInterval" type="number" min="30">
           <span class="muted" data-i18n="seg.interval_hint">扫完一轮后等这么久再扫下一轮；只探已知机器</span></div>

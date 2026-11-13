@@ -443,6 +443,80 @@ def set_user_password(username, pw_hash, path=None):
 # ---- 网段(网页可编辑，存 segments.json) ----
 SEG_FILE = _file_from_env("MINER_SEGMENTS", "segments.json")
 
+# 备注最长：面板/货架展示用短标签（如「A4区」）
+SEGMENT_LABEL_MAX = 64
+
+
+def normalize_segment_label(value):
+    """清洗网段备注：去首尾空白与常见分隔符前缀，超长截断；空则返回 ""。"""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if s[:1] in "#—–-":
+        s = s[1:].strip()
+    if len(s) > SEGMENT_LABEL_MAX:
+        s = s[:SEGMENT_LABEL_MAX].rstrip()
+    return s
+
+
+def parse_segment_entry(raw):
+    """解析一行「网段 [备注]」→ (base_or_None, label, bad_display)。
+
+    支持：172.16.119 / 172.16.119.x / 172.16.119 A4区 / 172.16.119 # A4区
+    公网/非法返回 (None, "", 原始片段)。
+    """
+    import ipaddress
+
+    text = str(raw or "").strip()
+    if not text:
+        return None, "", ""
+    bits = text.split(None, 1)
+    token = bits[0]
+    label = normalize_segment_label(bits[1]) if len(bits) > 1 else ""
+    if token.lower().endswith(".x"):
+        token = token[:-2]
+    parts = token.split(".")
+    if len(parts) < 3:
+        return None, "", text[:32]
+    if not all(x.isascii() and x.isdigit() and int(x) <= 255 for x in parts[:3]):
+        return None, "", text[:32]
+    base = ".".join(str(int(x)) for x in parts[:3])
+    net = ipaddress.ip_address(base + ".1")
+    if not (net.is_private or net in ipaddress.ip_network("100.64.0.0/10")) \
+            or net.is_loopback or net.is_link_local or net.is_multicast:
+        return None, "", text[:32]
+    return base, label, ""
+
+
+def _clean_labels(labels, segments):
+    """只保留仍在网段列表中的备注。"""
+    known = {str(s).strip() for s in (segments or []) if str(s).strip()}
+    out = {}
+    if not isinstance(labels, dict):
+        return out
+    for raw_key, raw_val in labels.items():
+        key = str(raw_key).strip()
+        if key not in known:
+            continue
+        lab = normalize_segment_label(raw_val)
+        if lab:
+            out[key] = lab
+    return out
+
+
+def load_segment_labels(segments=None):
+    """从 segments.json 读 labels；无文件或损坏返回 {}。segments 用于过滤幽灵备注。"""
+    if not os.path.exists(SEG_FILE):
+        return {}
+    try:
+        with open(SEG_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        segs = segments if segments is not None else (d.get("segments") or [])
+        return _clean_labels(d.get("labels") or {}, segs)
+    except (OSError, ValueError, TypeError) as e:
+        log.warning("segments.json 备注读取失败(%s)", e)
+        return {}
+
 
 def load_segments(cfg):
     """返回 (segments, host_start, host_end)。优先 segments.json，其次 config，最后 lo/hi 回退。"""
@@ -468,9 +542,13 @@ def load_segments(cfg):
     return [f"{base}.{c}" for c in range(lo, hi + 1)], hs, he
 
 
-def save_segments(segments, host_start=1, host_end=254):
-    _atomic_json(SEG_FILE, {"segments": segments,
-                            "host_start": host_start, "host_end": host_end})
+def save_segments(segments, host_start=1, host_end=254, labels=None):
+    payload = {"segments": segments,
+               "host_start": host_start, "host_end": host_end}
+    cleaned = _clean_labels(labels or {}, segments)
+    if cleaned:
+        payload["labels"] = cleaned
+    _atomic_json(SEG_FILE, payload)
 
 
 # ---- 网页可改的运行参数(存 settings.json，覆盖 config.yaml) ----
