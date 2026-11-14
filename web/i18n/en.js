@@ -96,7 +96,7 @@ I18N.register('en', {
   "seg.full_hint": "Scan all subnets for new miners (slow); suggest 3600",
   "seg.pps": "ARP rate max_pps",
   "seg.pps_hint": "(locked)",
-  "seg.pps_locked": "ARP rate and concurrency are locked in code (roster 100pps/200 workers, discovery 50pps/64 workers) to protect the L3 switch.",
+  "seg.pps_locked": "ARP rate and concurrency are locked in code (roster 100pps/200 workers, discovery 50pps/64 workers, batch 250 / pause 10s) to protect the L3 switch.",
   "seg.cloud_hint": "☁ Cloud report (multi-site). Saves apply immediately. Site ID:",
   "seg.cloud_enable": "Enable reporting",
   "seg.cloud_enable_hint": "Works behind NAT — site pushes every minute",

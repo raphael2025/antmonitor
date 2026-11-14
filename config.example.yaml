@@ -13,13 +13,12 @@ scan:
   data_timeout: 5.0     # 取算力超时(秒)
   # 下列速率项由代码 SCAN_RATE_LOCK 锁死，改这里/网页/settings.json 都无效：
   # workers=200, discovery_workers=64, max_pps=100, discovery_max_pps=50,
-  # discovery_batch=150, discovery_pause_sec=30
+  # discovery_batch=250, discovery_pause_sec=10
   workers: 200          # (锁死) 名册巡检并发
   discovery_workers: 64 # (锁死) 空扫并发
-  # 空地址不要一口气探完：连续狂扫死 IP 会打满三层 ARP/CPCAR，旁边真机一起读失败，
-  # 表现为"跑一段时间后扫不到机器"。小批次 + 批间停顿让交换机回血。
-  discovery_batch: 150          # (锁死)
-  discovery_pause_sec: 30       # (锁死)
+  # 空地址分批探；真限速靠 discovery_max_pps，批间短停即可。
+  discovery_batch: 250          # (锁死)
+  discovery_pause_sec: 10       # (锁死)
   liveness_gate: true   # 先 TCP 连 80 判活，死IP不再白跑原厂/第三方整套取数
   gate_timeout: 3.0     # 名册判活超时(秒)；低于 3 按 3(防慢矿机误报掉线)
   max_pps: 100                  # (锁死) 名册 pps

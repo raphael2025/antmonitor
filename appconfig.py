@@ -42,8 +42,9 @@ SCAN_RATE_LOCK = {
     "discovery_workers": 64,
     "max_pps": 100,
     "discovery_max_pps": 50,
-    "discovery_batch": 150,
-    "discovery_pause_sec": 30,
+    # pps 已锁 50，批间不必再趴 30 秒；250/10s 大约两分钟级扫完空地址
+    "discovery_batch": 250,
+    "discovery_pause_sec": 10,
 }
 
 # 全部可配置项的默认值。config.yaml 只需写要覆盖的部分。
