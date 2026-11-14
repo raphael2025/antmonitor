@@ -5,7 +5,7 @@
 扫描分两档（这是容量设计的核心，别再合成一档）：
   - quick：只探"名册"内的已知真机(约5千台)，每轮扫完后再等 schedule.scan_interval(默认300s)开始下一轮。
            抓上线/下线/掉算力/温度，是日常监控的主力。
-  - full ：展开全部网段(约1.5万地址)做发现，每 schedule.full_interval(默认3600s)一轮。
+  - full ：展开全部网段做发现，每 schedule.full_interval(默认7200s)一轮。
            抓新装机/换网段。死 IP 的判活超时是全扫的主要耗时来源。
 之前两档被合并成"每5分钟全扫一次"，扫描耗时逼近间隔本身 → 系统长期处于"永远在扫"状态，
 既压三层网络，也让 SQLite 的 WAL checkpoint 永远追不上。
@@ -793,7 +793,7 @@ class MonitorService:
         # 独立 pps：即便网页把 max_pps 调到 300，空地址仍按 discovery_max_pps 限速
         d_pps = sc.get("discovery_max_pps")
         if d_pps is None:
-            d_pps = min(int(sc.get("max_pps", 150) or 150), 80)
+            d_pps = min(int(sc.get("max_pps", 100) or 100), 50)
         cc["max_pps"] = max(1, int(d_pps))
         # 发现阶段不需要矿工名：少一次 4028，降低对真机的额外压力
         cc["fetch_worker"] = False
@@ -803,8 +803,8 @@ class MonitorService:
         """分批探空地址。批间停顿，避免连续 ARP 把交换机打满后误伤真机。"""
         ips = list(ips)
         sc = self.cfg["scan"]
-        batch = max(1, int(sc.get("discovery_batch", 250) or 250))
-        pause = max(0.0, float(sc.get("discovery_pause_sec", 20) or 0))
+        batch = max(1, int(sc.get("discovery_batch", 150) or 150))
+        pause = max(0.0, float(sc.get("discovery_pause_sec", 30) or 0))
         disc_cfg = self._discovery_scan_cfg(scan_cfg)
         workers = min(int(workers or sc.get("discovery_workers", 64) or 64),
                       int(sc.get("discovery_workers", 64) or 64))

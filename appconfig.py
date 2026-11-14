@@ -38,19 +38,21 @@ def _file_from_env(env_key, default_name):
 # 全部可配置项的默认值。config.yaml 只需写要覆盖的部分。
 DEFAULTS = {
     "scan": {
-        "segments": [], "host_start": 1, "host_end": 254,
+        "segments": [], "host_start": 1, "host_end": 210,
         "base": "172.16", "lo": 100, "hi": 160,
         # 单台判活/在线判定统一等 3 秒：扫一轮会慢一点，但慢响应的矿机不会被当成掉线乱报警
         "online_timeout": 3.0, "data_timeout": 5.0,
         # 名册并发可高(ARP 多半命中缓存)；空地址发现必须低并发+低 pps，否则三层 CoPP
         # 把 arp-miss 丢光后，真机也跟着判不在线——跑一段时间"扫不到机器"的主因。
+        # workers≈pps×gate 即可喂满令牌桶；空扫并发 300 无益且更容易扎堆打 ARP。
         "workers": 200, "discovery_workers": 64,
         # 空地址分批：小批次 + 较长批间停顿，让交换机 ARP/CPCAR 回血。
-        "discovery_batch": 250, "discovery_pause_sec": 20,
-        "liveness_gate": True, "gate_timeout": 3.0, "max_pps": 150,
+        "discovery_batch": 150, "discovery_pause_sec": 30,
+        "liveness_gate": True, "gate_timeout": 3.0, "max_pps": 100,
         # 空地址专用：短判活(死 IP 别干等 3 秒) + 独立 pps(可低于名册 max_pps)。
         # 不要与 gate_timeout 共用下限 3 秒——那是名册防误报用的。
-        "discovery_gate_timeout": 0.5, "discovery_max_pps": 80,
+        # 华为 AR arp-miss 硬限约 512pps；留余量给其它源后空扫建议 40–50。
+        "discovery_gate_timeout": 0.8, "discovery_max_pps": 50,
         # 名册阶段 unknown/误伤比例过高 → 本轮跳过空地址发现(网络已在吐血)。
         "discovery_pressure_unknown_ratio": 0.15, "discovery_pressure_min": 20,
         "reconfirm_enabled": True, "reconfirm_online_timeout": 3.0,
@@ -62,13 +64,13 @@ DEFAULTS = {
         "roster_retention_days": 7,
         "migrate_max": 200,
         # 巡检发现有身份的机器刚掉线 → 提前全网发现识别 IP 迁移；距上次全网发现至少这么久(秒)，0=关闭
-        "early_full_min_interval": 1200,
+        "early_full_min_interval": 3600,
         "passwords": [["root", "root"]],
     },
     "schedule": {
         "enabled": True,
         "scan_interval": 300,      # 名册巡检间隔(秒)，从上一轮扫完开始算
-        "full_interval": 3600,     # 全网发现间隔(秒)；发现新机/新网段
+        "full_interval": 7200,     # 全网发现间隔(秒)；发现新机/新网段
         "watchdog_minutes": 0,     # 0=自动取 max(20分钟, 巡检间隔×3)，高于扫描整体超时15分钟
         "container_interval": 10,
     },
