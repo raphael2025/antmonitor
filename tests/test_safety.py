@@ -127,8 +127,9 @@ def test_saved_zero_pps_from_old_version_is_ignored_not_clamped_to_one():
     import appconfig
     cfg = appconfig._merge(appconfig.DEFAULTS, {"scan": {"max_pps": 120}})
     appconfig.apply_settings(cfg, {"max_pps": 0, "discovery_workers": 0})
-    assert cfg["scan"]["max_pps"] == 120
-    assert cfg["scan"]["discovery_workers"] == appconfig.DEFAULTS["scan"]["discovery_workers"]
+    # 旧 settings 里的速率键一律忽略，并强制回到锁死值
+    assert cfg["scan"]["max_pps"] == appconfig.SCAN_RATE_LOCK["max_pps"]
+    assert cfg["scan"]["discovery_workers"] == appconfig.SCAN_RATE_LOCK["discovery_workers"]
 
 
 def test_backup_finds_db_when_started_from_another_directory(tmp_path, monkeypatch):

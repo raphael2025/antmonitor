@@ -227,17 +227,19 @@ def test_access_log_masks_token():
     assert "SECRET123" not in rec.getMessage() and "token=***" in rec.getMessage()
 
 
-def test_settings_cannot_silently_stall_scanning(app, monkeypatch):
-    """ARP 限速存成 0：以前接口回显 0，实际被压成 1 pps，5000 台巡检要一个多小时，监控
-    形同停摆且界面上看不出来。现在超范围直接拒绝，保存成功时回显的就是实际生效的值。"""
+def test_settings_rejects_locked_scan_rate(app, monkeypatch):
+    """max_pps / discovery_* 已代码锁死：网页或 API 再改一律 400，运行值不变。"""
+    import appconfig
     server, c = app
-    monkeypatch.setitem(server.CFG["scan"], "max_pps", 100)
-    for bad in (0, 2000):
+    locked = appconfig.SCAN_RATE_LOCK["max_pps"]
+    monkeypatch.setitem(server.CFG["scan"], "max_pps", locked)
+    for bad in (0, 50, 200, 2000):
         r = c.post("/api/settings", json={"max_pps": bad})
         assert r.status_code == 400, bad
-        assert server.CFG["scan"]["max_pps"] == 100
-    r = c.post("/api/settings", json={"max_pps": 200})
-    assert r.status_code == 200 and r.json()["max_pps"] == 200 == server.CFG["scan"]["max_pps"]
+        assert server.CFG["scan"]["max_pps"] == locked
+    r = c.post("/api/settings", json={"discovery_workers": 300})
+    assert r.status_code == 400
+    assert server.CFG["scan"]["discovery_workers"] == appconfig.SCAN_RATE_LOCK["discovery_workers"]
 
 
 def test_low_pressure_container_counts_as_faulty(app, monkeypatch):

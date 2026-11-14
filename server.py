@@ -1102,11 +1102,14 @@ def api_segments(_: dict = Depends(require_viewer)):
 @app.get("/api/settings")
 def api_settings_get(sess: dict = Depends(require_viewer)):
     ctl = CFG.get("control") or {}
+    lock = appconfig.SCAN_RATE_LOCK
     out = {"scan_interval": CFG["schedule"].get("scan_interval", 300),
-           "full_interval": CFG["schedule"].get("full_interval", 3600),
-           "max_pps": CFG["scan"].get("max_pps", 100),
+           "full_interval": CFG["schedule"].get("full_interval", 7200),
+           "max_pps": lock["max_pps"],
            "container_interval": CFG["schedule"].get("container_interval", 10),
-           "discovery_workers": CFG["scan"].get("discovery_workers", 300),
+           "discovery_workers": lock["discovery_workers"],
+           "discovery_max_pps": lock["discovery_max_pps"],
+           "scan_rate_locked": True,
            # 重启设置：viewer/ops 只读可见；admin 可 POST 改。开关只挡自动重启。
            "reboot_enabled": bool(ctl.get("reboot_enabled")),
            "reboot_concurrency": int(ctl.get("reboot_concurrency", 30) or 30),
@@ -1207,12 +1210,15 @@ def api_settings_post(body: dict = Body(...), _: dict = Depends(require_admin)):
         if err:
             return JSONResponse({"ok": False, "error": err}, status_code=400)
         s["cloud"] = cl
-    # 与 appconfig._validate 的上下限保持一致(max_pps/discovery_workers 硬上限 500 = 三层 CoPP)。
-    # 超范围直接拒绝而不是悄悄夹紧：以前网页清空 ARP 限速会存成 0、回显 0，实际被夹成 1 pps，
-    # 巡检一轮要一个多小时，监控形同停摆却看不出来
+    # 速率类(max_pps/discovery_*)已代码锁死，网页提交直接拒绝，避免旧前端/手工 API 再改爆三层。
+    for k in appconfig._LOCKED_SETTINGS_KEYS:
+        if k in body:
+            return JSONResponse(
+                {"ok": False, "error": f"{k} 已由程序锁死为 {appconfig.SCAN_RATE_LOCK[k]}，不可修改"},
+                status_code=400)
+    # 超范围直接拒绝而不是悄悄夹紧
     ranges = {"scan_interval": (30, 86400, "巡检间隔(秒)"), "full_interval": (60, 604800, "全网发现间隔(秒)"),
-              "container_interval": (5, 3600, "集装箱刷新间隔(秒)"), "max_pps": (1, 500, "ARP限速 max_pps"),
-              "discovery_workers": (1, 500, "发现并发"),
+              "container_interval": (5, 3600, "集装箱刷新间隔(秒)"),
               "reboot_concurrency": (1, 1000, "重启并发"),
               "reboot_delay_sec": (0, 3600, "重启批间隔(秒)"),
               "reboot_max_per_day": (1, 100, "24h重启上限"),

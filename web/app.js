@@ -1379,7 +1379,6 @@ async function openSeg() {
   const s = await jget("/api/settings");
   $("setInterval").value = s.scan_interval;
   if ($("setFullInterval")) $("setFullInterval").value = s.full_interval;
-  $("setPps").value = s.max_pps;
   $("segModal").classList.remove("hidden");
 }
 async function saveSeg(scan) {
@@ -1395,7 +1394,6 @@ async function saveSeg(scan) {
     const num = (id) => { const v = parseInt($(id).value); return Number.isFinite(v) ? v : undefined; };
     const body = {
       scan_interval: num("setInterval"),
-      max_pps: num("setPps"),
     };
     if ($("setFullInterval")) body.full_interval = num("setFullInterval");
     Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);

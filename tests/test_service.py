@@ -646,13 +646,16 @@ def test_mass_offline_skips_dead_address_scan(svc, monkeypatch):
 
 
 def test_discovery_uses_short_gate_and_own_pps(svc, monkeypatch):
-    """空地址发现必须用短判活 + 独立低 pps，不能跟名册共用 3 秒 gate。"""
+    """空地址发现必须用短判活 + 独立低 pps，且速率锁死不受 cfg 篡改。"""
+    import appconfig
     monkeypatch.setattr(miner_core, "scan", fake_scan([rec("10.9.0.2")]))
     svc.scan_full("full")
+    # 试图改爆：锁死后仍应走 SCAN_RATE_LOCK
     svc.cfg["scan"].update(
         reconfirm_enabled=False, max_pps=300, discovery_max_pps=77,
         discovery_gate_timeout=0.4, discovery_workers=11, discovery_batch=1000)
     cfgs = []
+    lock = appconfig.SCAN_RATE_LOCK
 
     def _scan(ips, cfg, progress_cb=None, workers=None):
         cfgs.append((list(ips), dict(cfg), workers))
@@ -662,14 +665,15 @@ def test_discovery_uses_short_gate_and_own_pps(svc, monkeypatch):
     svc.scan_full("full")
     # 第 1 次名册，第 2 次空地址
     assert cfgs[0][0] == ["10.9.0.2"]
-    assert cfgs[0][1].get("max_pps") == 300
+    assert cfgs[0][1].get("max_pps") == lock["max_pps"]
+    assert cfgs[0][2] == lock["workers"]
     dead = cfgs[1]
     assert set(dead[0]) == {"10.9.0.1", "10.9.0.3", "10.9.0.4", "10.9.0.5"}
-    assert dead[1]["max_pps"] == 77
+    assert dead[1]["max_pps"] == lock["discovery_max_pps"]
     assert dead[1]["gate_timeout"] == 0.4
     assert dead[1]["liveness_gate"] is True
     assert dead[1].get("fetch_worker") is False
-    assert dead[2] == 11
+    assert dead[2] == lock["discovery_workers"]
 
 
 def test_unknown_pressure_skips_dead_address_scan(svc, monkeypatch):

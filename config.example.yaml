@@ -11,17 +11,20 @@ scan:
   hi: 160               # 回退用：第三段结束
   online_timeout: 3.0   # 在线判定超时(秒)：单台最多等 3 秒，扫描慢一点但不会把慢响应的矿机误报掉线；低于 3 按 3
   data_timeout: 5.0     # 取算力超时(秒)
-  workers: 200          # 名册巡检并发(已知真机,ARP 多半命中缓存，可相对高)
-  discovery_workers: 64 # 空扫并发≈pps×gate 即可；再高喂不满令牌桶，只会扎堆打 ARP
+  # 下列速率项由代码 SCAN_RATE_LOCK 锁死，改这里/网页/settings.json 都无效：
+  # workers=200, discovery_workers=64, max_pps=100, discovery_max_pps=50,
+  # discovery_batch=150, discovery_pause_sec=30
+  workers: 200          # (锁死) 名册巡检并发
+  discovery_workers: 64 # (锁死) 空扫并发
   # 空地址不要一口气探完：连续狂扫死 IP 会打满三层 ARP/CPCAR，旁边真机一起读失败，
   # 表现为"跑一段时间后扫不到机器"。小批次 + 批间停顿让交换机回血。
-  discovery_batch: 150
-  discovery_pause_sec: 30
+  discovery_batch: 150          # (锁死)
+  discovery_pause_sec: 30       # (锁死)
   liveness_gate: true   # 先 TCP 连 80 判活，死IP不再白跑原厂/第三方整套取数
   gate_timeout: 3.0     # 名册判活超时(秒)；低于 3 按 3(防慢矿机误报掉线)
-  max_pps: 100          # 名册每秒新建连接上限；代码强制上限500
+  max_pps: 100                  # (锁死) 名册 pps
   discovery_gate_timeout: 0.8  # 空地址判活超时(可亚秒：死IP别干等3秒)
-  discovery_max_pps: 50        # 空扫 pps；华为 AR arp-miss≈512pps，留余量后建议40–50
+  discovery_max_pps: 50         # (锁死) 空扫 pps
   # 名册阶段 unknown 比例过高(=网络已经在丢包)时，本轮跳过空地址发现
   discovery_pressure_unknown_ratio: 0.15
   discovery_pressure_min: 20

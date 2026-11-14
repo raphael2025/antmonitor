@@ -35,6 +35,17 @@ def _file_from_env(env_key, default_name):
     """取环境变量指定的路径(绝对则直接用，相对则相对 BASE)，未设置则用 BASE 下的默认名。"""
     return _anchor(os.environ.get(env_key) or default_name)
 
+# 扫描速率锁死：宁可扫慢，也不能让 config.yaml / 网页 / settings.json 再把三层 ARP 打爆。
+# _validate 与 apply_settings 都会强制写回这些值；网页不再提供修改入口。
+SCAN_RATE_LOCK = {
+    "workers": 200,
+    "discovery_workers": 64,
+    "max_pps": 100,
+    "discovery_max_pps": 50,
+    "discovery_batch": 150,
+    "discovery_pause_sec": 30,
+}
+
 # 全部可配置项的默认值。config.yaml 只需写要覆盖的部分。
 DEFAULTS = {
     "scan": {
@@ -45,14 +56,19 @@ DEFAULTS = {
         # 名册并发可高(ARP 多半命中缓存)；空地址发现必须低并发+低 pps，否则三层 CoPP
         # 把 arp-miss 丢光后，真机也跟着判不在线——跑一段时间"扫不到机器"的主因。
         # workers≈pps×gate 即可喂满令牌桶；空扫并发 300 无益且更容易扎堆打 ARP。
-        "workers": 200, "discovery_workers": 64,
+        # 以下速率相关项以 SCAN_RATE_LOCK 为准，改配置无效。
+        "workers": SCAN_RATE_LOCK["workers"],
+        "discovery_workers": SCAN_RATE_LOCK["discovery_workers"],
         # 空地址分批：小批次 + 较长批间停顿，让交换机 ARP/CPCAR 回血。
-        "discovery_batch": 150, "discovery_pause_sec": 30,
-        "liveness_gate": True, "gate_timeout": 3.0, "max_pps": 100,
+        "discovery_batch": SCAN_RATE_LOCK["discovery_batch"],
+        "discovery_pause_sec": SCAN_RATE_LOCK["discovery_pause_sec"],
+        "liveness_gate": True, "gate_timeout": 3.0,
+        "max_pps": SCAN_RATE_LOCK["max_pps"],
         # 空地址专用：短判活(死 IP 别干等 3 秒) + 独立 pps(可低于名册 max_pps)。
         # 不要与 gate_timeout 共用下限 3 秒——那是名册防误报用的。
         # 华为 AR arp-miss 硬限约 512pps；留余量给其它源后空扫建议 40–50。
-        "discovery_gate_timeout": 0.8, "discovery_max_pps": 50,
+        "discovery_gate_timeout": 0.8,
+        "discovery_max_pps": SCAN_RATE_LOCK["discovery_max_pps"],
         # 名册阶段 unknown/误伤比例过高 → 本轮跳过空地址发现(网络已在吐血)。
         "discovery_pressure_unknown_ratio": 0.15, "discovery_pressure_min": 20,
         "reconfirm_enabled": True, "reconfirm_online_timeout": 3.0,
@@ -198,6 +214,18 @@ def _merge(defaults, override):
 MIN_PROBE_TIMEOUT = 3.0
 
 
+def enforce_scan_rate_lock(cfg):
+    """强制写回扫描速率锁。返回被改写过的 key 列表。"""
+    sc = cfg.setdefault("scan", {})
+    changed = []
+    for k, v in SCAN_RATE_LOCK.items():
+        cur = sc.get(k)
+        if cur != v:
+            changed.append(k)
+            sc[k] = v
+    return changed
+
+
 def _validate(cfg):
     """把明显不合法的值纠正到安全范围并记日志(宁可跑起来也不要静默跑歪)。"""
     warn = []
@@ -230,8 +258,8 @@ def _validate(cfg):
     clamp("schedule", "scan_interval", 30, 86400, int)
     clamp("schedule", "full_interval", 60, 604800, int)
     clamp("schedule", "container_interval", 5, 3600, int)
-    # 三层交换机 CoPP 硬限制约 500pps，这里是代码层面的最后一道保险——
-    # 不管 config.yaml 还是网页设置怎么填，并发/连接速率永远不允许超过 500。
+    # 速率相关项不再开放区间配置：下面 enforce_scan_rate_lock 会锁死。
+    # 先做类型收敛，避免非数字把强制赋值搞乱。
     clamp("scan", "max_pps", 1, 500, int)
     clamp("scan", "discovery_max_pps", 1, 500, int)
     clamp("scan", "workers", 1, 500, int)
@@ -324,6 +352,10 @@ def _validate(cfg):
     if not isinstance(pw, list) or not pw:
         warn.append("scan.passwords 非法，回退 [['root','root']]")
         cfg["scan"]["passwords"] = [["root", "root"]]
+
+    locked = enforce_scan_rate_lock(cfg)
+    for k in locked:
+        warn.append(f"scan.{k} 已由代码锁死为 {SCAN_RATE_LOCK[k]}（防三层 ARP/CoPP；配置/网页不可改）")
 
     for w in warn:
         log.warning("配置校验: %s", w)
@@ -643,12 +675,13 @@ def _atomic_json(path, data):
         raise
 
 
-_INT_SETTINGS = ("scan_interval", "full_interval", "container_interval",
-                 "max_pps", "discovery_workers", "discovery_max_pps",
-                 "discovery_batch")
+# 网页可改间隔；速率类已移出，一律走 SCAN_RATE_LOCK。
+_INT_SETTINGS = ("scan_interval", "full_interval", "container_interval")
 # 网页可热改的 control 整数项(自动重启相关)；与 _INT_SETTINGS 分开，避免误写到 scan/schedule
 _CONTROL_INT_SETTINGS = ("reboot_concurrency", "reboot_delay_sec",
                          "reboot_max_per_day", "reboot_min_interval_sec")
+# 旧版 settings.json 可能仍带这些键：读取时忽略，也不再从网页写入
+_LOCKED_SETTINGS_KEYS = tuple(SCAN_RATE_LOCK.keys())
 
 
 def settings_overrides(cfg, s):
@@ -661,8 +694,6 @@ def settings_overrides(cfg, s):
             continue
         if k in ("scan_interval", "full_interval", "container_interval"):
             cur = cfg["schedule"].get(k)
-        elif k in ("max_pps", "discovery_workers", "discovery_max_pps", "discovery_batch"):
-            cur = cfg["scan"].get(k)
         else:
             cur = (cfg.get("control") or {}).get(k)
         if str(cur) != str(s[k]):
@@ -672,22 +703,17 @@ def settings_overrides(cfg, s):
 
 def apply_settings(cfg, s):
     """把网页保存的参数覆盖进运行中的 cfg（各循环每轮重读，即时生效）。"""
+    for k in _LOCKED_SETTINGS_KEYS:
+        if k in s:
+            log.warning("settings.json 里的 %s=%s 已忽略（扫描速率由代码锁死）", k, s[k])
     for k in _INT_SETTINGS:
         if k in s:
             try:
                 v = int(s[k])
             except (TypeError, ValueError):
                 continue
-            if k in ("max_pps", "discovery_workers", "discovery_max_pps",
-                     "discovery_batch") and v < 1:
-                # 旧版网页清空输入框会存成 0，校验时被夹成 1 → 每秒只探 1 台，扫描形同停摆。
-                # 这种值当作没设置，沿用 config.yaml/默认值
-                log.warning("settings.json 里 %s=%s 无效(会让扫描几乎停摆)，已忽略，沿用配置值", k, v)
-                continue
             if k in ("scan_interval", "full_interval", "container_interval"):
                 cfg["schedule"][k] = v
-            else:
-                cfg["scan"][k] = v
     ctl = cfg.setdefault("control", {})
     if "reboot_enabled" in s:
         ctl["reboot_enabled"] = s["reboot_enabled"]

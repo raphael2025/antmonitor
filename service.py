@@ -717,7 +717,7 @@ class MonitorService:
                                  sc.get("reconfirm_data_timeout", 5.0))
         cc["liveness_gate"] = False    # 不走判活闸门，给慢响应机器充分时间
         cc["alive_probe"] = True       # 接口都没应答时补测 80/4028：连得上就不算离线
-        cc["max_pps"] = sc.get("max_pps", 100)   # 保留限速，护住三层 ARP/CoPP
+        cc["max_pps"] = appconfig.SCAN_RATE_LOCK["max_pps"]  # 锁死，护住三层 ARP/CoPP
         def rank(r):   # 在线正算力 > 在线实测零 > 在线缺测 > 未探测 > 离线
             if r["status"] == "online":
                 hr = data_metrics.measurement(r.get("hr_rt"))
@@ -790,11 +790,8 @@ class MonitorService:
         cc["gate_timeout"] = max(0.1, gate)
         # 空地址阶段 online/data 也跟着收紧：闸门已判死就不会走到取数
         cc["online_timeout"] = max(cc["gate_timeout"], min(float(cc.get("online_timeout", 3.0)), 1.5))
-        # 独立 pps：即便网页把 max_pps 调到 300，空地址仍按 discovery_max_pps 限速
-        d_pps = sc.get("discovery_max_pps")
-        if d_pps is None:
-            d_pps = min(int(sc.get("max_pps", 100) or 100), 50)
-        cc["max_pps"] = max(1, int(d_pps))
+        # 空地址 pps 锁死：不受 config/网页影响
+        cc["max_pps"] = appconfig.SCAN_RATE_LOCK["discovery_max_pps"]
         # 发现阶段不需要矿工名：少一次 4028，降低对真机的额外压力
         cc["fetch_worker"] = False
         return cc
@@ -802,16 +799,15 @@ class MonitorService:
     def _scan_discover(self, ips, scan_cfg, workers, progress_cb, base, total, gen):
         """分批探空地址。批间停顿，避免连续 ARP 把交换机打满后误伤真机。"""
         ips = list(ips)
-        sc = self.cfg["scan"]
-        batch = max(1, int(sc.get("discovery_batch", 150) or 150))
-        pause = max(0.0, float(sc.get("discovery_pause_sec", 30) or 0))
+        lock = appconfig.SCAN_RATE_LOCK
+        batch = lock["discovery_batch"]
+        pause = float(lock["discovery_pause_sec"])
         disc_cfg = self._discovery_scan_cfg(scan_cfg)
-        workers = min(int(workers or sc.get("discovery_workers", 64) or 64),
-                      int(sc.get("discovery_workers", 64) or 64))
+        workers = lock["discovery_workers"]
         log.info("全网发现空地址: %d 个, batch=%d pause=%.0fs workers=%d gate=%.2fs pps=%d",
                  len(ips), batch, pause, workers,
-                 float(disc_cfg.get("gate_timeout", 0.5)),
-                 int(disc_cfg.get("max_pps", 80)))
+                 float(disc_cfg.get("gate_timeout", 0.8)),
+                 int(disc_cfg.get("max_pps", lock["discovery_max_pps"])))
         found = []
         for i in range(0, len(ips), batch):
             if gen != self._scan_gen:
@@ -857,11 +853,15 @@ class MonitorService:
                 self.progress["loop_beat"] = ts
 
             scan_cfg = dict(self.cfg["scan"])
+            # 速率锁死：防止运行中被 settings/手工改 cfg 再打爆三层
+            scan_cfg.update(appconfig.SCAN_RATE_LOCK)
             # MAC is a stable fallback identity for firmware that cannot expose
             # an SN.  Fetch it on discovery scans, not every five-minute patrol.
             scan_cfg["collect_identity"] = kind in {"full", "manual"}
             # UniPlus 代登/取数密码在 control 段，探测层需要看到
             scan_cfg["control"] = self.cfg.get("control") or {}
+            if workers is None:
+                workers = appconfig.SCAN_RATE_LOCK["workers"]
             records = _scan_batch(ips, scan_cfg, progress_cb=cb, workers=workers) if ips else []
             # 看门狗恢复会递增世代并启动新扫描。旧线程苏醒后必须在任何进度更新、
             # 二次探测或落库前退出，否则会覆盖新扫描的进度/快照。
@@ -1123,16 +1123,17 @@ class MonitorService:
         roster = set(db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7)))
         known = [ip for ip in ips if ip in roster]
         rest = [ip for ip in ips if ip not in roster]
-        return self._do_scan(kind, known, workers=self.cfg["scan"].get("workers", 200),
+        lock = appconfig.SCAN_RATE_LOCK
+        return self._do_scan(kind, known, workers=lock["workers"],
                              discover=rest,
-                             discover_workers=self.cfg["scan"].get("discovery_workers", 64))
+                             discover_workers=lock["discovery_workers"])
 
     def scan_quick(self, kind="quick"):
         """名册巡检：只探已知真机(在线过的 + 维修中的)，抓上线/下线。"""
         ips = db.roster_ips(self.conn, self.cfg["scan"].get("roster_retention_days", 7))
         if not ips:
             return self.scan_full(kind="full")   # 没有底库先全扫
-        return self._do_scan(kind, ips, workers=self.cfg["scan"].get("workers", 200))
+        return self._do_scan(kind, ips, workers=appconfig.SCAN_RATE_LOCK["workers"])
 
     def _kick_containers(self):
         """离线太久的箱子移出监控。移出后漏液等冷却告警就不再检测，必须明确通知，
