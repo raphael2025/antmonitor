@@ -38,7 +38,7 @@ def _file_from_env(env_key, default_name):
 # 全部可配置项的默认值。config.yaml 只需写要覆盖的部分。
 DEFAULTS = {
     "scan": {
-        "segments": [], "host_start": 1, "host_end": 210,
+        "segments": [], "host_start": 1, "host_end": 254,
         "base": "172.16", "lo": 100, "hi": 160,
         # 单台判活/在线判定统一等 3 秒：扫一轮会慢一点，但慢响应的矿机不会被当成掉线乱报警
         "online_timeout": 3.0, "data_timeout": 5.0,
