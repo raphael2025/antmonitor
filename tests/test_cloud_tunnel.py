@@ -107,3 +107,13 @@ def test_cloud_form_keeps_and_validates_tunnel_flag(server, monkeypatch):
     assert cl["tunnel"] is False
     cl, err = server._cloud_form({"enabled": False, "tunnel": "yes"})
     assert cl is None and "布尔" in err
+
+
+def test_cloud_status_reports_tunnel_state(server, monkeypatch):
+    monkeypatch.setitem(server.CFG, "cloud", {"enabled": True, "url": "https://x", "token": "t",
+                                              "site_name": "s", "tunnel": True})
+    out = server.api_cloud_status(_={})
+    assert out["tunnel"]["wanted"] is True and "state" in out["tunnel"]
+    monkeypatch.setitem(server.CFG, "cloud", {"enabled": True, "url": "https://x", "token": "t",
+                                              "site_name": "s"})
+    assert server.api_cloud_status(_={})["tunnel"]["wanted"] is False

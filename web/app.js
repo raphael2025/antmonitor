@@ -1630,9 +1630,26 @@ function agoText(ts) {
   const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
   return s < 90 ? t("cloud.ago_s", { n: s }) : t("cloud.ago_m", { n: Math.round(s / 60) });
 }
+function renderTunnelStatus(st) {
+  // 远程面板(云端点开本场地面板)的连接状态：不用翻日志就能看出为什么云端没有「打开本地面板」
+  const el = $("cloudTunnelStatus");
+  if (!el) return;
+  if (!st || !st.enabled || !st.tunnel) { el.classList.add("hidden"); return; }
+  const tn = st.tunnel;
+  let key = "cloud.tunnel_off", cls = "muted";
+  if (tn.wanted) {
+    if (tn.state === "online") { key = "cloud.tunnel_online"; cls = "res-ok"; }
+    else if (tn.state === "unsupported") key = "cloud.tunnel_unsupported";
+    else if (tn.state === "error") { key = "cloud.tunnel_error"; cls = "res-fail"; }
+    else key = "cloud.tunnel_connecting";
+  }
+  el.className = cls;
+  el.textContent = t(key, { error: tn.last_err || "" });
+}
 function renderCloudStatus() {
   const el = $("cloudStatus"), badge = $("cloudHeaderState"), st = _cloudSnapshot;
   el.className = "muted";
+  renderTunnelStatus(st);
   $("btnCloud").classList.toggle("needs-connection", !!(st && !st.enabled));
   if (_cloudStatusUnavailable || !st) {
     el.textContent = t(_cloudStatusUnavailable ? "cloud.status_unavailable" : "cloud.loading");

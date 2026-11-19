@@ -1208,7 +1208,8 @@ def api_cloud_status(_: dict = Depends(require_admin)):
     st = cloud_report.status()
     return {"ok": True, "enabled": cloud_report.enabled(CFG), "running": cloud_report.is_alive(),
             "url": c.get("url") or "", "site_id": cloud_report.site_id(CFG),
-            "pinned": bool(c.get("tls_fingerprint")), **st}
+            "pinned": bool(c.get("tls_fingerprint")),
+            "tunnel": {"wanted": bool(c.get("tunnel")), **cloud_tunnel.status()}, **st}
 
 
 @app.post("/api/cloud/test")
