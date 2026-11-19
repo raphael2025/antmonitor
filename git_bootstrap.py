@@ -28,12 +28,18 @@ import urllib.request
 import zipfile
 
 REPO_URL = os.environ.get("MINER_REPO_URL") or "https://github.com/raphael2025/antmonitor.git"
+GITEE_REPO_URL = "https://gitee.com/raphael01/antmonitor.git"
 BRANCH = "main"
 MINGIT_VERSION = "2.56.0"
 _MINGIT_URL = ("https://github.com/git-for-windows/git/releases/download/"
                "v{v}.windows.1/MinGit-{v}-{arch}.zip")
 _MINGIT_MIRROR_URL = ("https://sourceforge.net/projects/git-for-windows.mirror/files/"
                       "v{v}.windows.1/MinGit-{v}-{arch}.zip/download")
+# 国内可直连的镜像：下载后仍按下面固定的 SHA-256 校验，镜像本身不需要被信任
+_MINGIT_CN_MIRRORS = (
+    "https://registry.npmmirror.com/-/binary/git-for-windows/v{v}.windows.1/MinGit-{v}-{arch}.zip",
+    "https://repo.huaweicloud.com/git-for-windows/v{v}.windows.1/MinGit-{v}-{arch}.zip",
+)
 # SHA-256 of the official MinGit archives; a download with any other content is rejected.
 MINGIT_SHA256 = {
     "64-bit": "064b440ff870ed5198527e8f3a92cdf5bd2fd0fedf5e718af95e3fdaddeff718",
@@ -176,6 +182,17 @@ def find_git():
     return _find_mingit()
 
 
+def _rank_by_reachability(templates, arch):
+    """GitHub 被墙时别先卡满 120 秒才换镜像：几秒钟探测一下，能连的排前面(都通则保持原顺序)。"""
+    try:
+        import update_source
+        urls = [t.format(v=MINGIT_VERSION, arch=arch) for t in templates]
+        order = update_source.ordered(urls, preferred=urls[0], prober=update_source.probe_download)
+        return [templates[urls.index(u)] for u in order]
+    except Exception:  # noqa: BLE001 - 探测失败就按原顺序
+        return list(templates)
+
+
 def _download_mingit(archive, arch):
     """Every source, including a local/offline package, must match the same pin."""
     local = os.environ.get("MINER_MINGIT_ZIP")
@@ -189,9 +206,11 @@ def _download_mingit(archive, arch):
         if hashlib.sha256(archive.read_bytes()).hexdigest() != MINGIT_SHA256[arch]:
             raise RuntimeError("local portable Git package failed verification (sha256 mismatch)")
         return
-    sources = [_MINGIT_URL, _MINGIT_MIRROR_URL]
+    sources = [_MINGIT_URL, *_MINGIT_CN_MIRRORS, _MINGIT_MIRROR_URL]
     if os.environ.get("MINER_DOWNLOAD_SOURCE", "").lower() == "gitee":
-        sources.reverse()
+        sources = [*_MINGIT_CN_MIRRORS, _MINGIT_MIRROR_URL, _MINGIT_URL]
+    else:
+        sources = _rank_by_reachability(sources, arch)
     failures = []
     for template in sources:
         url = template.format(v=MINGIT_VERSION, arch=arch)
@@ -326,6 +345,34 @@ def adopt(base, git, repo_url=REPO_URL, branch=BRANCH):
     return match, extra
 
 
+def _repo_candidates():
+    """要尝试的仓库地址：自定义地址只用它自己；官方默认则 GitHub/Gitee 谁通谁在前。"""
+    if os.environ.get("MINER_REPO_URL"):
+        return [REPO_URL]
+    urls = [REPO_URL, GITEE_REPO_URL]
+    try:
+        import update_source
+        return update_source.ordered(urls, preferred=REPO_URL)
+    except Exception:  # noqa: BLE001
+        return urls
+
+
+def _adopt_from_available_source(base, git):
+    """按可用性逐个源尝试接管。拉取失败(网络不通)换下一个；拉到了但文件对不上任何
+    提交，说明是内容问题而不是网络问题，换镜像没用，直接停。"""
+    last = None
+    for url in _repo_candidates():
+        try:
+            if url != REPO_URL:
+                _say("GitHub is unreachable or failed; trying the Gitee mirror...")
+            return adopt(base, git, repo_url=url)
+        except Exception as e:  # noqa: BLE001
+            last = e
+    if last is not None:
+        raise last
+    return None, []
+
+
 def bootstrap(base):
     """Called by the Windows launcher on every start. Returns the directory that must be
     on PATH for the server to find git ("" when nothing is needed), never raises."""
@@ -339,7 +386,7 @@ def bootstrap(base):
             git = install_mingit()
         if (base / ".git").exists():
             return _path_dir_for(git)
-        commit, extra = adopt(base, git)
+        commit, extra = _adopt_from_available_source(base, git)
         if commit:
             _say("Web updates enabled: this folder now tracks {} at {}.".format(BRANCH, commit[:10]))
             if extra:

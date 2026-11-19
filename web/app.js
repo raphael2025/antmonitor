@@ -1445,6 +1445,7 @@ function fillCloudSettings(c) {
   $("cloudType").value = c.site_type || "air";
   $("cloudUrl").value = c.url || "";
   $("cloudFp").value = c.tls_fingerprint || "";
+  $("cloudTunnel").checked = !!c.tunnel;
   $("cloudSiteId").textContent = c.site_id || "-";
   $("cloudToken").value = "";
   $("cloudToken").type = "password";
@@ -1527,7 +1528,8 @@ function applyCloudCode(showError = false) {
 function cloudForm() {
   const c = { enabled: true, site_name: $("cloudName").value.trim(),
     site_type: $("cloudType").value, url: $("cloudUrl").value.trim(),
-    token: $("cloudToken").value.trim(), tls_fingerprint: $("cloudFp").value.trim() };
+    token: $("cloudToken").value.trim(), tls_fingerprint: $("cloudFp").value.trim(),
+    tunnel: $("cloudTunnel").checked };
   if (cloudSiteIdOverride) c.site_id = cloudSiteIdOverride;
   return c;
 }
@@ -1613,7 +1615,8 @@ async function pauseCloud() {
   try {
     const c = { enabled: false, url: _cloudSaved.url, token: "",
       site_name: _cloudSaved.site_name, site_type: _cloudSaved.site_type,
-      tls_fingerprint: _cloudSaved.tls_fingerprint, site_id: _cloudSaved.site_id };
+      tls_fingerprint: _cloudSaved.tls_fingerprint, site_id: _cloudSaved.site_id,
+      tunnel: !!_cloudSaved.tunnel };
     const d = await jpost("/api/settings", { cloud: c });
     if (!d.ok) { cloudFeedback("cloud.save_failed", { error: d.error || "" }, "res-fail"); return; }
     _cloudSaved.enabled = false;

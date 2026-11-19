@@ -495,6 +495,7 @@ I18N.register('zh', {
   "cloud.code_hint": "粘贴云端「复制完整接入信息」得到的 AMC1-… 整段；它已包含上报地址和密钥，不是单独 token。",
   "cloud.code_ready": "已自动拆分上报地址、密钥和场地信息；连接测试通过后才保存。",
   "cloud.code_needs_name": "这是旧版接入信息。下方已展开场地信息，请核对已有名称；空白时补填一次即可。",
+  "cloud.tunnel": "允许云端管理员在云端打开本场地面板（远程面板）",
   "cloud.advanced": "高级设置 / 手动填写",
   "cloud.site_id": "场地 ID：",
   "cloud.pause": "暂停当前上报",

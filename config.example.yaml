@@ -110,6 +110,8 @@ cloud:                  # 云端总览上报：本地每分钟主动推，场地
   customer_interval: 600 # 客户报表上报间隔(秒)
   customer_hours: 24    # 客户报表统计周期(小时)
   timeout: 10           # 上报请求超时(秒)
+  tunnel: false         # 允许云端管理员在云端点开本场地面板(场地在 NAT 后也行，本机主动连云端)；
+                        # 面板自己的登录照常要求。默认关，需要时改 true 后重启
 
 control:
   enabled: true         # 远程命令总开关（重启/定位灯/换矿池）。关闭则一律拒绝写操作

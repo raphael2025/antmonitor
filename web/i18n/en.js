@@ -495,6 +495,7 @@ I18N.register('en', {
   "cloud.code_hint": "Paste the entire AMC1- string from “Copy complete connection info” in the cloud. It already includes the reporting URL and token.",
   "cloud.code_ready": "Reporting URL, token and site details extracted. They will be saved only after a successful connection test.",
   "cloud.code_needs_name": "This is legacy connection information. Check the expanded site details and fill in the name only if it is blank.",
+  "cloud.tunnel": "Allow cloud admins to open this site panel from the cloud (remote panel)",
   "cloud.advanced": "Advanced settings / Manual setup",
   "cloud.site_id": "Site ID: ",
   "cloud.pause": "Pause current reporting",

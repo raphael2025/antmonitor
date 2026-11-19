@@ -475,6 +475,7 @@ I18N.register('es', {
   "cloud.code_hint": "Pega la cadena AMC1- completa obtenida con «Copiar conexión completa» en la nube. Ya incluye la URL de envío y el token.",
   "cloud.code_ready": "URL de envío, token y datos del sitio extraídos. Se guardarán solo si la prueba de conexión tiene éxito.",
   "cloud.code_needs_name": "Este formato es antiguo. Revise los datos desplegados de la instalación y rellene el nombre solo si está vacío.",
+  "cloud.tunnel": "Permitir que los administradores de la nube abran el panel de este sitio desde la nube (panel remoto)",
   "cloud.advanced": "Configuración avanzada / Manual",
   "cloud.site_id": "ID del sitio: ",
   "cloud.pause": "Pausar los envíos actuales",

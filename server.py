@@ -45,6 +45,7 @@ import auth
 import cloud_alert_summary
 import cloud_connect
 import cloud_report
+import cloud_tunnel
 import control
 import data_metrics
 import db
@@ -76,6 +77,10 @@ def _start_cloud_report():
     def _daily(days=14):
         return db.customer_daily_report(SVC.conn, days).get("customers_daily") or []
 
+    try:
+        cloud_tunnel.start(CFG)       # 远程面板转发(cloud.tunnel=true 才会真正启动)
+    except Exception as exc:  # noqa: BLE001 - 转发出问题绝不影响上报和监控
+        log.warning("云端远程面板转发启动失败: %s", exc)
     return cloud_report.start(CFG, _build_cloud_summary,
                               _customer_report_packet, get_daily=_daily)
 
@@ -145,6 +150,9 @@ def _ensure_cloud_report():
     if cloud_report.enabled(CFG) and not cloud_report.is_alive():
         log.warning("云端上报线程已意外退出，尝试重新拉起")
         _start_cloud_report()
+    elif cloud_tunnel.wanted(CFG) and not cloud_tunnel.is_alive():
+        log.warning("云端远程面板转发线程已意外退出，尝试重新拉起")
+        cloud_tunnel.start(CFG)
 
 
 async def _guardian_loop():
@@ -181,6 +189,14 @@ def _client_ip(request: Request):
     否则任何人加一个伪造头就能绕过登录失败锁定和公共 API 限流。
     默认不信任任何代理，直连部署下这是正确且安全的行为。"""
     peer = request.client.host if request.client else ""
+    if auth.is_local(peer):
+        # 云端远程面板转发：本机线程带着只有本进程知道的暗号把云端管理员的请求送进来。
+        # 来源记成 "tunnel:<云端看到的真实IP>"——不是回环地址，所以不享受"本机操作员"特权，
+        # 登录失败锁定也按真实来源计，不会和本机用户混在一起。
+        mark = request.headers.get(cloud_tunnel.MARK_HEADER, "")
+        if mark and _hmac.compare_digest(mark.encode(), cloud_tunnel.secret().encode()):
+            who = request.headers.get(cloud_tunnel.CLIENT_HEADER, "") or "unknown"
+            return "tunnel:" + re.sub(r"[^0-9A-Za-z.:_-]", "", who)[:64]
     if _TRUSTED and peer:
         try:
             ip = ipaddress.ip_address(peer)
@@ -1125,7 +1141,8 @@ def api_settings_get(sess: dict = Depends(require_viewer)):
                         "token_set": bool(tok), "token_hint": tok[-4:] if len(tok) >= 12 else "",
                         "site_name": c.get("site_name") or "",
                         "site_type": c.get("site_type") or "air",
-                        "tls_fingerprint": c.get("tls_fingerprint") or ""}
+                        "tls_fingerprint": c.get("tls_fingerprint") or "",
+                        "tunnel": bool(c.get("tunnel"))}
         out["site_id"] = cloud_report.site_id(CFG)
     return out
 
@@ -1176,6 +1193,9 @@ def _cloud_form(c, keep_token=True):
         cl["site_id"] = sid
     if "enabled" in c and not isinstance(c["enabled"], bool):
         return None, "cloud.enabled 须为布尔值"
+    if "tunnel" in c and not isinstance(c["tunnel"], bool):
+        return None, "cloud.tunnel 须为布尔值"
+    cl["tunnel"] = bool(c["tunnel"]) if "tunnel" in c else bool(cur.get("tunnel"))   # 远程面板开关：表单没带就沿用
     if cl["enabled"] and not (cl["url"] and cl["token"] and cl["site_name"]):
         return None, "启用上报需填写 云端地址/上报token/场地名"
     return cl, ""

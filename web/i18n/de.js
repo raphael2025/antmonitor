@@ -475,6 +475,7 @@ I18N.register('de', {
   "cloud.code_hint": "Die gesamte AMC1-Zeichenfolge aus „Vollständige Verbindungsdaten kopieren“ in der Cloud einfügen. Sie enthält bereits Meldeadresse und Token.",
   "cloud.code_ready": "Meldeadresse, Token und Standortdaten übernommen. Gespeichert wird erst nach erfolgreichem Verbindungstest.",
   "cloud.code_needs_name": "Dies sind ältere Verbindungsdaten. Prüfen Sie die aufgeklappten Standortangaben und ergänzen Sie den Namen nur, wenn er fehlt.",
+  "cloud.tunnel": "Cloud-Admins dürfen das Panel dieses Standorts über die Cloud öffnen (Remote-Panel)",
   "cloud.advanced": "Erweiterte Einstellungen / Manuell",
   "cloud.site_id": "Standort-ID: ",
   "cloud.pause": "Aktuelle Übertragung pausieren",

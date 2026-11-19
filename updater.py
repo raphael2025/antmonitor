@@ -29,6 +29,7 @@ import threading
 import time
 
 import logs
+import update_source
 
 log = logs.get(__name__)
 
@@ -441,13 +442,20 @@ def _update_fetch_sources():
     except Exception:  # noqa: BLE001
         origin = ""
     normalized = _normalize_public_update_remote(origin)
-    if normalized == GITHUB_HTTPS:
-        # origin first: after ensure(), this is anonymous HTTPS and matches what
-        # legacy updater.py did (`git fetch origin`).
-        return ["origin", GITEE_HTTPS]
-    if normalized == GITEE_HTTPS:
-        return ["origin", GITHUB_HTTPS]
-    return ["origin"]
+    if normalized not in (GITHUB_HTTPS, GITEE_HTTPS):
+        return ["origin"]
+    other = GITEE_HTTPS if normalized == GITHUB_HTTPS else GITHUB_HTTPS
+    # 先用几秒钟的探测看哪个源真的通：通的排前面(都通时保持当前 origin 优先)，
+    # 不通的排最后。否则 GitHub 被墙时 fetch 要先卡满超时才会换 Gitee。
+    try:
+        ranked = update_source.ordered([normalized, other], preferred=normalized)
+    except Exception as exc:  # noqa: BLE001 - 探测本身出错就退回旧顺序
+        log.warning("更新源探测失败，按默认顺序尝试: %s", exc)
+        ranked = [normalized, other]
+    if ranked[0] != normalized:
+        log.warning("更新源 %s 当前连不上，改用 %s", normalized, ranked[0])
+    # origin 保持字面 "origin"(兼容只会 fetch origin 的旧版更新器)，另一个源用完整地址
+    return ["origin" if u == normalized else u for u in ranked]
 
 
 def _fetch_update_refs():

@@ -129,6 +129,9 @@ def test_bootstrap_can_be_disabled(monkeypatch, tmp_path):
     assert not (tmp_path / ".git").exists()
 
 
+_REAL_RANK = git_bootstrap._rank_by_reachability   # fixture 会替换掉模块里的，这里留一份真的
+
+
 @pytest.fixture
 def portable_archive(monkeypatch, tmp_path):
     """A tiny pinned archive; native Windows CI separately runs the actual MinGit."""
@@ -136,6 +139,8 @@ def portable_archive(monkeypatch, tmp_path):
     monkeypatch.setenv("PROCESSOR_ARCHITECTURE", "AMD64")
     monkeypatch.delenv("PROCESSOR_ARCHITEW6432", raising=False)
     monkeypatch.setattr(git_bootstrap.shutil, "which", lambda name: None)
+    # 测试不真的探测网络：默认所有下载源都"通"，保持模板原顺序；需要时单个用例再覆盖
+    monkeypatch.setattr(git_bootstrap, "_rank_by_reachability", lambda templates, arch: list(templates))
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as z:
         z.writestr("cmd/git.exe", b"test Git binary")
@@ -191,7 +196,19 @@ def test_portable_git_uses_verified_mirror_when_github_is_unreachable(monkeypatc
     assert git_bootstrap.find_git() is None
     git = git_bootstrap.install_mingit()
     assert git_bootstrap.find_git() == git
-    assert [url.split('/')[2] for url in downloads] == ["github.com", "sourceforge.net"]
+    # 探测说通、但真正下载失败：依次换到国内镜像
+    assert [url.split('/')[2] for url in downloads] == ["github.com", "registry.npmmirror.com"]
+
+
+def test_unreachable_github_is_ranked_last_so_no_long_wait(monkeypatch):
+    import update_source
+    monkeypatch.setattr(update_source, "probe_download",
+                        lambda url, timeout=6, fetcher=None: None if "github.com" in url else 0.2)
+    update_source.reset_cache()
+    order = _REAL_RANK([git_bootstrap._MINGIT_URL, *git_bootstrap._MINGIT_CN_MIRRORS,
+                        git_bootstrap._MINGIT_MIRROR_URL], "64-bit")
+    assert "github.com" in order[-1] and "github.com" not in order[0]
+    update_source.reset_cache()
 
 
 def test_gitee_portable_git_needs_no_github_request(monkeypatch, portable_archive):
@@ -199,7 +216,7 @@ def test_gitee_portable_git_needs_no_github_request(monkeypatch, portable_archiv
     monkeypatch.setenv("MINER_DOWNLOAD_SOURCE", "gitee")
     git = git_bootstrap.install_mingit()
     assert git_bootstrap.find_git() == git
-    assert len(downloads) == 1 and downloads[0].startswith("https://sourceforge.net/")
+    assert len(downloads) == 1 and downloads[0].startswith("https://registry.npmmirror.com/")
 
 
 def test_offline_git_zip_is_verified_without_network(monkeypatch, portable_archive, tmp_path):
@@ -463,3 +480,42 @@ def test_adoption_failure_cleans_only_its_own_metadata(origin, tmp_path, monkeyp
     assert sentinel.read_text() == "do not remove"
     assert (site / "server.py").read_bytes() == b"VERSION = 2\n"
     assert (site / "config.yaml").read_text() == "site: x\n"
+
+
+def test_zip_is_adopted_from_gitee_when_github_is_unreachable(origin, tmp_path, monkeypatch):
+    """GitHub 压缩包部署在连不上 GitHub 的 Windows 上：改从 Gitee 接管，之后网页更新照常。"""
+    bare, (c1, c2, c3) = origin
+    site = tmp_path / "site"
+    _unzip_like_github(bare, c2, site)
+    monkeypatch.delenv("MINER_REPO_URL", raising=False)
+    monkeypatch.setattr(git_bootstrap, "REPO_URL", str(tmp_path / "github-blocked.git"))
+    monkeypatch.setattr(git_bootstrap, "GITEE_REPO_URL", str(bare))
+    import update_source
+    monkeypatch.setattr(update_source, "ordered", lambda urls, preferred=None, **k: list(urls))
+    commit, extra = git_bootstrap._adopt_from_available_source(site, "git")
+    assert commit == c2 and extra == []
+    assert _g("remote", "get-url", "origin", cwd=site) == str(bare)     # origin 记成真正能用的 Gitee
+    assert _g("status", "--porcelain", cwd=site) == ""
+
+
+def test_content_mismatch_does_not_retry_other_mirror(origin, tmp_path, monkeypatch):
+    bare, (c1, c2, c3) = origin
+    site = tmp_path / "site"
+    _unzip_like_github(bare, c2, site)
+    (site / "server.py").write_bytes(b"edited\n")
+    monkeypatch.delenv("MINER_REPO_URL", raising=False)
+    monkeypatch.setattr(git_bootstrap, "REPO_URL", str(bare))
+    calls = []
+    monkeypatch.setattr(git_bootstrap, "GITEE_REPO_URL", str(tmp_path / "never.git"))
+    import update_source
+    monkeypatch.setattr(update_source, "ordered", lambda urls, preferred=None, **k: list(urls))
+    real = git_bootstrap.adopt
+    monkeypatch.setattr(git_bootstrap, "adopt", lambda *a, **k: (calls.append(k.get("repo_url")), real(*a, **k))[1])
+    assert git_bootstrap._adopt_from_available_source(site, "git") == (None, [])
+    assert calls == [str(bare)]
+
+
+def test_custom_repo_url_never_falls_back_to_other_project(monkeypatch):
+    monkeypatch.setenv("MINER_REPO_URL", "https://git.example.com/me/fork.git")
+    monkeypatch.setattr(git_bootstrap, "REPO_URL", "https://git.example.com/me/fork.git")
+    assert git_bootstrap._repo_candidates() == ["https://git.example.com/me/fork.git"]

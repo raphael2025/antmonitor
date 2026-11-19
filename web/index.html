@@ -124,6 +124,7 @@
             <label class="cloud-field" for="cloudToken"><span data-i18n="seg.cloud_token">上报 token</span>
               <span class="cloud-token-row"><input id="cloudToken" type="password" autocomplete="off" placeholder="ingest token"><button id="cloudTokenEye" type="button" class="mini-btn" data-i18n="seg.token_eye">👁 显示</button></span></label>
             <label class="cloud-field" for="cloudFp"><span data-i18n="seg.cloud_fp">证书指纹</span><input id="cloudFp" type="text" autocomplete="off" spellcheck="false" data-i18n-placeholder="seg.cloud_fp_ph" placeholder="自签名证书需要指纹；公共 CA 证书留空"></label>
+            <label class="cloud-field cloud-check" for="cloudTunnel"><input id="cloudTunnel" type="checkbox"> <span data-i18n="cloud.tunnel">允许云端管理员在云端打开本场地面板（远程面板）</span></label>
             <p class="muted"><span data-i18n="cloud.site_id">场地 ID：</span><code id="cloudSiteId">-</code></p>
             <button id="cloudPause" type="button" class="mini-btn hidden" data-i18n="cloud.pause">暂停当前上报</button>
           </details>
