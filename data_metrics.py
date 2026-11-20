@@ -46,17 +46,23 @@ def live_record(record, fresh=True):
 
 
 def aggregate(records):
-    """Full totals require every known machine; expose measured subtotals separately."""
+    """Hashrate total is the sum of successfully read machines (offline = 0).
+
+    A few unread/unknown roster entries must not hide the measured fleet total
+    or mark the trend as partial. Power still requires full coverage because a
+    missing watt reading is not the same as a confirmed offline zero.
+    """
     records = [live_record(r) for r in records]
     online = [r for r in records if r["status"] == "online"]
     offline = sum(r["status"] == "offline" for r in records)
     rates = [r["hr_rt"] for r in records if r["hr_rt"] is not None]
     watts = [r["power"] for r in records if r["power"] is not None]
-    hr_complete = len(rates) == len(records)
     power_complete = len(watts) == len(records)
     known_hr = round(sum(rates), 2) if rates or not records else None
     known_kw = round(sum(watts) / 1000, 3) if watts or not records else None
-    total_hr = known_hr if hr_complete else None
+    # Present the acquired hashrate sum as the site total.
+    total_hr = known_hr
+    hr_complete = known_hr is not None
     total_kw = known_kw if power_complete else None
     # Use matched readings: separate power/hashrate subtotals may describe
     # different machines. Include known idle power when the matched total hashes.

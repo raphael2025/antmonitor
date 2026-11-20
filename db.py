@@ -522,7 +522,9 @@ def _scan_totals(records, ts):
              if state == "online" else None for r, state in zip(records, states)]
     known_rates = [v for v in rates if v is not None]
     known_total_hr = round(sum(known_rates), 2) if known_rates or not records else None
-    total_hr = known_total_hr if len(known_rates) == len(records) else None
+    # Persist the acquired sum as the fleet total so trend/summary do not treat
+    # a few unread machines as an incomplete (orange partial) sample.
+    total_hr = known_total_hr
     return len(records), online, offline, unknown, total_hr, known_total_hr, len(known_rates)
 
 
@@ -1005,6 +1007,9 @@ def hashrate_trend(conn, limit=288):
             d["known_total_hr"] = d["total_hr"]
             if d["total_hr"] is not None:
                 d["hashrate_known_machines"] = d["total"]
+        elif d["total_hr"] is None and d["known_total_hr"] is not None:
+            # 新策略：已读到的算力合计即展示总量（兼容升级前写入的缺测行）。
+            d["total_hr"] = d["known_total_hr"]
         if d["unknown"]:
             d["online"] = None  # 确认在线的部分计数不能冒充完整在线总数。
         d["data_quality"] = "incomplete" if d["total_hr"] is None else "complete"

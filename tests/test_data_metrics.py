@@ -10,14 +10,16 @@ import db
 from conftest import insert_scan, rec
 
 
-def test_unknown_machine_keeps_inventory_and_invalidates_full_totals():
+def test_unknown_machine_uses_acquired_hashrate_without_claiming_full_power():
     s = data_metrics.aggregate([rec("10.0.0.1", hr=293),
                                 rec("10.0.0.2", status="unknown", worker="cust1")])
     assert (s["online"], s["offline"], s["unknown"], s["total"]) == (1, 0, 1, 2)
-    assert s["total_hashrate_th"] is None and s["known_hashrate_ths"] == 293
+    # Hashrate total follows successfully read machines; unread roster entries
+    # must not hide that sum. Power still withholds a full total when incomplete.
+    assert s["total_hashrate_th"] == s["known_hashrate_ths"] == 293
+    assert s["hashrate_complete"] and s["avg_hashrate_th"] == 293
     assert s["total_power_kw"] is None and s["known_power_kw"] == 3
-    assert s["avg_hashrate_th"] is None and s["avg_efficiency"] is None
-    assert not s["hashrate_complete"] and not s["power_complete"]
+    assert s["avg_efficiency"] is None and not s["power_complete"]
 
 
 def test_fleet_efficiency_is_ratio_of_total_watts_to_total_hashrate():
@@ -212,7 +214,9 @@ def test_public_local_and_push_reports_share_exact_window_without_flooring_histo
     local = api.api_report_customers(hours=24)
     public = api.api_public_customers(None, hours=24)
     callbacks = []
-    monkeypatch.setattr(api.cloud_report, "start", lambda cfg, summary, customers: callbacks.append(customers))
+    monkeypatch.setattr(
+        api.cloud_report, "start",
+        lambda cfg, summary, customers, get_daily=None: callbacks.append(customers))
     api._start_cloud_report()
     push = callbacks[0](24)
     assert local == push
