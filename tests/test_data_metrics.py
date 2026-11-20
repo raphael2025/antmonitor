@@ -276,7 +276,7 @@ def test_container_unknown_and_expired_evidence_are_not_healthy_or_offline(api, 
         {"ip": "10.0.0.1", "online": 1, "data_status": "online", "data_complete": 1,
          "measured_ts": now, "faults": []},
         {"ip": "10.0.0.2", "online": 1, "data_status": "unknown", "data_complete": 0,
-         "measured_ts": now, "faults": [{"flag": "leakage_fault", "observed": False}]},
+         "measured_ts": now, "faults": [{"flag": "freezing_alarm", "observed": False}]},
         {"ip": "10.0.0.3", "online": 0, "data_status": "offline", "data_complete": 0,
          "measured_ts": now, "faults": []},
         {"ip": "10.0.0.4", "online": 1, "data_status": "online", "data_complete": 1,
@@ -288,3 +288,17 @@ def test_container_unknown_and_expired_evidence_are_not_healthy_or_offline(api, 
     assert result["containers"][1]["faults"][0]["observed"] is False
     assert result["containers"][3]["data_status"] == "unknown"
     assert raw[3]["data_complete"] == 1  # Last-known evidence is never rewritten by a read.
+
+
+def test_container_panel_hides_leakage_in_list_and_details(api, monkeypatch):
+    now = int(time.time())
+    row = {"ip": "10.0.0.1", "online": 1, "data_status": "online", "data_complete": 1,
+           "measured_ts": now, "faults": [{"flag": "leakage_fault"}, {"flag": "leakage"}]}
+    monkeypatch.setattr(db, "get_containers", lambda conn: [row])
+    monkeypatch.setattr(db, "container_history", lambda conn, ip: [])
+
+    result = api.api_containers()
+    assert result["faulty"] == 0
+    assert result["containers"][0]["faults"] == []
+    assert api.api_container(row["ip"])["current"]["faults"] == []
+    assert len(row["faults"]) == 2

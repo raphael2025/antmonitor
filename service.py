@@ -45,6 +45,12 @@ class MonitorService:
         self.cfg = cfg
         self.conn = db.init_db(cfg["db"]["path"])
         db.resolve_types_except(self.conn, alerts.MINER_TYPES)
+        # 漏液停止告警后，启动时静默关闭旧的活跃记录。
+        db.resolve_alerts_bulk(self.conn, [
+            (row["ip"], row["type"])
+            for flag in alerts.HIDDEN_CONTAINER_FAULTS
+            for row in db.active_alerts_by_type(self.conn, f"cooler:{flag}")
+        ])
         self._scan_lock = threading.Lock()
         # 集装箱单独一把锁：只保护"写集装箱 + 评估冷却告警"这一小段(全网扫描和 10 秒刷新
         # 都会做，并发会重复报)。以前共用 _scan_lock，一轮巡检一两分钟里漏液数据都不刷新
@@ -1136,7 +1142,7 @@ class MonitorService:
         return self._do_scan(kind, ips, workers=appconfig.SCAN_RATE_LOCK["workers"])
 
     def _kick_containers(self):
-        """离线太久的箱子移出监控。移出后漏液等冷却告警就不再检测，必须明确通知，
+        """离线太久的箱子移出监控。移出后冷却告警就不再检测，必须明确通知，
         不能让 crit 告警自己悄悄消失。"""
         gone = db.kick_offline_containers(
             self.conn, self.cfg["scan"].get("container_offline_kick_sec", 86400))
@@ -1145,7 +1151,7 @@ class MonitorService:
             log.warning("集装箱离线超过 %d 小时，移出监控: %s", hours, gone)
             try:
                 alerts.push_text(self.cfg, f"🔴 集装箱 {'、'.join(gone[:10])} 控制器离线已超过 {hours} 小时，"
-                                           f"已移出监控(漏液/压力等冷却告警不再检测)；控制器恢复后会自动重新发现")
+                                           f"已移出监控(冷却告警不再检测)；控制器恢复后会自动重新发现")
             except Exception:  # noqa: BLE001
                 log.exception("集装箱移出推送失败")
 

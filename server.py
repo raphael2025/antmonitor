@@ -434,6 +434,8 @@ def _current_containers():
     out = []
     for original in db.get_containers(SVC.conn):
         c = dict(original)
+        c["faults"] = [f for f in (c.get("faults") or [])
+                       if f["flag"] not in alerts.HIDDEN_CONTAINER_FAULTS]
         stamp = data_metrics.measurement(c.get("measured_ts"))
         if not stamp or stamp > now + 60 or now - stamp > lifetime:
             c.update(data_status="unknown", data_complete=0, data_stale=True)
@@ -473,7 +475,7 @@ def _summary_stats(ls, recs):
     if stats["unknown"]:
         measured = None
     cs = _current_containers()
-    ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
+    ignore = alerts.container_faults_ignore(CFG.get("alerts", {}))
     return {
         **stats,
         "scan_id": ls.get("scan_id"), "scan_ts": ls.get("ts"), "scan_kind": ls.get("kind"),
@@ -725,7 +727,7 @@ def api_public_containers(request: Request):
 
     def build():
         cs = _current_containers()
-        ignore = set(CFG.get("alerts", {}).get("container_faults_ignore", []))
+        ignore = alerts.container_faults_ignore(CFG.get("alerts", {}))
         return {"ok": True, "ts": int(time.time()), "count": len(cs),
                 "faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
                 "offline": sum(1 for c in cs if not c.get("online") and not _container_unknown(c)),
@@ -910,13 +912,13 @@ def _attach_segment_labels(rows):
 def api_containers(_: dict = Depends(require_viewer)):
     cs = _attach_segment_labels(_current_containers())
     acfg = CFG.get("alerts", {})
-    ignore = set(acfg.get("container_faults_ignore", []))
+    ignore = alerts.container_faults_ignore(acfg)
     return {"count": len(cs),
             "faulty": sum(1 for c in cs if _container_faulty(c, ignore)),
             "offline": sum(1 for c in cs if not c.get("online") and not _container_unknown(c)),
             "unknown": sum(_container_unknown(c) for c in cs),
             "containers": cs,
-            "faults_ignore": acfg.get("container_faults_ignore", []),
+            "faults_ignore": sorted(ignore - alerts.HIDDEN_CONTAINER_FAULTS),
             "supply_pressure_min": acfg.get("container_supply_pressure_min", 0),
             "return_pressure_min": acfg.get("container_return_pressure_min", 0)}
 

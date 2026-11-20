@@ -84,7 +84,7 @@ alerts:
   container_offline_rounds: 3 # 集装箱控制器连续 N 轮(每轮约10秒)没采到才判离线
   # 集装箱：以下故障位不报警(仍在卡片显示)
   # supply_liquid_flow_low=供液流量低 liquid_level_high=液位高 supply_liquid_pressure_high=供液压力高
-  # ⚠ leakage_fault / freezing_alarm 等安全故障即使写进忽略列表也会强制报警
+  # 漏液固定忽略并从卡片隐藏；冻结 freezing_alarm 和急停 emergency_stop 强制报警
   container_faults_ignore: ["supply_liquid_flow_low", "liquid_level_high", "supply_liquid_pressure_high"]
   container_supply_pressure_min: 0.2   # 供液压 < 此值(MPa) → 告警；0=关
   container_return_pressure_min: 0.05  # 回液压 < 此值(MPa) → 告警；0=关

@@ -547,12 +547,11 @@ def evaluate(conn, scan_id, records, cfg, kind=None, state=None):
 
 
 # 集装箱故障持续读到"正常"满这么久才消警。一次抖动就消警的话，下一轮故障还在却被冷却拦下，
-# 漏液最长 30 分钟没有活跃告警；而 crit 又不受冷却(复发立刻重报)，消得太快会在接触不良时
+# 故障最长 30 分钟没有活跃告警；而 crit 又不受冷却(复发立刻重报)，消得太快会在接触不良时
 # 反复"报—消—报"刷屏。按时间而不是轮数：全网扫描和 10 秒刷新都会评估，轮数不等于时长
 COOLER_CLEAR_SEC = 300
 # 供/回液压力阈值告警：自动补水会让回液压瞬间掉一下(常见仅 1 个采样点)，
-# 立刻报 crit 又要等 5 分钟才消，夜班等于白挨一刀。压力是连续模拟量，不是漏液触点，
-# 持续偏低才报、恢复后较快消即可。
+# 立刻报 crit 又要等 5 分钟才消。压力是连续模拟量，持续偏低才报、恢复后较快消即可。
 COOLER_PRESSURE_CLEAR_SEC = 30
 # 软件压力阈值 + 箱体自带回液压低位：补水瞬时抖动也走同一套确认
 _PRESSURE_ALERT_TYPES = frozenset({
@@ -560,7 +559,14 @@ _PRESSURE_ALERT_TYPES = frozenset({
     "cooler:return_pressure_low_th",
     "cooler:return_liquid_pressure_low",
 })
+HIDDEN_CONTAINER_FAULTS = frozenset({"leakage_fault", "leakage"})
+_REQUIRED_CONTAINER_FAULTS = frozenset({"freezing_alarm", "emergency_stop"})
 _COOLER_STATE = {}
+
+
+def container_faults_ignore(acfg):
+    configured = set(acfg.get("container_faults_ignore", []))
+    return (configured - _REQUIRED_CONTAINER_FAULTS) | HIDDEN_CONTAINER_FAULTS
 
 
 def evaluate_containers(conn, containers, known_before, cfg, state=None):
@@ -578,10 +584,7 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
     cur = {c["ip"]: c for c in containers}
     b = _Batch(conn, acfg.get("cooldown", 1800), now)
 
-    ignore = set(acfg.get("container_faults_ignore", []))
-    # 安全类故障位：即使误配进忽略列表也必须报警（漏液/冻结等）
-    _NEVER_IGNORE = {"leakage_fault", "freezing_alarm", "emergency_stop", "leakage"}
-    ignore -= _NEVER_IGNORE
+    ignore = container_faults_ignore(acfg)
     sp_min = acfg.get("container_supply_pressure_min", 0) or 0
     rp_min = acfg.get("container_return_pressure_min", 0) or 0
     stale_sec = int(acfg.get("container_stale_sec", 180) or 0)
@@ -594,7 +597,7 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
     for ip, c in cur.items():
         observed = c.get("observed_fault_flags")
         observed = set(observed) if isinstance(observed, list) else None
-        # 故障位（忽略列表内的不报警，但仍在卡片显示）
+        # 筛出需要产生告警的故障位。
         active = {f"cooler:{f['flag']}": f for f in (c.get("faults") or [])
                   if f["flag"] not in ignore}
         sp, rp = c.get("supply_pressure"), c.get("return_pressure")
@@ -629,7 +632,7 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
 
         for type_, f in active.items():
             clean.pop((ip, type_), None)
-            # crit(漏液/断流/冻结…)不受冷却限制：真恢复后又复发必须立刻再报
+            # crit(断流/冻结…)不受冷却限制：真恢复后又复发必须立刻再报
             b.fire(ip, type_, f["sev"], f"集装箱 {ip} {f['label']}", force=f["sev"] == "crit")
 
         # 数据停更：状态仍像在线，但采样时间过旧 → 值班会以为水温还是绿的
@@ -679,7 +682,7 @@ def evaluate_containers(conn, containers, known_before, cfg, state=None):
                 for key in list(timer):
                     if key[0] == ip:
                         timer.pop(key, None)
-            # force：与其他冷却 crit 一致不受冷却限制。控制器离线 = 漏液监测失效，
+            # force：与其他冷却 crit 一致不受冷却限制。控制器离线 = 冷却监测失效，
             # 短暂掉线恢复后 30 分钟内再次掉线，不能被冷却推迟
             b.fire(ip, "cooler_offline", "crit", f"集装箱 {ip} 控制器离线", force=True)
 
